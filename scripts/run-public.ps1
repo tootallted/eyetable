@@ -99,6 +99,13 @@ function Publish-Url($url) {
     }
 }
 
+# One copy at a time: a manual start and the logon task would otherwise fight over the port.
+$mutex = New-Object System.Threading.Mutex($false, "Local\eyetable-run-public")
+if (-not $mutex.WaitOne(0)) {
+    Write-Log "run-public.ps1 is already running; this copy exits."
+    exit 0
+}
+
 $api = $null
 $tunnel = $null
 try {
@@ -116,5 +123,6 @@ try {
     }
 } finally {
     foreach ($p in @($tunnel, $api)) { if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force } }
+    $mutex.ReleaseMutex()
     Write-Log "Stopped."
 }

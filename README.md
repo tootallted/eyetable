@@ -164,6 +164,18 @@ the window passes. Behind the tunnel the client IP comes from Cloudflare's
 `CF-Connecting-IP` header, which is trusted only on connections from this
 machine. The page works only while this PC and the script are running.
 
+To have it start every time you log in to Windows (hidden, restarted if it
+fails), register the scheduled task once:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install-logon-task.ps1
+Start-ScheduledTask -TaskName EyetablePublicApi    # start now without logging out
+Stop-ScheduledTask -TaskName EyetablePublicApi     # stop the API and tunnel
+```
+
+`-Remove` unregisters it. Only one copy of `run-public.ps1` runs at a time; a
+second start just exits.
+
 ## Where rows come from in an API response
 
 eyetable looks for the list of records in the JSON: a top-level array, or a
