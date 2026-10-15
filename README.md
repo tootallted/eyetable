@@ -91,6 +91,39 @@ only array of objects in the body. Nested objects become `parent__child`
 columns; arrays are kept as JSON. When the guess is wrong, point at the rows:
 `--records-path "Orders/List orders=payload.orders"`. CSV responses work too.
 
+## Paginated APIs
+
+By default a request is sent once. To pull every page, give it a pagination
+strategy with `--paginate "Request key=type[,option=value,...]"` (repeatable,
+one per request):
+
+| type | options (defaults) | next page | stops when |
+| --- | --- | --- | --- |
+| `page` | `param=page`, `start=1`, `size_param`, `size` | page number + 1 | a page is empty, or shorter than `size` |
+| `offset` | `offset_param=offset`, `limit_param=limit`, `limit` (required), `start=0` | offset + rows received | a page is shorter than `limit` |
+| `cursor` | `cursor_path` (required), `param=cursor` | cursor read from the response | the cursor is missing, empty or repeats |
+| `next_link` | `next_path` | the URL at `next_path`, or the `Link: <...>; rel="next"` header | there is no next URL |
+
+```powershell
+eyetable source add-postman shop .\shop.postman_collection.json `
+    --paginate "Orders/List orders=page,size_param=per_page,size=100" `
+    --paginate "Events/List events=cursor,cursor_path=meta.next_cursor,param=after" `
+    --paginate "Customers/List customers=next_link,next_path=links.next"
+```
+
+* Paging parameters go in the query string, replacing any value the Postman
+  request already has; the request's other params, headers and auth are kept.
+  Relative next links are resolved against the current URL, and credentials are
+  not sent when a next link points at a different host.
+* Set `size` / `limit` no higher than the API's maximum page size, since a
+  short page is taken to be the last one.
+* Every strategy takes `max_pages` (default 1000). If the API still has more
+  after that many pages the run fails rather than loading a truncated table;
+  raise `max_pages` for that request. Paging also stops if a page repeats the
+  previous one, which happens when an API ignores the parameter.
+* Pages stream into core storage as they arrive. Discovery fetches only the
+  first page, so a paginated dataset's row count shows as `?` until ingested.
+
 ## Development
 
 ```powershell
@@ -102,7 +135,6 @@ server or network.
 
 ## Not built yet
 
-* Pagination for API sources (page / offset / cursor / next-link)
 * Incremental loads (watermark columns, change tracking)
 * Scheduling ingestion runs
 * Analysis layer: modeled views on top of `eyetable_raw`, and a UI

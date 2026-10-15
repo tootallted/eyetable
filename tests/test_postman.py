@@ -5,13 +5,17 @@ import httpx
 import pytest
 
 from eyetable.connectors.postman import (
+    PaginationLimitError,
     PostmanConnector,
     UnresolvedVariableError,
     UnsupportedRequestError,
     extract_records,
     import_postman,
+    pagination_settings,
+    parse_pagination_option,
     resolve,
 )
+from eyetable.engine import Engine
 
 USERS = {"data": [{"id": 1, "name": "Ada", "address": {"city": "London"}}, {"id": 2, "name": "Grace"}]}
 SALES = {"@odata.context": "x", "value": [{"Region": "West", "Amount": 10.5}]}
@@ -115,3 +119,237 @@ def test_nested_variables_resolve():
 )
 def test_extract_records(payload, path, expected):
     assert extract_records(payload, path) == expected
+
+
+# -- pagination -----------------------------------------------------------
+
+ITEMS = [{"id": i} for i in range(1, 6)]
+BEARER = {"type": "bearer", "bearer": [{"key": "token", "value": "tok"}]}
+
+
+def paged_connector(handler, pagination, url="https://api.example.test/items", auth=None):
+    collection = {
+        "info": {"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
+        "item": [{"name": "Items", "request": {"method": "GET", "url": url}}],
+    }
+    if auth:
+        collection["auth"] = auth
+    sent = []
+
+    def record(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        return handler(request)
+
+    config = {"collection": collection, "pagination": {"Items": pagination}}
+    return PostmanConnector(config, client=httpx.Client(transport=httpx.MockTransport(record))), sent
+
+
+def page_handler(request: httpx.Request) -> httpx.Response:
+    page, size = int(request.url.params["page"]), int(request.url.params.get("per_page", 2))
+    return httpx.Response(200, json={"data": ITEMS[(page - 1) * size : page * size]})
+
+
+def test_page_number_streams_one_batch_per_page():
+    conn, sent = paged_connector(page_handler, {"type": "page", "size_param": "per_page", "size": 2})
+    batches = conn.read("Items", batch_size=100)
+    assert next(batches) == ITEMS[:2]
+    assert len(sent) == 1  # later pages are not fetched until the store asks for them
+    assert list(batches) == [ITEMS[2:4], ITEMS[4:]]
+    assert [(r.url.params["page"], r.url.params["per_page"]) for r in sent] == [("1", "2"), ("2", "2"), ("3", "2")]
+
+
+def test_page_number_without_size_stops_on_empty_page():
+    conn, sent = paged_connector(page_handler, {"type": "page"})
+    assert list(conn.read("Items", batch_size=1)) == [[r] for r in ITEMS]  # pages are split to batch_size
+    assert [r.url.params["page"] for r in sent] == ["1", "2", "3", "4"]
+
+
+def test_page_number_custom_param_and_start():
+    def handler(request):
+        p = int(request.url.params["p"])
+        return httpx.Response(200, json=[{"p": p}] if p < 2 else [])
+
+    conn, sent = paged_connector(handler, {"type": "page", "param": "p", "start": 0})
+    assert list(conn.read("Items")) == [[{"p": 0}], [{"p": 1}]]
+
+
+def test_page_number_stops_when_api_ignores_the_param():
+    conn, sent = paged_connector(lambda r: httpx.Response(200, json={"data": ITEMS[:2]}), {"type": "page"})
+    assert list(conn.read("Items")) == [ITEMS[:2]]
+    assert len(sent) == 2
+
+
+def test_offset_limit_advances_by_rows_received():
+    def handler(request):
+        offset, limit = int(request.url.params["skip"]), int(request.url.params["take"])
+        return httpx.Response(200, json={"results": ITEMS[offset : offset + limit]})
+
+    pagination = {"type": "offset", "offset_param": "skip", "limit_param": "take", "limit": 2}
+    conn, sent = paged_connector(handler, pagination)
+    assert list(conn.read("Items")) == [ITEMS[:2], ITEMS[2:4], ITEMS[4:]]
+    assert [r.url.params["skip"] for r in sent] == ["0", "2", "4"]
+    assert all(r.url.params["take"] == "2" for r in sent)
+
+
+def test_cursor_follows_dotted_path_until_empty():
+    pages = {None: (ITEMS[:2], "c2"), "c2": (ITEMS[2:4], "c3"), "c3": (ITEMS[4:], None)}
+
+    def handler(request):
+        rows, nxt = pages[request.url.params.get("after")]
+        return httpx.Response(200, json={"data": rows, "meta": {"next_cursor": nxt}})
+
+    conn, sent = paged_connector(
+        handler,
+        {"type": "cursor", "cursor_path": "meta.next_cursor", "param": "after"},
+        url="https://api.example.test/items?limit=2",
+    )
+    assert list(conn.read("Items")) == [ITEMS[:2], ITEMS[2:4], ITEMS[4:]]
+    assert [r.url.params.get("after") for r in sent] == [None, "c2", "c3"]
+    assert all(r.url.params["limit"] == "2" for r in sent)  # the request's own params are kept
+
+
+def test_cursor_stops_when_cursor_repeats():
+    def handler(request):
+        return httpx.Response(200, json={"data": [{"n": len(sent)}], "next": "same"})
+
+    conn, sent = paged_connector(handler, {"type": "cursor", "cursor_path": "next"})
+    assert list(conn.read("Items")) == [[{"n": 1}], [{"n": 2}]]
+    assert [r.url.params.get("cursor") for r in sent] == [None, "same"]
+
+
+def test_next_link_from_body_relative_url_keeps_auth():
+    def handler(request):
+        assert request.headers["Authorization"] == "Bearer tok"
+        page = int(request.url.params.get("page", 1))
+        nxt = f"/items?page={page + 1}" if page < 3 else None
+        return httpx.Response(200, json={"items": [{"page": page}], "links": {"next": nxt}})
+
+    conn, sent = paged_connector(handler, {"type": "next_link", "next_path": "links.next"}, auth=BEARER)
+    assert list(conn.read("Items")) == [[{"page": 1}], [{"page": 2}], [{"page": 3}]]
+    assert str(sent[1].url) == "https://api.example.test/items?page=2"
+
+
+def test_next_link_from_link_header_reapplies_query_api_key():
+    def handler(request):
+        assert request.url.params["api_key"] == "k"
+        page = int(request.url.params.get("page", 1))
+        headers = {}
+        if page < 2:
+            headers["Link"] = f'<https://api.example.test/items?page={page + 1}>; rel="next", <x>; rel="last"'
+        return httpx.Response(200, json=[{"page": page}], headers=headers)
+
+    auth = {
+        "type": "apikey",
+        "apikey": [{"key": "key", "value": "api_key"}, {"key": "value", "value": "k"}, {"key": "in", "value": "query"}],
+    }
+    conn, sent = paged_connector(handler, {"type": "next_link"}, auth=auth)
+    assert list(conn.read("Items")) == [[{"page": 1}], [{"page": 2}]]
+    assert len(sent) == 2
+
+
+def test_next_link_to_another_host_drops_credentials():
+    def handler(request):
+        if request.url.host == "api.example.test":
+            return httpx.Response(200, json={"data": [{"a": 1}], "next": "https://cdn.example.test/p2"})
+        assert "Authorization" not in request.headers
+        return httpx.Response(200, json={"data": [{"a": 2}]})
+
+    conn, sent = paged_connector(handler, {"type": "next_link", "next_path": "next"}, auth=BEARER)
+    assert list(conn.read("Items")) == [[{"a": 1}], [{"a": 2}]]
+    assert sent[1].headers["host"] == "cdn.example.test"
+
+
+def test_max_pages_fails_instead_of_truncating():
+    pagination = {"type": "page", "size": 2, "size_param": "per_page", "max_pages": 2}
+    conn, sent = paged_connector(page_handler, pagination)
+    batches = conn.read("Items")
+    assert next(batches) == ITEMS[:2]
+    assert next(batches) == ITEMS[2:4]
+    with pytest.raises(PaginationLimitError, match="max_pages=2"):
+        next(batches)
+    assert len(sent) == 2  # nothing is sent beyond the limit
+
+
+def test_max_pages_reached_exactly_is_fine():
+    pagination = {"type": "page", "size": 2, "size_param": "per_page", "max_pages": 3}
+    conn, sent = paged_connector(page_handler, pagination)
+    assert sum(len(b) for b in conn.read("Items")) == 5
+
+
+def test_discover_probes_only_the_first_page():
+    conn, sent = paged_connector(page_handler, {"type": "page", "size": 2, "size_param": "per_page"})
+    (info,) = conn.discover()
+    assert len(sent) == 1
+    assert info.row_count is None  # unknown until ingested
+    assert [c.name for c in info.columns] == ["id"]
+    assert info.detail["pagination"] == "page"
+
+
+def test_engine_ingests_every_page(store):
+    pagination = {"type": "page", "size": 2, "size_param": "per_page"}
+    engine = Engine(store, connector_factory=lambda type_, config: paged_connector(page_handler, pagination)[0])
+    engine.add_source("api", "postman", {}, verify=False)
+    (result,) = engine.ingest("api", batch_size=1)
+    assert result.status == "succeeded" and result.rows == 5
+    assert sorted(r["id"] for r in store.read_table(result.table)) == [1, 2, 3, 4, 5]
+
+
+def test_pagination_for_unknown_request_fails_test():
+    conn, _ = paged_connector(page_handler, {"type": "page"})
+    conn.pagination["Nope"] = conn.pagination["Items"]
+    with pytest.raises(ValueError, match="Nope"):
+        conn.test()
+
+
+@pytest.mark.parametrize(
+    "spec, message",
+    [
+        ({"type": "pages"}, "must be one of"),
+        ({"type": "offset"}, "needs limit"),
+        ({"type": "cursor"}, "needs cursor_path"),
+        ({"type": "page", "size_param": "per_page"}, "also needs size"),
+        ({"type": "page", "cursor_path": "x"}, "unknown page pagination option"),
+        ({"type": "page", "max_pages": 0}, "at least 1"),
+        ({"type": "offset", "limit": "lots"}, "limit must be int"),
+    ],
+)
+def test_pagination_settings_validation(spec, message):
+    with pytest.raises(ValueError, match=message):
+        pagination_settings(spec)
+
+
+def test_parse_pagination_option():
+    key, settings = parse_pagination_option("Users/List users=page,size_param=per_page,size=100,max_pages=50")
+    assert key == "Users/List users"
+    assert settings == {
+        "type": "page", "param": "page", "start": 1, "size_param": "per_page", "size": 100, "max_pages": 50,
+    }
+    assert parse_pagination_option("Feed=next_link")[1] == {"type": "next_link", "max_pages": 1000}
+    with pytest.raises(ValueError):
+        parse_pagination_option("Feed")
+    with pytest.raises(ValueError):
+        parse_pagination_option("Feed=cursor,cursor_path")
+
+
+def test_cli_add_postman_stores_pagination(store, tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+
+    from eyetable import cli
+
+    path = tmp_path / "collection.json"
+    path.write_text(json.dumps({
+        "info": {"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
+        "item": [{"name": "Items", "request": {"method": "GET", "url": "https://api.example.test/items"}}],
+    }))
+    monkeypatch.setattr(cli, "_engine", lambda: Engine(store))
+    runner = CliRunner()
+
+    args = ["source", "add-postman", "api", str(path), "--paginate", "Items=cursor,cursor_path=meta.next"]
+    result = runner.invoke(cli.app, args)
+    assert result.exit_code == 0, result.output
+    assert store.get_source("api").config["pagination"] == {
+        "Items": {"type": "cursor", "param": "cursor", "cursor_path": "meta.next", "max_pages": 1000}
+    }
+
+    result = runner.invoke(cli.app, ["source", "add-postman", "api2", str(path), "--paginate", "Items=pages"])
+    assert result.exit_code == 1 and "must be one of" in result.output

@@ -10,12 +10,18 @@ Config:
      "records_path": {"Users/List users": "data.items"},
      "allow_methods": ["POST"],                 # beyond GET, opt in explicitly
      "probe": true,                             # GET each request during discovery
-     "timeout": 30}
+     "timeout": 30,
+     "pagination": {"Users/List users": {"type": "page", "size_param": "per_page", "size": 100}}}
+
+Pagination is per request; see `pagination_settings` for each strategy's
+options. Every strategy stops after `max_pages` and fails rather than silently
+truncating if the API still reports more.
 
 Supported: folders, collection/environment/override variables (including
 nested and `{{$guid}}`-style dynamic ones), path variables, query params,
-headers, raw / urlencoded / formdata (text) / graphql bodies, and bearer,
-basic, API key and OAuth2-access-token auth with folder/collection inheritance.
+headers, raw / urlencoded / formdata (text) / graphql bodies, bearer, basic,
+API key and OAuth2-access-token auth with folder/collection inheritance, and
+page-number / offset / cursor / next-link pagination.
 Not supported: pre-request and test scripts (they are JavaScript), file uploads,
 and auth types that need a signing flow (AWS, Hawk, digest, NTLM, ...).
 """
@@ -57,6 +63,10 @@ class UnresolvedVariableError(ValueError):
 
 
 class UnsupportedRequestError(ValueError):
+    pass
+
+
+class PaginationLimitError(RuntimeError):
     pass
 
 
@@ -225,10 +235,16 @@ def _find_records(obj: dict) -> Any:
     return obj
 
 
+def dig(payload: Any, path: str) -> Any:
+    """Follow a dotted path like "data.items" or "results.0.id" into a JSON payload."""
+    for part in path.split("."):
+        payload = payload[int(part)] if isinstance(payload, list) else payload[part]
+    return payload
+
+
 def extract_records(payload: Any, path: str | None = None) -> list[Record]:
     if path:
-        for part in path.split("."):
-            payload = payload[int(part)] if isinstance(payload, list) else payload[part]
+        payload = dig(payload, path)
     elif isinstance(payload, dict):
         payload = _find_records(payload)
     if isinstance(payload, dict):
@@ -248,6 +264,102 @@ def parse_response(response: httpx.Response) -> Any:
         return response.text
 
 
+# -- pagination -----------------------------------------------------------
+
+DEFAULT_MAX_PAGES = 1000
+
+# Options per strategy (name -> type), and the defaults filled in for them.
+_PAGINATION_OPTIONS: dict[str, dict[str, type]] = {
+    "page": {"param": str, "start": int, "size_param": str, "size": int},
+    "offset": {"offset_param": str, "limit_param": str, "limit": int, "start": int},
+    "cursor": {"cursor_path": str, "param": str},
+    "next_link": {"next_path": str},
+}
+_PAGINATION_DEFAULTS: dict[str, dict[str, Any]] = {
+    "page": {"param": "page", "start": 1},
+    "offset": {"offset_param": "offset", "limit_param": "limit", "start": 0},
+    "cursor": {"param": "cursor"},
+    "next_link": {},
+}
+_PAGINATION_REQUIRED = {"offset": ("limit",), "cursor": ("cursor_path",)}
+
+
+def pagination_settings(spec: dict) -> dict:
+    """Validate one request's pagination config and fill in its defaults.
+
+    page:      param="page", start=1, size_param, size. Stops on an empty page,
+               or a short one when `size` is known.
+    offset:    offset_param="offset", limit_param="limit", limit (required),
+               start=0. Advances by the rows received; stops on a short page.
+    cursor:    cursor_path (required, dotted path to the next cursor in the
+               response), param="cursor". Stops when the cursor is empty.
+    next_link: next_path (optional dotted path to the next page's URL); an
+               RFC 5988 `Link: <...>; rel="next"` header is always honored.
+    All take max_pages (default 1000). Parameters are sent in the query string.
+    """
+    kind = spec.get("type")
+    if kind not in _PAGINATION_OPTIONS:
+        raise ValueError(f"pagination type must be one of {', '.join(_PAGINATION_OPTIONS)}; got {kind!r}")
+    options = {**_PAGINATION_OPTIONS[kind], "max_pages": int}
+    unknown = sorted(set(spec) - set(options) - {"type"})
+    if unknown:
+        raise ValueError(f"unknown {kind} pagination option(s): {', '.join(unknown)} (expected {', '.join(options)})")
+    out: dict[str, Any] = {"type": kind, "max_pages": DEFAULT_MAX_PAGES, **_PAGINATION_DEFAULTS[kind]}
+    for name, value in spec.items():
+        if name == "type":
+            continue
+        try:
+            out[name] = options[name](value)
+        except (TypeError, ValueError):
+            raise ValueError(f"pagination option {name} must be {options[name].__name__}, got {value!r}") from None
+    missing = [name for name in _PAGINATION_REQUIRED.get(kind, ()) if name not in out]
+    if missing:
+        raise ValueError(f"{kind} pagination needs {', '.join(missing)}")
+    if "size_param" in out and "size" not in out:
+        raise ValueError("page pagination with size_param also needs size")
+    if out["max_pages"] < 1 or out.get("size", 1) < 1 or out.get("limit", 1) < 1:
+        raise ValueError("max_pages, size and limit must be at least 1")
+    return out
+
+
+def parse_pagination_option(text: str) -> tuple[str, dict]:
+    """Parse the CLI form `Request key=type[,option=value,...]`."""
+    key, sep, rest = text.partition("=")
+    kind, *options = rest.split(",")
+    if not sep or not key or not kind:
+        raise ValueError(f"expected 'Request key=type[,option=value,...]', got {text!r}")
+    spec: dict[str, Any] = {"type": kind.strip()}
+    for option in options:
+        name, sep, value = option.partition("=")
+        if not sep:
+            raise ValueError(f"pagination option must look like name=value, got {option!r}")
+        spec[name.strip()] = value.strip()
+    return key, pagination_settings(spec)
+
+
+def _with_params(built: httpx.Request, params: dict[str | None, Any]) -> httpx.Request:
+    """A copy of `built` with query parameters set (None names and values are skipped)."""
+    url = built.url
+    for name, value in params.items():
+        if name is not None and value is not None:
+            url = url.copy_set_param(name, str(value))
+    return httpx.Request(
+        built.method, url, headers=built.headers, content=built.content or None, extensions=built.extensions
+    )
+
+
+def _next_link(response: httpx.Response, payload: Any, next_path: str | None) -> str | None:
+    url = None
+    if next_path:
+        try:
+            url = dig(payload, next_path)
+        except (KeyError, IndexError, TypeError, ValueError):
+            pass
+    if not isinstance(url, str) or not url:
+        url = response.links.get("next", {}).get("url")
+    return str(response.url.join(url)) if url else None  # next links may be relative
+
+
 # -- connector ------------------------------------------------------------
 
 
@@ -262,6 +374,12 @@ class PostmanConnector(Connector):
         self.variables = build_variables(self.collection, self.environment, config.get("variables"))
         self.requests = {r.key: r for r in iter_requests(self.collection)}
         self.allowed_methods = {"GET", *(m.upper() for m in config.get("allow_methods", []))}
+        self.pagination: dict[str, dict] = {}
+        for key, spec in (config.get("pagination") or {}).items():
+            try:
+                self.pagination[key] = pagination_settings(spec)
+            except ValueError as exc:
+                raise ValueError(f"pagination for {key!r}: {exc}") from None
         self._client = client or httpx.Client(timeout=config.get("timeout", 30), follow_redirects=True)
 
     def close(self) -> None:
@@ -270,6 +388,9 @@ class PostmanConnector(Connector):
     def test(self) -> None:
         if not self.requests:
             raise ValueError("collection contains no requests")
+        unknown = [key for key in self.pagination if key not in self.requests]
+        if unknown:
+            raise ValueError(f"pagination configured for unknown request(s): {', '.join(unknown)}")
         # Resolving every request surfaces missing variables without sending anything.
         for request in self.requests.values():
             self._build(request)
@@ -286,10 +407,13 @@ class PostmanConnector(Connector):
                 readable=readable,
                 detail={"method": request.method, "url": raw_url(request.url)},
             )
+            paginated = request.key in self.pagination
+            if paginated:
+                info.detail["pagination"] = self.pagination[request.key]["type"]
             if probe and readable:
                 try:
-                    records = self.fetch(request.key)
-                    info.row_count = len(records)
+                    records = self.fetch(request.key)  # first page only
+                    info.row_count = None if paginated else len(records)
                     info.columns = [ColumnInfo(n, k or "unknown") for n, k in infer_columns(records).items()]
                 except Exception as exc:  # report it in the catalog; keep discovering
                     info.detail["probe_error"] = f"{type(exc).__name__}: {exc}"
@@ -297,11 +421,16 @@ class PostmanConnector(Connector):
         return datasets
 
     def read(self, key: str, batch_size: int = 1000) -> Iterator[list[Record]]:
-        records = self.fetch(key)
-        for start in range(0, len(records), batch_size):
-            yield records[start : start + batch_size]
+        for records in self.pages(key):  # stream page by page; nothing is buffered
+            for start in range(0, len(records), batch_size):
+                yield records[start : start + batch_size]
 
     def fetch(self, key: str) -> list[Record]:
+        """The records of the first response only."""
+        return next(self.pages(key), [])
+
+    def pages(self, key: str) -> Iterator[list[Record]]:
+        """Send a request and yield the records of each page it paginates through."""
         request = self.requests.get(key)
         if request is None:
             raise KeyError(f"no request {key!r} in collection")
@@ -309,10 +438,83 @@ class PostmanConnector(Connector):
             raise UnsupportedRequestError(
                 f"{request.method} {key!r} is not read by default; add it to allow_methods to ingest it"
             )
-        response = self._client.send(self._build(request))
-        response.raise_for_status()
         path = (self.config.get("records_path") or {}).get(key)
-        return extract_records(parse_response(response), path)
+        paging = self.pagination.get(key)
+        built = self._build(request)
+        if paging is None:
+            yield extract_records(parse_response(self._send(built)), path)
+            return
+
+        kind = paging["type"]
+        position = paging.get("start", 0)  # page number or row offset
+        if kind == "page":
+            built = _with_params(built, {paging["param"]: position, paging.get("size_param"): paging.get("size")})
+        elif kind == "offset":
+            built = _with_params(built, {paging["offset_param"]: position, paging["limit_param"]: paging["limit"]})
+        followed: set[str] = set()  # cursors / next URLs already used, to stop on loops
+        previous: list[Record] | None = None
+        count = 0
+        while True:
+            response = self._send(built)
+            payload = parse_response(response)
+            records = extract_records(payload, path)
+            if records == previous:  # the API ignored the paging parameter
+                return
+            if records:
+                yield records
+            previous = records
+            count += 1
+
+            if kind in ("page", "offset"):
+                size = paging.get("size") if kind == "page" else paging["limit"]
+                if not records or (size and len(records) < size):
+                    return
+                position += 1 if kind == "page" else len(records)
+                param = paging["param"] if kind == "page" else paging["offset_param"]
+                built = _with_params(built, {param: position})
+            elif kind == "cursor":
+                try:
+                    cursor = dig(payload, paging["cursor_path"])
+                except (KeyError, IndexError, TypeError, ValueError):
+                    cursor = None
+                if cursor is None or cursor is False or cursor == "" or str(cursor) in followed:
+                    return
+                followed.add(str(cursor))
+                built = _with_params(built, {paging["param"]: cursor})
+            else:
+                url = _next_link(response, payload, paging.get("next_path"))
+                if url is None or url in followed:
+                    return
+                followed.add(url)
+                built = self._follow(request, built, url)
+
+            if count >= paging["max_pages"]:
+                raise PaginationLimitError(
+                    f"{key!r}: more pages remain after max_pages={paging['max_pages']}; "
+                    "raise max_pages in its pagination config"
+                )
+
+    def _send(self, built: httpx.Request) -> httpx.Response:
+        response = self._client.send(built)
+        response.raise_for_status()
+        return response
+
+    def _follow(self, request: PostmanRequest, built: httpx.Request, url: str) -> httpx.Request:
+        """The request for a next-page URL, keeping headers and auth only on the same origin."""
+        auth_headers: dict[str, str] = {}
+        auth_params: list[tuple[str, str]] = []
+        self._apply_auth(request, auth_headers, auth_params)
+        target = httpx.URL(url)
+        headers = httpx.Headers(built.headers)
+        for name in ("host", "content-length"):
+            headers.pop(name, None)
+        if (target.scheme, target.host, target.port) == (built.url.scheme, built.url.host, built.url.port):
+            if auth_params:  # an API key in the query string may not be repeated in the link
+                target = target.copy_merge_params(auth_params)
+        else:  # like a cross-origin redirect: never hand credentials to another host
+            for name in auth_headers:
+                headers.pop(name, None)
+        return self._client.build_request(built.method, target, headers=headers, content=built.content or None)
 
     def _build(self, request: PostmanRequest) -> httpx.Request:
         v = self.variables

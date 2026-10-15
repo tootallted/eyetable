@@ -9,7 +9,7 @@ from rich.console import Console
 from rich.table import Table
 
 from eyetable.config import load_settings
-from eyetable.connectors.postman import import_postman
+from eyetable.connectors.postman import import_postman, parse_pagination_option
 from eyetable.credentials import env_ref
 from eyetable.engine import Engine
 from eyetable.store import CoreStore
@@ -92,6 +92,9 @@ def add_postman(
     var: Annotated[Optional[list[str]], typer.Option(help="Variable override KEY=VALUE (repeatable).")] = None,
     records_path: Annotated[Optional[list[str]], typer.Option(help="'Request key=dotted.path' to the rows (repeatable).")] = None,
     allow_method: Annotated[Optional[list[str]], typer.Option(help="Also ingest requests with this method, e.g. POST.")] = None,
+    paginate: Annotated[Optional[list[str]], typer.Option(
+        help="'Request key=type[,option=value,...]' with type page, offset, cursor or next_link, "
+             "e.g. 'Users/List users=page,size_param=per_page,size=100' (repeatable).")] = None,
     replace: bool = False,
 ) -> None:
     """Register an API source from a Postman collection export."""
@@ -103,6 +106,14 @@ def add_postman(
         config["records_path"] = _pairs(records_path, "--records-path")
     if allow_method:
         config["allow_methods"] = [m.upper() for m in allow_method]
+    if paginate:
+        config["pagination"] = {}
+        for item in paginate:
+            try:
+                key, settings = parse_pagination_option(item)
+            except ValueError as exc:
+                _fail(f"--paginate {item!r}: {exc}")
+            config["pagination"][key] = settings
     try:
         _engine().add_source(name, "postman", config, replace=replace)
     except Exception as exc:
