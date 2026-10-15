@@ -142,6 +142,28 @@ only call the API from the origins in `EYETABLE_CORS_ORIGINS` (default
 `https://tootallted.github.io`). Uploads are limited to 50 MB
 (`EYETABLE_MAX_UPLOAD_MB`). API docs: `/api/docs`.
 
+### Public access from the GitHub Pages page
+
+`scripts/run-public.ps1` makes the API on this PC reachable from the published
+page, the same way acomwebsite's transact API is:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\run-public.ps1
+```
+
+It runs `eyetable serve` on `127.0.0.1:8765` and a Cloudflare quick tunnel to
+it. Quick tunnel URLs change on every restart, so each new URL is written into
+`API_BASE` in `docs/source_management/index.html`, committed, and pushed; the
+live page follows about a minute later. Either process is restarted if it
+exits. Logs go to `logs/` (gitignored).
+
+The tunnel URL is public, so the API protects itself: every call needs the
+token, each client IP is limited to 240 requests a minute and 120 uploads an
+hour, and an IP that sends 10 wrong tokens in 15 minutes is locked out until
+the window passes. Behind the tunnel the client IP comes from Cloudflare's
+`CF-Connecting-IP` header, which is trusted only on connections from this
+machine. The page works only while this PC and the script are running.
+
 ## Where rows come from in an API response
 
 eyetable looks for the list of records in the JSON: a top-level array, or a

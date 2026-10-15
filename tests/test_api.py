@@ -96,3 +96,44 @@ def test_serves_the_page_locally(store):
 def test_token_is_required():
     with pytest.raises(ValueError):
         create_app(None, "")
+
+
+def test_rate_limits_and_lockout(store):
+    app = create_app(Engine(store), TOKEN, requests_per_minute=5, auth_failures_per_15_minutes=2)
+    client = TestClient(app)
+    bad = {"Authorization": "Bearer nope"}
+    assert client.get("/api/sources", headers=bad).status_code == 401
+    assert client.get("/api/sources", headers=bad).status_code == 401
+    locked = client.get("/api/sources", headers=AUTH)  # even the right token waits out the lockout
+    assert locked.status_code == 429 and int(locked.headers["retry-after"]) > 0
+
+    # a different client (as seen through the tunnel) is unaffected, until it sends too much
+    other = {**AUTH, "CF-Connecting-IP": "203.0.113.9"}
+    assert [client.get("/api/sources", headers=other).status_code for _ in range(6)] == [200] * 5 + [429]
+
+
+def test_upload_limit(store):
+    client = TestClient(create_app(Engine(store), TOKEN, uploads_per_hour=1))
+    assert post_csv(client, "parts", create="true").status_code == 200
+    assert post_csv(client, "parts").status_code == 429
+
+
+def test_security_headers(client):
+    r = client.get("/api/health")
+    assert r.headers["x-content-type-options"] == "nosniff"
+    assert r.headers["cache-control"] == "no-store"
+
+
+def test_client_ip_trusts_cloudflare_header_only_from_loopback():
+    from starlette.requests import Request
+
+    from eyetable.ratelimit import client_ip
+
+    def req(peer, header=None):
+        headers = [(b"cf-connecting-ip", header.encode())] if header else []
+        return Request({"type": "http", "client": (peer, 1234), "headers": headers})
+
+    assert client_ip(req("127.0.0.1", "198.51.100.7")) == "198.51.100.7"
+    assert client_ip(req("::1", "198.51.100.7")) == "198.51.100.7"
+    assert client_ip(req("192.0.2.1", "198.51.100.7")) == "192.0.2.1"
+    assert client_ip(req("127.0.0.1")) == "127.0.0.1"

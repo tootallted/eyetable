@@ -4,22 +4,27 @@ Every /api route except /api/health needs `Authorization: Bearer <token>`,
 where the token is EYETABLE_API_TOKEN. The pages may be served from GitHub
 Pages (another origin), so CORS is open to EYETABLE_CORS_ORIGINS and the
 browser's private-network preflight is answered for http://localhost use.
+
+The API can be exposed to the internet (e.g. through a Cloudflare tunnel), so
+each client IP is rate limited, and an IP that keeps sending wrong tokens is
+locked out for a while.
 """
 
 import secrets
 from pathlib import Path
 from typing import Annotated, Any
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from eyetable import __version__
 from eyetable.connectors.file import DATASET_KEY
 from eyetable.engine import Engine
 from eyetable.identifiers import SOURCE_NAME, table_name
+from eyetable.ratelimit import SlidingWindow, client_ip
 from eyetable.store import SourceNotFound
 
 DEFAULT_CORS_ORIGINS = ["https://tootallted.github.io"]
@@ -39,11 +44,48 @@ def create_app(
     cors_origins: list[str] | None = None,
     max_upload_bytes: int = DEFAULT_MAX_UPLOAD_BYTES,
     pages_dir: Path | None = PAGES_DIR,
+    requests_per_minute: int = 240,
+    uploads_per_hour: int = 120,
+    auth_failures_per_15_minutes: int = 10,
 ) -> FastAPI:
     if not token:
         raise ValueError("an API token is required")
     store = engine.store
     app = FastAPI(title="eyetable", version=__version__, docs_url="/api/docs", openapi_url="/api/openapi.json")
+
+    requests_limit = SlidingWindow(requests_per_minute, 60)
+    uploads_limit = SlidingWindow(uploads_per_hour, 3600)
+    auth_failures = SlidingWindow(auth_failures_per_15_minutes, 900)
+
+    def too_many(wait: float, what: str) -> JSONResponse:
+        seconds = max(int(wait) + 1, 1)
+        return JSONResponse(
+            {"detail": f"too many {what}; try again in {seconds} s"},
+            status_code=429,
+            headers={"Retry-After": str(seconds)},
+        )
+
+    # Added before CORS so CORS ends up outermost and 429s still carry CORS headers.
+    @app.middleware("http")
+    async def limit_and_harden(request: Request, call_next):
+        ip = client_ip(request)
+        if request.url.path.startswith("/api/"):
+            wait = auth_failures.blocked(ip)
+            if wait and request.method != "OPTIONS":
+                return too_many(wait, "failed sign-in attempts")
+            wait = requests_limit.hit(ip)
+            if wait:
+                return too_many(wait, "requests")
+            if request.method == "POST" and request.url.path.endswith("/uploads"):
+                wait = uploads_limit.hit(ip)
+                if wait:
+                    return too_many(wait, "uploads")
+        response = await call_next(request)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        if request.url.path.startswith("/api/"):
+            response.headers.setdefault("Cache-Control", "no-store")
+        return response
 
     app.add_middleware(
         CORSMiddleware,
@@ -55,8 +97,11 @@ def create_app(
 
     bearer = HTTPBearer(auto_error=False)
 
-    def authorized(credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer)]) -> None:
+    def authorized(
+        request: Request, credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer)]
+    ) -> None:
         if credentials is None or not secrets.compare_digest(credentials.credentials.encode(), token.encode()):
+            auth_failures.hit(client_ip(request))
             raise HTTPException(401, "missing or wrong API token", headers={"WWW-Authenticate": "Bearer"})
 
     auth = [Depends(authorized)]
