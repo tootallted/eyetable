@@ -1,0 +1,10 @@
+{
+  "name": "Sample - Dev",
+  "values": [
+    { "key": "apiToken", "value": "tok-123", "type": "secret", "enabled": true },
+    { "key": "reportKey", "value": "rk-456", "type": "secret", "enabled": true },
+    { "key": "version", "value": "v2", "type": "default", "enabled": true },
+    { "key": "unused", "value": "x", "type": "default", "enabled": false }
+  ],
+  "_postman_variable_scope": "environment"
+}

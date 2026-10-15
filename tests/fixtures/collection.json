@@ -1,0 +1,72 @@
+{
+  "info": {
+    "name": "Sample API",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [{ "key": "token", "value": "{{apiToken}}", "type": "string" }]
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "https://api.example.test/{{version}}" },
+    { "key": "version", "value": "v1" }
+  ],
+  "item": [
+    {
+      "name": "Users",
+      "item": [
+        {
+          "name": "List users",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "application/json" },
+              { "key": "X-Debug", "value": "1", "disabled": true }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/users?page=1",
+              "host": ["{{baseUrl}}"],
+              "path": ["users"],
+              "query": [{ "key": "page", "value": "1" }]
+            }
+          }
+        },
+        {
+          "name": "Get user",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/users/:id",
+              "variable": [{ "key": "id", "value": "7" }]
+            }
+          }
+        },
+        {
+          "name": "Create user",
+          "request": {
+            "method": "POST",
+            "body": { "mode": "raw", "raw": "{\"name\": \"x\"}", "options": { "raw": { "language": "json" } } },
+            "url": "{{baseUrl}}/users"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Reports",
+      "auth": {
+        "type": "apikey",
+        "apikey": [
+          { "key": "key", "value": "api_key" },
+          { "key": "value", "value": "{{reportKey}}" },
+          { "key": "in", "value": "query" }
+        ]
+      },
+      "item": [
+        {
+          "name": "Sales (OData)",
+          "request": { "method": "GET", "url": "{{baseUrl}}/odata/Sales" }
+        }
+      ]
+    }
+  ]
+}

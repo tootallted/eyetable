@@ -1,0 +1,14 @@
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: eyetable
+      POSTGRES_PASSWORD: eyetable
+      POSTGRES_DB: eyetable
+    ports:
+      - "5432:5432"
+    volumes:
+      - eyetable-pg:/var/lib/postgresql/data
+
+volumes:
+  eyetable-pg:
