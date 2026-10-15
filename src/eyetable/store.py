@@ -2,7 +2,7 @@
 
 Two schemas live inside it:
   * meta schema (default `eyetable`): registered sources, the discovered
-    dataset catalog, and a log of every ingestion run.
+    dataset catalog, a log of every ingestion run, and every file uploaded.
   * data schema (default `eyetable_raw`): one table per ingested dataset,
     named `<source>__<dataset>`.
 
@@ -17,6 +17,7 @@ and quick local experiments without a Postgres server.
 """
 
 import datetime as dt
+import hashlib
 import json
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -44,6 +45,27 @@ def _now() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
 
 
+class UTCDateTime(sa.TypeDecorator):
+    """timestamptz that always comes back timezone-aware.
+
+    Postgres does this already; SQLite stores no offset, so values written as
+    UTC are tagged UTC again on the way out.
+    """
+
+    impl = sa.DateTime(timezone=True)
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        if isinstance(value, dt.datetime) and value.tzinfo is not None:
+            return value.astimezone(dt.timezone.utc)
+        return value
+
+    def process_result_value(self, value, dialect):
+        if isinstance(value, dt.datetime) and value.tzinfo is None:
+            return value.replace(tzinfo=dt.timezone.utc)
+        return value
+
+
 def sa_type(kind: str | None) -> sa.types.TypeEngine:
     return {
         "bigint": sa.BigInteger(),
@@ -51,7 +73,7 @@ def sa_type(kind: str | None) -> sa.types.TypeEngine:
         "numeric": sa.Numeric(),
         "boolean": sa.Boolean(),
         "timestamp": sa.DateTime(timezone=False),
-        "timestamptz": sa.DateTime(timezone=True),
+        "timestamptz": UTCDateTime(),
         "date": sa.Date(),
         "time": sa.Time(),
         "json": JSONType,
@@ -113,6 +135,18 @@ class Source:
 
 
 @dataclass
+class Upload:
+    id: int
+    source: str
+    filename: str
+    size_bytes: int
+    sha256: str
+    mode: str
+    run_id: int | None
+    uploaded_at: dt.datetime
+
+
+@dataclass
 class Run:
     id: int
     source: str
@@ -140,8 +174,8 @@ class CoreStore:
             sa.Column("name", sa.String(64), primary_key=True),
             sa.Column("type", sa.String(32), nullable=False),
             sa.Column("config", JSONType, nullable=False),
-            sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
-            sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+            sa.Column("created_at", UTCDateTime(), nullable=False),
+            sa.Column("updated_at", UTCDateTime(), nullable=False),
         )
         self.datasets = sa.Table(
             "datasets",
@@ -149,7 +183,7 @@ class CoreStore:
             sa.Column("source", sa.String(64), primary_key=True),
             sa.Column("key", sa.Text, primary_key=True),
             sa.Column("info", JSONType, nullable=False),
-            sa.Column("discovered_at", sa.DateTime(timezone=True), nullable=False),
+            sa.Column("discovered_at", UTCDateTime(), nullable=False),
         )
         self.runs = sa.Table(
             "runs",
@@ -161,9 +195,22 @@ class CoreStore:
             sa.Column("mode", sa.String(16), nullable=False),
             sa.Column("status", sa.String(16), nullable=False),
             sa.Column("rows_written", sa.BigInteger, nullable=False, default=0),
-            sa.Column("started_at", sa.DateTime(timezone=True), nullable=False),
-            sa.Column("finished_at", sa.DateTime(timezone=True)),
+            sa.Column("started_at", UTCDateTime(), nullable=False),
+            sa.Column("finished_at", UTCDateTime()),
             sa.Column("error", sa.Text),
+        )
+        self.uploads = sa.Table(
+            "uploads",
+            self.metadata,
+            sa.Column("id", sa.Integer, primary_key=True, autoincrement=True),
+            sa.Column("source", sa.String(64), nullable=False, index=True),
+            sa.Column("filename", sa.Text, nullable=False),
+            sa.Column("size_bytes", sa.BigInteger, nullable=False),
+            sa.Column("sha256", sa.String(64), nullable=False),
+            sa.Column("mode", sa.String(16), nullable=False),
+            sa.Column("run_id", sa.Integer),
+            sa.Column("uploaded_at", UTCDateTime(), nullable=False),
+            sa.Column("content", sa.LargeBinary, nullable=False),
         )
 
     # -- setup -------------------------------------------------------------
@@ -273,7 +320,55 @@ class CoreStore:
         with self.db.connect() as conn:
             return [Run(**r._mapping) for r in conn.execute(query).all()]
 
+    # -- uploads -----------------------------------------------------------
+
+    def save_upload(self, source: str, filename: str, content: bytes, mode: str) -> int:
+        """Keep the uploaded file itself, so every loaded version can be traced back."""
+        with self.db.begin() as conn:
+            result = conn.execute(
+                sa.insert(self.uploads).values(
+                    source=source,
+                    filename=filename,
+                    size_bytes=len(content),
+                    sha256=hashlib.sha256(content).hexdigest(),
+                    mode=mode,
+                    uploaded_at=_now(),
+                    content=content,
+                )
+            )
+            return result.inserted_primary_key[0]
+
+    def link_upload(self, upload_id: int, run_id: int) -> None:
+        with self.db.begin() as conn:
+            conn.execute(sa.update(self.uploads).where(self.uploads.c.id == upload_id).values(run_id=run_id))
+
+    def list_uploads(self, source: str | None = None, limit: int = 50) -> list[Upload]:
+        cols = [c for c in self.uploads.c if c.name != "content"]
+        query = sa.select(*cols).order_by(self.uploads.c.id.desc()).limit(limit)
+        if source is not None:
+            query = query.where(self.uploads.c.source == source)
+        with self.db.connect() as conn:
+            return [Upload(**r._mapping) for r in conn.execute(query).all()]
+
+    def upload_content(self, upload_id: int) -> bytes:
+        with self.db.connect() as conn:
+            content = conn.execute(
+                sa.select(self.uploads.c.content).where(self.uploads.c.id == upload_id)
+            ).scalar()
+        if content is None:
+            raise LookupError(f"no upload {upload_id}")
+        return content
+
     # -- data --------------------------------------------------------------
+
+    def table_exists(self, table: str) -> bool:
+        return sa.inspect(self.db).has_table(table, schema=self.data_schema)
+
+    def count_rows(self, table: str) -> int | None:
+        if not self.table_exists(table):
+            return None
+        with self.db.connect() as conn:
+            return conn.execute(sa.text(f"SELECT COUNT(*) FROM {self.qualified(table)}")).scalar_one()
 
     def qualified(self, table: str) -> str:
         prep = self.db.dialect.identifier_preparer
@@ -314,7 +409,13 @@ class CoreStore:
         return rows
 
     def read_table(self, table: str, limit: int | None = None) -> list[dict[str, Any]]:
-        reflected = sa.Table(table, sa.MetaData(), schema=self.data_schema, autoload_with=self.db)
+        reflected = sa.Table(
+            table,
+            sa.MetaData(),
+            sa.Column(TIMESTAMP_COLUMN, UTCDateTime()),
+            schema=self.data_schema,
+            autoload_with=self.db,
+        )
         query = sa.select(reflected).order_by(reflected.c[ID_COLUMN]).limit(limit)
         with self.db.connect() as conn:
             return [dict(r._mapping) for r in conn.execute(query)]

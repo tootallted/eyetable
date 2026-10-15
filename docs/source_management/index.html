@@ -1,0 +1,700 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>eyetable · Source management</title>
+<meta name="description" content="Load CSV files into eyetable as named sources, and replace or append new versions.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23255f85'/%3E%3Cpath d='M8 11h16M8 16h16M8 21h16M13 8v16' stroke='white' stroke-width='2.4' stroke-linecap='round'/%3E%3C/svg%3E">
+<style>
+  :root {
+    --bg: #f6f7f9;
+    --surface: #ffffff;
+    --surface-2: #f0f2f5;
+    --border: #dde1e7;
+    --text: #1b2430;
+    --muted: #5d6b7c;
+    --accent: #255f85;
+    --accent-text: #ffffff;
+    --accent-soft: #e3eef6;
+    --ok: #1f7a4d;
+    --ok-soft: #e2f3ea;
+    --warn: #8a5a00;
+    --warn-soft: #fbf0d9;
+    --err: #b42318;
+    --err-soft: #fde8e6;
+    --focus: #3b82c4;
+    --shadow: 0 1px 2px rgba(16, 24, 40, .06), 0 1px 3px rgba(16, 24, 40, .08);
+    --mono: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f141a;
+      --surface: #171e26;
+      --surface-2: #1e2731;
+      --border: #2c3744;
+      --text: #e6ebf1;
+      --muted: #9aa8b8;
+      --accent: #6aaed8;
+      --accent-text: #0b1520;
+      --accent-soft: #1b3346;
+      --ok: #5cc98f;
+      --ok-soft: #173327;
+      --warn: #e0b154;
+      --warn-soft: #3a2e14;
+      --err: #f08a80;
+      --err-soft: #3d1d1a;
+      --focus: #8cc4ea;
+      --shadow: none;
+      color-scheme: dark;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  button, input, select { font: inherit; color: inherit; }
+  :focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+  code, .mono { font-family: var(--mono); font-size: .92em; }
+
+  header.top {
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+    padding: 14px 24px; background: var(--surface); border-bottom: 1px solid var(--border);
+  }
+  .brand { display: flex; align-items: baseline; gap: 10px; margin-right: auto; }
+  .brand b { font-size: 18px; letter-spacing: -.01em; }
+  .brand span { color: var(--muted); }
+  .pill {
+    display: inline-flex; align-items: center; gap: 8px; padding: 4px 12px;
+    border: 1px solid var(--border); border-radius: 999px; color: var(--muted); font-size: 13px;
+    max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
+  .pill.ok .dot { background: var(--ok); }
+  .pill.err .dot { background: var(--err); }
+
+  main { max-width: 1240px; margin: 0 auto; padding: 24px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 20px; }
+  .grid { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); gap: 20px; align-items: start; }
+  @media (max-width: 900px) { .grid { grid-template-columns: minmax(0, 1fr); } main { padding: 16px; } header.top { padding: 12px 16px; } }
+
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; box-shadow: var(--shadow); min-width: 0; }
+  .card > h2, .card-head { margin: 0; padding: 16px 20px 0; }
+  .card h2 { font-size: 16px; }
+  .card-head { display: flex; align-items: center; gap: 12px; }
+  .card-head h2 { padding: 0; margin-right: auto; }
+  .card-body { padding: 16px 20px 20px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; }
+  .card-body > * { min-width: 0; }
+  .hint { color: var(--muted); font-size: 13px; margin: 0; }
+
+  .btn {
+    display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+    padding: 8px 16px; border-radius: 8px; border: 1px solid var(--border);
+    background: var(--surface); cursor: pointer; font-weight: 500;
+  }
+  .btn:hover { background: var(--surface-2); }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+  .btn.primary:hover { filter: brightness(1.08); background: var(--accent); }
+  .btn:disabled { opacity: .5; cursor: not-allowed; filter: none; }
+  .btn.small { padding: 4px 10px; font-size: 13px; }
+  .link { background: none; border: 0; padding: 0; color: var(--accent); cursor: pointer; text-decoration: underline; }
+
+  label.field { display: grid; gap: 6px; font-size: 13px; font-weight: 600; }
+  input[type=text], input[type=password], input[type=url], select {
+    width: 100%; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--border);
+    background: var(--surface); font-weight: 400; font-size: 15px;
+  }
+  .field .note { font-weight: 400; color: var(--muted); }
+  .field .note.bad { color: var(--err); }
+  .check { display: flex; gap: 8px; align-items: center; font-size: 13px; color: var(--muted); }
+
+  .settings { border-color: var(--accent); }
+  .settings .row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; }
+  @media (max-width: 640px) { .settings .row { grid-template-columns: minmax(0, 1fr); } }
+  .settings .actions { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+
+  .drop {
+    display: grid; place-items: center; gap: 6px; text-align: center; padding: 32px 16px;
+    border: 2px dashed var(--border); border-radius: 12px; background: var(--surface-2);
+    cursor: pointer; transition: border-color .15s, background .15s;
+  }
+  .drop:hover, .drop.over { border-color: var(--accent); background: var(--accent-soft); }
+  .drop svg { color: var(--accent); }
+  .drop strong { font-size: 16px; }
+  .drop input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+
+  .file-chip { display: flex; gap: 12px; align-items: center; padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px; }
+  .file-chip .meta { min-width: 0; margin-right: auto; }
+  .file-chip .name { font-weight: 600; overflow-wrap: anywhere; }
+  .file-chip .sub { color: var(--muted); font-size: 13px; }
+
+  .segmented { display: inline-grid; grid-auto-flow: column; border: 1px solid var(--border); border-radius: 9px; padding: 3px; gap: 3px; background: var(--surface-2); }
+  .segmented button { border: 0; background: none; padding: 6px 14px; border-radius: 6px; cursor: pointer; color: var(--muted); font-weight: 500; }
+  .segmented button[aria-pressed=true] { background: var(--surface); color: var(--text); box-shadow: var(--shadow); }
+  .segmented button:disabled { cursor: not-allowed; opacity: .5; }
+
+  .modes { display: grid; gap: 10px; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  @media (max-width: 520px) { .modes { grid-template-columns: minmax(0, 1fr); } }
+  .mode { display: grid; gap: 4px; padding: 12px; border: 1px solid var(--border); border-radius: 10px; cursor: pointer; }
+  .mode:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); }
+  .mode .t { display: flex; gap: 8px; align-items: center; font-weight: 600; }
+  .mode .d { color: var(--muted); font-size: 13px; }
+
+  .target { font-size: 13px; color: var(--muted); }
+
+  .banner { padding: 10px 14px; border-radius: 10px; font-size: 14px; overflow-wrap: anywhere; }
+  .banner.ok { background: var(--ok-soft); color: var(--ok); }
+  .banner.err { background: var(--err-soft); color: var(--err); }
+  .banner.warn { background: var(--warn-soft); color: var(--warn); }
+
+  .table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 10px; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--border); white-space: nowrap; vertical-align: top; }
+  th { background: var(--surface-2); color: var(--muted); font-weight: 600; position: sticky; top: 0; }
+  tbody tr:last-child td { border-bottom: 0; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  td.null { color: var(--muted); font-style: italic; }
+  th.et, td.et { background: color-mix(in srgb, var(--accent-soft) 45%, transparent); }
+  tr.clickable { cursor: pointer; }
+  tr.clickable:hover td { background: var(--surface-2); }
+  tr.selected td { background: var(--accent-soft); }
+  .tag { display: inline-block; padding: 1px 8px; border-radius: 999px; background: var(--surface-2); border: 1px solid var(--border); font-size: 12px; color: var(--muted); }
+  .empty { padding: 28px 16px; text-align: center; color: var(--muted); }
+
+  .detail-head { display: flex; gap: 12px; align-items: baseline; flex-wrap: wrap; }
+  .detail-head h2 { margin: 0; font-size: 18px; }
+  .stats { display: flex; gap: 24px; flex-wrap: wrap; }
+  .stat .k { font-size: 12px; color: var(--muted); }
+  .stat .v { font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .stat { min-width: 0; }
+  .stat .v.mono { font-size: 14px; font-weight: 500; overflow-wrap: anywhere; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="brand"><b>eyetable</b><span>Source management</span></div>
+  <span class="pill" id="status"><span class="dot"></span><span id="status-text">Not connected</span></span>
+  <button class="btn small" id="toggle-settings" type="button">Connection</button>
+</header>
+
+<main>
+  <section class="card settings" id="settings" hidden aria-labelledby="settings-title">
+    <h2 id="settings-title">Connect to your eyetable API</h2>
+    <div class="card-body">
+      <p class="hint">This page runs in your browser and talks to the eyetable API you run with
+        <code>eyetable serve</code>. Your data goes from this page straight to that API, nowhere else.</p>
+      <div class="row">
+        <label class="field">API URL
+          <input type="url" id="api-base" placeholder="http://localhost:8765" autocomplete="off" spellcheck="false">
+        </label>
+        <label class="field">API token
+          <input type="password" id="api-token" placeholder="EYETABLE_API_TOKEN" autocomplete="off">
+        </label>
+      </div>
+      <div class="actions">
+        <button class="btn primary" id="connect" type="button">Connect</button>
+        <label class="check"><input type="checkbox" id="remember"> Remember on this browser</label>
+        <span class="hint" id="settings-msg" role="status"></span>
+      </div>
+    </div>
+  </section>
+
+  <div class="grid">
+    <section class="card" aria-labelledby="load-title">
+      <h2 id="load-title">Load a file</h2>
+      <div class="card-body">
+        <label class="drop" id="drop">
+          <input type="file" id="file-input" accept=".csv,text/csv">
+          <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 16V4M7 9l5-5 5 5"/><path d="M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3"/></svg>
+          <strong>Drop a CSV file here</strong>
+          <span class="hint">or click to choose one</span>
+        </label>
+
+        <div id="staged" hidden>
+          <div style="display:grid; gap:16px">
+            <div class="file-chip">
+              <div class="meta">
+                <div class="name" id="file-name"></div>
+                <div class="sub" id="file-sub"></div>
+              </div>
+              <button class="btn small" id="clear-file" type="button">Remove</button>
+            </div>
+            <div class="table-wrap" id="local-preview"></div>
+
+            <div style="display:grid; gap:10px">
+              <div class="segmented" role="group" aria-label="Destination">
+                <button type="button" id="dest-new" aria-pressed="true">New source</button>
+                <button type="button" id="dest-existing" aria-pressed="false">Existing source</button>
+              </div>
+
+              <div id="new-fields">
+                <label class="field">Source name
+                  <input type="text" id="new-name" autocomplete="off" spellcheck="false">
+                  <span class="note" id="name-note">Lowercase letters, digits and _, starting with a letter.</span>
+                </label>
+              </div>
+
+              <div id="existing-fields" hidden style="display:grid; gap:12px">
+                <label class="field">Source
+                  <select id="existing-source"></select>
+                </label>
+                <div class="modes" role="radiogroup" aria-label="What to do with the existing table">
+                  <label class="mode">
+                    <span class="t"><input type="radio" name="mode" value="replace" checked> Replace contents</span>
+                    <span class="d">The table is rebuilt from this file. ET_id starts again at 1.</span>
+                  </label>
+                  <label class="mode">
+                    <span class="t"><input type="radio" name="mode" value="append"> Append rows</span>
+                    <span class="d">Rows are added after the existing ones. ET_id continues.</span>
+                  </label>
+                </div>
+              </div>
+
+              <div class="target" id="target"></div>
+            </div>
+
+            <button class="btn primary" id="load" type="button" disabled>Load into eyetable</button>
+          </div>
+        </div>
+        <div id="load-result" role="status"></div>
+      </div>
+    </section>
+
+    <section class="card" aria-labelledby="sources-title">
+      <div class="card-head">
+        <h2 id="sources-title">Sources</h2>
+        <button class="btn small" id="refresh" type="button">Refresh</button>
+      </div>
+      <div class="card-body">
+        <div class="table-wrap" id="sources"><div class="empty">Connect to see your sources.</div></div>
+      </div>
+    </section>
+  </div>
+
+  <section class="card" id="detail" hidden aria-live="polite">
+    <div class="card-body">
+      <div class="detail-head">
+        <h2 id="detail-name"></h2>
+        <span class="tag" id="detail-type"></span>
+      </div>
+      <div class="stats" id="detail-stats"></div>
+      <div>
+        <h3 style="font-size:14px; margin:0 0 8px">First rows</h3>
+        <div class="table-wrap" id="detail-preview"></div>
+      </div>
+      <div>
+        <h3 style="font-size:14px; margin:0 0 8px">File history</h3>
+        <div class="table-wrap" id="detail-history"></div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script>
+  // Default eyetable API URL for this page. Empty: same origin when served by
+  // `eyetable serve`, http://localhost:8765 on GitHub Pages. The Connection
+  // panel overrides it per browser.
+  var API_BASE = '';
+
+  (function () {
+    'use strict';
+    var SOURCE_NAME = /^[a-z][a-z0-9_]{0,39}$/;
+    var ET_COLUMNS = ['ET_id', 'ET_timestamp', 'ET_source', 'ET_run_id'];
+    var KEY_BASE = 'eyetable.apiBase', KEY_TOKEN = 'eyetable.apiToken';
+
+    var state = { base: '', token: '', connected: false, sources: [], file: null, dest: 'new', selected: null };
+    var $ = function (id) { return document.getElementById(id); };
+
+    // -- storage (each access guarded: private windows and blocked storage throw) --
+    function read(store, key) { try { return window[store].getItem(key) || ''; } catch (e) { return ''; } }
+    function write(store, key, value) { try { value ? window[store].setItem(key, value) : window[store].removeItem(key); } catch (e) {} }
+
+    function defaultBase() {
+      if (API_BASE) return API_BASE;
+      if (location.protocol.indexOf('http') === 0 && !/\.github\.io$/.test(location.hostname)) return location.origin;
+      return 'http://localhost:8765';
+    }
+
+    // -- DOM helpers -------------------------------------------------------
+    function el(tag, attrs, children) {
+      var node = document.createElement(tag);
+      if (attrs) Object.keys(attrs).forEach(function (k) {
+        if (k === 'text') node.textContent = attrs[k];
+        else if (k === 'class') node.className = attrs[k];
+        else node.setAttribute(k, attrs[k]);
+      });
+      (children || []).forEach(function (c) { if (c) node.appendChild(typeof c === 'string' ? document.createTextNode(c) : c); });
+      return node;
+    }
+    function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); return node; }
+    function fmtInt(n) { return n === null || n === undefined ? '—' : Number(n).toLocaleString(); }
+    function plural(n, word) { return fmtInt(n) + ' ' + word + (n === 1 ? '' : 's'); }
+    function fmtBytes(n) { return n < 1024 ? n + ' B' : n < 1048576 ? (n / 1024).toFixed(1) + ' KB' : (n / 1048576).toFixed(1) + ' MB'; }
+    function fmtTime(s) {
+      if (!s) return '—';
+      var d = new Date(s);
+      return isNaN(d) ? s : d.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+    }
+    function banner(kind, text) { return el('div', { class: 'banner ' + kind, text: text }); }
+
+    function dataTable(columns, rows, opts) {
+      opts = opts || {};
+      if (!rows.length) return el('div', { class: 'empty', text: opts.empty || 'No rows.' });
+      var head = el('tr', null, columns.map(function (c) {
+        return el('th', { class: (ET_COLUMNS.indexOf(c) >= 0 ? 'et ' : '') + (opts.numeric && opts.numeric[c] ? 'num' : ''), text: c, scope: 'col' });
+      }));
+      var body = rows.map(function (r) {
+        return el('tr', null, r.map(function (v, i) {
+          var c = columns[i], cls = ET_COLUMNS.indexOf(c) >= 0 ? 'et ' : '';
+          if (v === null || v === undefined) return el('td', { class: cls + 'null', text: 'null' });
+          if (typeof v === 'number') cls += 'num';
+          if (typeof v === 'object') v = JSON.stringify(v);
+          if (c === 'ET_timestamp') v = fmtTime(v);
+          return el('td', { class: cls, text: String(v) });
+        }));
+      });
+      return el('table', null, [el('thead', null, [head]), el('tbody', null, body)]);
+    }
+
+    // -- API ---------------------------------------------------------------
+    function api(path, options) {
+      options = options || {};
+      var headers = Object.assign({ Authorization: 'Bearer ' + state.token }, options.headers || {});
+      return fetch(state.base.replace(/\/+$/, '') + path, Object.assign({}, options, { headers: headers }))
+        .catch(function () {
+          throw new Error("Can't reach the eyetable API at " + state.base + '. Is `eyetable serve` running?');
+        })
+        .then(function (res) {
+          return res.text().then(function (text) {
+            var body = null;
+            try { body = text ? JSON.parse(text) : null; } catch (e) {}
+            if (!res.ok) {
+              var detail = body && body.detail;
+              if (detail && typeof detail !== 'string') detail = JSON.stringify(detail);
+              var err = new Error(detail || res.status + ' ' + res.statusText);
+              err.status = res.status;
+              throw err;
+            }
+            return body;
+          });
+        });
+    }
+
+    function setStatus(kind, text) {
+      $('status').className = 'pill ' + kind;
+      $('status-text').textContent = text;
+      $('status').title = text;
+    }
+
+    function connect() {
+      state.base = $('api-base').value.trim() || defaultBase();
+      state.token = $('api-token').value.trim();
+      var remember = $('remember').checked;
+      write('localStorage', KEY_BASE, remember ? state.base : '');
+      write('localStorage', KEY_TOKEN, remember ? state.token : '');
+      write('sessionStorage', KEY_BASE, state.base);
+      write('sessionStorage', KEY_TOKEN, state.token);
+      $('settings-msg').textContent = 'Connecting…';
+      return refresh().then(function () {
+        $('settings-msg').textContent = '';
+        $('settings').hidden = true;
+      }, function (err) {
+        $('settings-msg').textContent = err.status === 401 ? 'The API rejected that token.' : err.message;
+        $('settings').hidden = false;
+      });
+    }
+
+    function refresh() {
+      return api('/api/sources').then(function (sources) {
+        state.connected = true;
+        state.sources = sources;
+        var host = state.base.replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+        setStatus('ok', 'Connected to ' + host);
+        renderSources();
+        renderDestination();
+        if (state.selected) selectSource(state.selected);
+      }, function (err) {
+        state.connected = false;
+        setStatus('err', err.status === 401 ? 'Token rejected' : 'Not connected');
+        clear($('sources')).appendChild(el('div', { class: 'empty', text: err.message }));
+        renderDestination();
+        throw err;
+      });
+    }
+
+    // -- sources list ------------------------------------------------------
+    function renderSources() {
+      var wrap = clear($('sources'));
+      if (!state.sources.length) {
+        wrap.appendChild(el('div', { class: 'empty', text: 'No sources yet. Drop a CSV to create your first one.' }));
+        return;
+      }
+      var head = el('tr', null, ['Source', 'Type', 'Table', 'Rows', 'Last file', 'Updated'].map(function (h, i) {
+        return el('th', { class: i === 3 ? 'num' : '', text: h, scope: 'col' });
+      }));
+      var rows = state.sources.map(function (s) {
+        var tr = el('tr', { class: 'clickable' + (s.name === state.selected ? ' selected' : ''), tabindex: '0' }, [
+          el('td', null, [el('strong', { text: s.name })]),
+          el('td', null, [el('span', { class: 'tag', text: s.type })]),
+          el('td', { class: 'mono', text: s.table ? 'eyetable_raw.' + s.table : s.datasets + ' dataset(s)' }),
+          el('td', { class: 'num', text: s.type === 'file' ? fmtInt(s.rows) : '—' }),
+          el('td', { text: s.last_upload ? s.last_upload.filename : '—' }),
+          el('td', { text: fmtTime(s.updated_at) })
+        ]);
+        var pick = function () { selectSource(s.name); };
+        tr.addEventListener('click', pick);
+        tr.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); pick(); } });
+        return tr;
+      });
+      wrap.appendChild(el('table', null, [el('thead', null, [head]), el('tbody', null, rows)]));
+    }
+
+    function selectSource(name) {
+      state.selected = name;
+      renderSources();
+      var src = state.sources.filter(function (s) { return s.name === name; })[0];
+      if (src && src.type === 'file') {
+        $('existing-source').value = name;
+        if (state.file && state.dest === 'existing') renderTarget();
+      }
+      Promise.all([
+        api('/api/sources/' + encodeURIComponent(name)),
+        src && src.type === 'file' ? api('/api/sources/' + encodeURIComponent(name) + '/preview?limit=20') : Promise.resolve(null)
+      ]).then(function (results) { renderDetail(results[0], results[1]); }, function (err) {
+        $('detail').hidden = false;
+        clear($('detail-preview')).appendChild(banner('err', err.message));
+      });
+    }
+
+    function renderDetail(src, preview) {
+      $('detail').hidden = false;
+      $('detail-name').textContent = src.name;
+      $('detail-type').textContent = src.type + ' source';
+      var stats = clear($('detail-stats'));
+      var stat = function (k, v, mono) { stats.appendChild(el('div', { class: 'stat' }, [el('div', { class: 'k', text: k }), el('div', { class: 'v' + (mono ? ' mono' : ''), text: v })])); };
+      if (src.type === 'file') {
+        stat('Rows', fmtInt(src.rows));
+        stat('Columns', fmtInt(src.columns));
+        stat('Files loaded', fmtInt(src.uploads.length));
+        stat('Table', 'eyetable_raw.' + src.table, true);
+      } else {
+        stat('Datasets', fmtInt(src.datasets));
+        stat('Runs', fmtInt(src.runs.length));
+      }
+
+      var pv = clear($('detail-preview'));
+      if (preview) pv.appendChild(dataTable(preview.columns, preview.rows, { empty: 'The table is empty.' }));
+      else pv.appendChild(el('div', { class: 'empty', text: 'Previews are shown for file sources. Use the CLI to ingest ' + src.type + ' sources.' }));
+
+      var hist = clear($('detail-history'));
+      var runsById = {};
+      src.runs.forEach(function (r) { runsById[r.id] = r; });
+      if (!src.uploads.length) { hist.appendChild(el('div', { class: 'empty', text: 'No files loaded.' })); return; }
+      hist.appendChild(dataTable(
+        ['When', 'File', 'Size', 'Mode', 'Rows written', 'Status'],
+        src.uploads.map(function (u) {
+          var run = runsById[u.run_id] || {};
+          return [fmtTime(u.uploaded_at), u.filename, fmtBytes(u.size_bytes), u.mode, run.rows_written === undefined ? null : run.rows_written, run.status || null];
+        })
+      ));
+    }
+
+    // -- staging a file ----------------------------------------------------
+    function sanitize(name) {
+      var s = name.toLowerCase().replace(/\.[^.]*$/, '').replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+      if (!s) s = 'source';
+      if (!/^[a-z]/.test(s)) s = 's_' + s;
+      return s.slice(0, 40).replace(/_+$/, '');
+    }
+
+    // Small RFC 4180 parser, for the local preview only; the API parses for real.
+    function parseCsv(text, limit) {
+      var first = text.slice(0, text.indexOf('\n') > 0 ? text.indexOf('\n') : text.length);
+      var delim = [',', ';', '\t', '|'].map(function (d) { return [d, first.split(d).length]; })
+        .sort(function (a, b) { return b[1] - a[1]; })[0][0];
+      var rows = [], row = [], cell = '', quoted = false, count = 0;
+      for (var i = 0; i < text.length; i++) {
+        var ch = text[i];
+        if (quoted) {
+          if (ch === '"') { if (text[i + 1] === '"') { cell += '"'; i++; } else quoted = false; }
+          else cell += ch;
+        } else if (ch === '"') quoted = true;
+        else if (ch === delim) { row.push(cell); cell = ''; }
+        else if (ch === '\n' || ch === '\r') {
+          if (ch === '\r' && text[i + 1] === '\n') i++;
+          row.push(cell); cell = '';
+          if (row.some(function (c) { return c.trim() !== ''; })) { count++; if (rows.length < limit) rows.push(row); }
+          row = [];
+        } else cell += ch;
+      }
+      row.push(cell);
+      if (row.some(function (c) { return c.trim() !== ''; })) { count++; if (rows.length < limit) rows.push(row); }
+      return { rows: rows, count: count };
+    }
+
+    function stage(file) {
+      $('load-result').textContent = '';
+      if (!/\.csv$/i.test(file.name)) {
+        clear($('load-result')).appendChild(banner('err', file.name + ' is not a .csv file. Only CSV files are accepted for now.'));
+        return;
+      }
+      state.file = file;
+      $('staged').hidden = false;
+      $('file-name').textContent = file.name;
+      $('file-sub').textContent = fmtBytes(file.size) + ' · reading…';
+      $('new-name').value = sanitize(file.name);
+      var matching = state.sources.filter(function (s) { return s.type === 'file' && s.name === sanitize(file.name); })[0];
+      setDest(matching ? 'existing' : 'new');
+      if (matching) $('existing-source').value = matching.name;
+      file.text().then(function (text) {
+        if (state.file !== file) return;
+        var parsed = parseCsv(text.replace(/^﻿/, ''), 6);
+        var header = parsed.rows[0] || [];
+        $('file-sub').textContent = fmtBytes(file.size) + ' · ' + plural(header.length, 'column') + ' · ' + plural(Math.max(parsed.count - 1, 0), 'row');
+        clear($('local-preview')).appendChild(dataTable(header, parsed.rows.slice(1), { empty: 'Only a header row.' }));
+      });
+      validate();
+    }
+
+    function unstage() {
+      state.file = null;
+      $('staged').hidden = true;
+      $('file-input').value = '';
+      clear($('local-preview'));
+    }
+
+    function fileSources() { return state.sources.filter(function (s) { return s.type === 'file'; }); }
+
+    function setDest(dest) {
+      if (dest === 'existing' && !fileSources().length) dest = 'new';
+      state.dest = dest;
+      $('dest-new').setAttribute('aria-pressed', String(dest === 'new'));
+      $('dest-existing').setAttribute('aria-pressed', String(dest === 'existing'));
+      $('new-fields').hidden = dest !== 'new';
+      $('existing-fields').hidden = dest !== 'existing';
+      renderTarget();
+      validate();
+    }
+
+    function renderDestination() {
+      var sel = $('existing-source'), current = sel.value;
+      clear(sel);
+      fileSources().forEach(function (s) { sel.appendChild(el('option', { value: s.name, text: s.name + ' (' + fmtInt(s.rows) + ' rows)' })); });
+      if (current) sel.value = current;
+      $('dest-existing').disabled = !fileSources().length;
+      $('dest-existing').title = fileSources().length ? '' : 'No file sources yet';
+      if (state.dest === 'existing' && !fileSources().length) setDest('new');
+      renderTarget();
+      validate();
+    }
+
+    function chosenMode() { return document.querySelector('input[name=mode]:checked').value; }
+
+    function renderTarget() {
+      var t = $('target');
+      clear(t);
+      if (state.dest === 'new') {
+        var name = $('new-name').value.trim();
+        if (SOURCE_NAME.test(name)) t.append('Creates source ', el('strong', { text: name }), ' and table ', el('code', { text: 'eyetable_raw.' + name + '__data' }), '.');
+      } else {
+        var s = fileSources().filter(function (x) { return x.name === $('existing-source').value; })[0];
+        if (s) {
+          t.append(chosenMode() === 'replace' ? 'Replaces the ' : 'Appends to the ', plural(s.rows, 'row') + ' in ', el('code', { text: 'eyetable_raw.' + s.table }), '.');
+        }
+      }
+    }
+
+    function validate() {
+      var ok = !!state.file && state.connected;
+      if (state.dest === 'new') {
+        var name = $('new-name').value.trim(), note = $('name-note');
+        var taken = state.sources.some(function (s) { return s.name === name; });
+        var valid = SOURCE_NAME.test(name) && !taken;
+        note.className = 'note' + (name && !valid ? ' bad' : '');
+        note.textContent = taken ? 'A source named ' + name + ' already exists. Choose Existing source to load a new version.'
+          : name && !SOURCE_NAME.test(name) ? 'Use lowercase letters, digits and _, starting with a letter (max 40).'
+          : 'Lowercase letters, digits and _, starting with a letter.';
+        ok = ok && valid;
+      } else {
+        ok = ok && !!$('existing-source').value;
+      }
+      $('load').disabled = !ok;
+      $('load').title = state.connected ? '' : 'Connect to the API first';
+    }
+
+    function load() {
+      var file = state.file;
+      var isNew = state.dest === 'new';
+      var name = isNew ? $('new-name').value.trim() : $('existing-source').value;
+      var mode = isNew ? 'replace' : chosenMode();
+      if (!isNew && mode === 'replace') {
+        var s = fileSources().filter(function (x) { return x.name === name; })[0];
+        if (s && s.rows && !confirm('Replace all ' + plural(s.rows, 'row') + ' in ' + name + ' with the contents of ' + file.name + '?')) return;
+      }
+      var form = new FormData();
+      form.append('file', file, file.name);
+      form.append('mode', mode);
+      form.append('create', isNew ? 'true' : 'false');
+      $('load').disabled = true;
+      $('load').textContent = 'Loading…';
+      var result = clear($('load-result'));
+      api('/api/sources/' + encodeURIComponent(name) + '/uploads', { method: 'POST', body: form }).then(function (r) {
+        var verb = isNew ? 'created' : mode === 'replace' ? 'replaced the contents of' : 'were appended to';
+        var text = isNew
+          ? plural(r.rows, 'row') + ' from ' + r.filename + ' created source ' + name + ' (eyetable_raw.' + r.table + ').'
+          : plural(r.rows, 'row') + ' from ' + r.filename + ' ' + (r.rows === 1 && mode === 'append' ? 'was appended to' : verb) + ' eyetable_raw.' + r.table + ', which now has ' + plural(r.source.rows, 'row') + '.';
+        result.appendChild(banner('ok', text));
+        unstage();
+        state.selected = name;
+        return refresh();
+      }, function (err) {
+        result.appendChild(banner('err', 'Not loaded: ' + err.message));
+      }).then(function () {
+        $('load').textContent = 'Load into eyetable';
+        validate();
+      });
+    }
+
+    // -- wiring ------------------------------------------------------------
+    var drop = $('drop');
+    $('file-input').addEventListener('change', function (e) { if (e.target.files[0]) stage(e.target.files[0]); });
+    ['dragenter', 'dragover'].forEach(function (t) {
+      document.addEventListener(t, function (e) { if (e.dataTransfer && Array.prototype.indexOf.call(e.dataTransfer.types, 'Files') >= 0) { e.preventDefault(); drop.classList.add('over'); } });
+    });
+    ['dragleave', 'drop'].forEach(function (t) {
+      document.addEventListener(t, function (e) { if (t === 'drop' || e.relatedTarget === null) drop.classList.remove('over'); });
+    });
+    document.addEventListener('drop', function (e) {
+      if (!e.dataTransfer || !e.dataTransfer.files.length) return;
+      e.preventDefault();
+      stage(e.dataTransfer.files[0]);
+    });
+    $('clear-file').addEventListener('click', unstage);
+    $('dest-new').addEventListener('click', function () { setDest('new'); });
+    $('dest-existing').addEventListener('click', function () { setDest('existing'); });
+    $('new-name').addEventListener('input', function () { renderTarget(); validate(); });
+    $('existing-source').addEventListener('change', function () { renderTarget(); validate(); });
+    document.querySelectorAll('input[name=mode]').forEach(function (r) { r.addEventListener('change', renderTarget); });
+    $('load').addEventListener('click', load);
+    $('refresh').addEventListener('click', function () { refresh().catch(function () {}); });
+    $('connect').addEventListener('click', connect);
+    $('api-token').addEventListener('keydown', function (e) { if (e.key === 'Enter') connect(); });
+    $('toggle-settings').addEventListener('click', function () { $('settings').hidden = !$('settings').hidden; });
+
+    // -- start -------------------------------------------------------------
+    var savedBase = read('sessionStorage', KEY_BASE) || read('localStorage', KEY_BASE);
+    var savedToken = read('sessionStorage', KEY_TOKEN) || read('localStorage', KEY_TOKEN);
+    // A newer tunnel URL from the page beats an old saved one.
+    $('api-base').value = API_BASE || savedBase || defaultBase();
+    $('api-token').value = savedToken;
+    $('remember').checked = !!read('localStorage', KEY_TOKEN);
+    renderDestination();
+    if (savedToken) connect(); else $('settings').hidden = false;
+  })();
+</script>
+</body>
+</html>

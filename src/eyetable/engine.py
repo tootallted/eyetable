@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from eyetable.connectors import Connector, build_connector
+from eyetable.connectors.file import DATASET_KEY, FileConnector
 from eyetable.credentials import resolve_env
 from eyetable.identifiers import SOURCE_NAME, table_name
 from eyetable.models import DatasetInfo
@@ -21,6 +22,7 @@ class RunResult:
     status: str  # "succeeded" | "failed"
     rows: int
     error: str | None = None
+    upload_id: int | None = None
 
 
 class UnknownDataset(KeyError):
@@ -57,6 +59,47 @@ class Engine:
             with self._open(type_, config) as conn:
                 conn.test()
         self.store.save_source(name, type_, config)
+
+    def ingest_upload(
+        self, source: str, filename: str, content: bytes, mode: str = "replace", create: bool = False
+    ) -> RunResult:
+        """Load an uploaded file into a file source's table.
+
+        With `create`, the file source is registered first; otherwise it must
+        already exist, and `mode` says whether this version of the file
+        replaces the table's contents or is appended to them. The file is
+        parsed before anything is registered or written, so a bad file
+        changes nothing except being rejected.
+        """
+        if mode not in ("replace", "append"):
+            raise ValueError(f"mode must be replace or append, got {mode!r}")
+        config = {"format": "csv"}
+        if not create:
+            src = self.store.get_source(source)
+            if src.type != "file":
+                raise ValueError(f"{source!r} is a {src.type} source; files can only be loaded into file sources")
+            config = src.config
+        conn = FileConnector(resolve_env(config, self._environ), content=content, filename=filename)
+        [dataset] = conn.discover()  # parses, raising on an unreadable file
+        if create:
+            self.add_source(source, "file", config)
+
+        upload_id = self.store.save_upload(source, filename, content, mode)
+        dataset.detail["upload_id"] = upload_id
+        table = table_name(source, dataset.name)
+        run_id = self.store.start_run(source, DATASET_KEY, table, mode)
+        self.store.link_upload(upload_id, run_id)
+        try:
+            rows = self.store.write(
+                table, conn.read(DATASET_KEY), mode, run_id, origin=f"{source} - {conn.origin(DATASET_KEY)}"
+            )
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            self.store.finish_run(run_id, "failed", 0, error)
+            return RunResult(run_id, DATASET_KEY, table, "failed", 0, error, upload_id)
+        self.store.finish_run(run_id, "succeeded", rows)
+        self.store.save_catalog(source, [dataset])
+        return RunResult(run_id, DATASET_KEY, table, "succeeded", rows, upload_id=upload_id)
 
     def discover(self, source: str) -> list[DatasetInfo]:
         """Walk the source's metadata, record every dataset found in the catalog."""

@@ -32,6 +32,10 @@ ones you want into a core Postgres database where every run is logged.
   auth with inheritance all carry over. Discovery sends each `GET` once to learn
   its columns and row count; other methods are listed but never sent unless you
   opt in with `--allow-method`.
+* **File sources** are CSV files you drop on the source management page (or
+  load with `eyetable upload`). Name the source once; each later version of the
+  file either replaces the table's contents or is appended to them. Every
+  uploaded file is kept in `eyetable.uploads`.
 * **Core storage** is Postgres. Metadata lives in the `eyetable` schema; each
   ingested dataset lands in `eyetable_raw.<source>__<dataset>`. Column types are
   inferred and widened as data changes; new fields become new columns.
@@ -98,6 +102,45 @@ only when the engine connects. Put the values in your shell or a `.env` file.
 
 For SQL Server: `--driver mssql+pyodbc --query "driver=ODBC Driver 18 for SQL Server"`
 (install with `pip install -e ".[mssql]"`).
+
+## Source management page
+
+`eyetable serve` runs the web API and the source management page:
+
+```powershell
+# once: add a long random token to .env as EYETABLE_API_TOKEN
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+
+eyetable serve                   # http://127.0.0.1:8765/source_management/
+```
+
+The page is also published at
+<https://tootallted.github.io/eyetable/source_management/> (GitHub Pages serves
+the `docs/` folder). That copy is only the page: it runs in your browser and
+calls the API you run, by default at `http://localhost:8765`. Click
+**Connection** to point it at another URL. The page asks for the API token
+and keeps it for the browser session, or longer if you tick *Remember*.
+
+* **Drop a CSV** to see its columns and first rows before anything is sent.
+* **New source:** name it (lowercase letters, digits, `_`) and it is created
+  with table `eyetable_raw.<name>__data`.
+* **Existing source:** drop the next version of the file and choose **Replace
+  contents** (the table is rebuilt from the file; `ET_id` restarts at 1) or
+  **Append rows** (`ET_id` continues). A file whose name matches a source is
+  matched to it automatically.
+* Click a source to see its first rows and the history of every file loaded.
+
+CSV handling: the delimiter (`,` `;` tab `|`) is detected from the header line,
+UTF-8 (with or without a BOM) and Windows-1252 are read, and a column becomes a
+number, boolean, date or timestamp only when every value in it parses as one.
+Values with leading zeros (`007`) stay text. The same load from the command
+line: `eyetable upload parts parts.csv --create`, then
+`eyetable upload parts parts_v2.csv --mode append`.
+
+Every `/api` route except `/api/health` requires the token, and browsers may
+only call the API from the origins in `EYETABLE_CORS_ORIGINS` (default
+`https://tootallted.github.io`). Uploads are limited to 50 MB
+(`EYETABLE_MAX_UPLOAD_MB`). API docs: `/api/docs`.
 
 ## Where rows come from in an API response
 

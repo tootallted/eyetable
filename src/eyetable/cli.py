@@ -209,3 +209,58 @@ def runs(source: Annotated[Optional[str], typer.Argument()] = None, limit: int =
         table.add_row(str(r.id), r.source, r.dataset_key, r.status, str(r.rows_written),
                       f"{r.started_at:%Y-%m-%d %H:%M:%S}", r.error or "")
     console.print(table)
+
+
+@app.command()
+def upload(
+    source: str,
+    file: Annotated[Path, typer.Argument(help="CSV file to load.", exists=True, dir_okay=False)],
+    mode: Annotated[str, typer.Option(help="replace or append, for an existing file source")] = "replace",
+    create: Annotated[bool, typer.Option(help="Register SOURCE as a new file source first.")] = False,
+) -> None:
+    """Load a CSV file into a file source (same as dropping it on the web page)."""
+    try:
+        result = _engine().ingest_upload(source, file.name, file.read_bytes(), mode=mode, create=create)
+    except Exception as exc:
+        _fail(str(exc))
+    if result.status != "succeeded":
+        _fail(result.error or "ingestion failed")
+    console.print(f"{result.rows} row(s) from {file.name} -> [bold]{result.table}[/bold] ({mode})")
+
+
+@app.command()
+def serve(
+    host: Annotated[str, typer.Option(help="Interface to listen on.")] = "127.0.0.1",
+    port: int = 8765,
+) -> None:
+    """Run the web API and the source management page.
+
+    Needs EYETABLE_API_TOKEN (any long random string); the page asks for it.
+    EYETABLE_CORS_ORIGINS (comma-separated) lists the sites allowed to call the
+    API; default https://tootallted.github.io.
+    """
+    import os
+
+    import uvicorn
+
+    from eyetable.api import DEFAULT_CORS_ORIGINS, DEFAULT_MAX_UPLOAD_BYTES, create_app
+
+    s = load_settings()
+    token = os.environ.get("EYETABLE_API_TOKEN", "")
+    if len(token) < 16:
+        _fail(
+            "set EYETABLE_API_TOKEN to a random string of 16+ characters (in .env or the shell), e.g.\n"
+            "  python -c \"import secrets; print(secrets.token_urlsafe(32))\""
+        )
+    origins = [o.strip() for o in os.environ.get("EYETABLE_CORS_ORIGINS", "").split(",") if o.strip()]
+    max_mb = os.environ.get("EYETABLE_MAX_UPLOAD_MB")
+    store = CoreStore(s.database_url, s.meta_schema, s.data_schema)
+    store.init()
+    app_ = create_app(
+        Engine(store),
+        token,
+        cors_origins=origins or DEFAULT_CORS_ORIGINS,
+        max_upload_bytes=int(max_mb) * 1024 * 1024 if max_mb else DEFAULT_MAX_UPLOAD_BYTES,
+    )
+    console.print(f"source management: [bold]http://{host}:{port}/source_management/[/bold]")
+    uvicorn.run(app_, host=host, port=port)
