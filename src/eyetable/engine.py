@@ -92,7 +92,8 @@ class Engine:
                 table = table_name(source, catalog[key].name)
                 run_id = self.store.start_run(source, key, table, mode)
                 try:
-                    rows = self.store.write(table, conn.read(key, batch_size), mode, run_id)
+                    origin = f"{source} - {conn.origin(key)}"
+                    rows = self.store.write(table, conn.read(key, batch_size), mode, run_id, origin=origin)
                 except Exception as exc:
                     error = f"{type(exc).__name__}: {exc}"
                     self.store.finish_run(run_id, "failed", 0, error)

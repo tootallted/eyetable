@@ -385,6 +385,16 @@ class PostmanConnector(Connector):
     def close(self) -> None:
         self._client.close()
 
+    def origin(self, key: str) -> str:
+        """The request's endpoint: resolved URL without its query string, which may hold keys."""
+        request = self.requests.get(key)
+        if request is None:
+            return key
+        url = resolve(raw_url(request.url), self.variables)
+        if "://" not in url:
+            url = "http://" + url
+        return str(httpx.URL(url).copy_with(query=None, fragment=None))
+
     def test(self) -> None:
         if not self.requests:
             raise ValueError("collection contains no requests")

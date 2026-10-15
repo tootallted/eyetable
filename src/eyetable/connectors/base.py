@@ -30,6 +30,10 @@ class Connector(ABC):
     def read(self, key: str, batch_size: int = 1000) -> Iterator[list[Record]]:
         """Yield the rows of one dataset in batches."""
 
+    def origin(self, key: str) -> str:
+        """Where a dataset's rows come from (its table, or its API endpoint)."""
+        return key
+
     def close(self) -> None:
         pass
 

@@ -33,11 +33,27 @@ ones you want into a core Postgres database where every run is logged.
   its columns and row count; other methods are listed but never sent unless you
   opt in with `--allow-method`.
 * **Core storage** is Postgres. Metadata lives in the `eyetable` schema; each
-  ingested dataset lands in `eyetable_raw.<source>__<dataset>`, with
-  `_eyetable_run_id` and `_eyetable_loaded_at` on every row. Column types are
+  ingested dataset lands in `eyetable_raw.<source>__<dataset>`. Column types are
   inferred and widened as data changes; new fields become new columns.
   `replace` mode loads into a staging table and swaps it in only when the whole
   pull succeeds; `append` adds rows.
+
+### Columns on every ingested row
+
+However a table is ingested, every row gets these columns ahead of its data:
+
+| column         | type          | value                                                               |
+|----------------|---------------|---------------------------------------------------------------------|
+| `ET_id`        | `bigint`      | identity: 1 for a new table's first row, then +1 per row            |
+| `ET_timestamp` | `timestamptz` | when the row was written                                            |
+| `ET_source`    | `varchar`     | `<source> - <schema.table>` for databases, `<source> - <endpoint URL>` for APIs |
+| `ET_run_id`    | `bigint`      | the ingestion run in `eyetable.runs` that wrote the row             |
+
+`replace` builds a new table, so `ET_id` starts again at 1; `append` continues
+the sequence. API endpoints are recorded without their query string, which can
+carry API keys. The names are mixed case, so quote them in Postgres SQL:
+`SELECT "ET_id", "ET_source" FROM eyetable_raw.crm__customers`. A source
+column with one of these names is stored with an `_src` suffix (`et_id_src`).
 
 ## Credentials
 

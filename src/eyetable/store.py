@@ -6,6 +6,12 @@ Two schemas live inside it:
   * data schema (default `eyetable_raw`): one table per ingested dataset,
     named `<source>__<dataset>`.
 
+Every row written to a data table carries these columns, ahead of its data:
+  * ET_id         bigint identity; 1 for a new table's first row, +1 per row
+  * ET_timestamp  when the row was written
+  * ET_source     where it came from: "<source> - <table or API endpoint>"
+  * ET_run_id     the ingestion run (eyetable.runs.id) that wrote it
+
 SQLite is accepted too (schemas are ignored) so the engine can run in tests
 and quick local experiments without a Postgres server.
 """
@@ -26,8 +32,12 @@ from eyetable.types import infer_columns, merge_kinds
 
 JSONType = sa.JSON().with_variant(JSONB(), "postgresql")
 
-RUN_ID_COLUMN = "_eyetable_run_id"
-LOADED_AT_COLUMN = "_eyetable_loaded_at"
+ID_COLUMN = "ET_id"
+TIMESTAMP_COLUMN = "ET_timestamp"
+SOURCE_COLUMN = "ET_source"
+RUN_ID_COLUMN = "ET_run_id"
+# Data columns may not take these names (compared case-insensitively, as SQLite does).
+RESERVED_COLUMNS = {c.lower() for c in (ID_COLUMN, TIMESTAMP_COLUMN, SOURCE_COLUMN, RUN_ID_COLUMN)}
 
 
 def _now() -> dt.datetime:
@@ -46,6 +56,7 @@ def sa_type(kind: str | None) -> sa.types.TypeEngine:
         "time": sa.Time(),
         "json": JSONType,
         "binary": sa.LargeBinary(),
+        "varchar": sa.String(),
     }.get(kind or "text", sa.Text())
 
 
@@ -69,13 +80,15 @@ def kind_of(type_: sa.types.TypeEngine) -> str:
         return "json"
     if isinstance(type_, sa.LargeBinary):
         return "binary"
+    if isinstance(type_, sa.String) and not isinstance(type_, sa.Text):
+        return "varchar"
     return "text"
 
 
 def coerce(value: Any, kind: str) -> Any:
     if value is None or kind == "json":
         return value
-    if kind == "text":
+    if kind in ("text", "varchar"):
         if isinstance(value, (dict, list)):
             return json.dumps(value, default=str)
         if isinstance(value, bool):
@@ -269,22 +282,30 @@ class CoreStore:
         return prep.quote(table)
 
     def write(
-        self, table: str, batches: Iterable[list[dict[str, Any]]], mode: str = "replace", run_id: int = 0
+        self,
+        table: str,
+        batches: Iterable[list[dict[str, Any]]],
+        mode: str = "replace",
+        run_id: int = 0,
+        *,
+        origin: str,
     ) -> int:
         """Write record batches into `table` in the data schema; return rows written.
 
-        `replace` loads into a staging table and swaps it in only once every
-        batch has landed, so a failed pull never leaves a half-empty table.
-        `append` adds rows to the existing table, adding columns as needed.
+        `origin` is stored in every row's ET_source. `replace` loads into a
+        staging table and swaps it in only once every batch has landed, so a
+        failed pull never leaves a half-empty table; ET_id restarts at 1 in the
+        new table. `append` adds rows to the existing table, continuing ET_id
+        and adding columns as needed.
         """
         if mode not in ("replace", "append"):
             raise ValueError(f"unknown write mode {mode!r}")
         target = f"{table}__stg" if mode == "replace" else table
         writer = _TableWriter(self, target, fresh=(mode == "replace"))
-        loaded_at = _now()
         rows = 0
         for batch in batches:
-            rows += writer.write(batch, {RUN_ID_COLUMN: run_id, LOADED_AT_COLUMN: loaded_at})
+            meta = {TIMESTAMP_COLUMN: _now(), SOURCE_COLUMN: origin, RUN_ID_COLUMN: run_id}
+            rows += writer.write(batch, meta)
         if mode == "replace":
             prep = self.db.dialect.identifier_preparer
             with self.db.begin() as conn:
@@ -293,11 +314,10 @@ class CoreStore:
         return rows
 
     def read_table(self, table: str, limit: int | None = None) -> list[dict[str, Any]]:
-        query = f"SELECT * FROM {self.qualified(table)}"
-        if limit is not None:
-            query += f" LIMIT {int(limit)}"
+        reflected = sa.Table(table, sa.MetaData(), schema=self.data_schema, autoload_with=self.db)
+        query = sa.select(reflected).order_by(reflected.c[ID_COLUMN]).limit(limit)
         with self.db.connect() as conn:
-            return [dict(r._mapping) for r in conn.execute(sa.text(query))]
+            return [dict(r._mapping) for r in conn.execute(query)]
 
 
 class _TableWriter:
@@ -306,7 +326,7 @@ class _TableWriter:
     def __init__(self, store: CoreStore, table: str, fresh: bool):
         self.store = store
         self.table = table
-        self.columns: dict[str, str] = {}  # column name -> kind
+        self.columns: dict[str, str] = {}  # column name -> kind, for every column we insert into
         self.key_to_column: dict[str, str] = {}
 
         qualified = store.qualified(table)
@@ -317,11 +337,24 @@ class _TableWriter:
                 conn.execute(sa.text(f"DROP TABLE {qualified}"))
             exists = False
         if exists:
-            for col in insp.get_columns(table, schema=store.data_schema):
-                self.columns[col["name"]] = kind_of(col["type"])
+            existing = insp.get_columns(table, schema=store.data_schema)
+            if ID_COLUMN not in {c["name"] for c in existing}:
+                raise ValueError(f"{table} has no {ID_COLUMN} column; ingest it with mode=replace once to rebuild it")
+            for col in existing:
+                if col["name"] != ID_COLUMN:  # the database assigns ET_id
+                    self.columns[col["name"]] = kind_of(col["type"])
         else:
-            self.columns = {RUN_ID_COLUMN: "bigint", LOADED_AT_COLUMN: "timestamptz"}
-            cols = [sa.Column(n, sa_type(k)) for n, k in self.columns.items()]
+            self.columns = {TIMESTAMP_COLUMN: "timestamptz", SOURCE_COLUMN: "varchar", RUN_ID_COLUMN: "bigint"}
+            cols = [
+                # BIGINT identity on Postgres; SQLite only auto-numbers an INTEGER PRIMARY KEY.
+                sa.Column(
+                    ID_COLUMN,
+                    sa.BigInteger().with_variant(sa.Integer(), "sqlite"),
+                    sa.Identity(start=1, increment=1, always=True),
+                    primary_key=True,
+                ),
+                *(sa.Column(n, sa_type(k), nullable=False) for n, k in self.columns.items()),
+            ]
             sa.Table(table, sa.MetaData(), *cols, schema=store.data_schema).create(store.db)
         self._rebuild()
 
@@ -332,6 +365,8 @@ class _TableWriter:
     def _column_for(self, key: str) -> str:
         if key not in self.key_to_column:
             name = column_name(key)
+            if name.lower() in RESERVED_COLUMNS:
+                name = f"{name}_src"
             taken = set(self.key_to_column.values())
             base, n = name, 2
             while name in taken:

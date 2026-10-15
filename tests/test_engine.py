@@ -1,3 +1,5 @@
+import datetime as dt
+
 import httpx
 import pytest
 
@@ -23,13 +25,17 @@ def test_database_source_end_to_end(store, source_db):
     }
     rows = store.read_table("crm__customers")
     assert [r["name"] for r in rows] == ["Ada", "Grace", "Linus"]
-    assert all(r["_eyetable_run_id"] for r in rows)
+    assert [r["ET_id"] for r in rows] == [1, 2, 3]
+    assert {r["ET_source"] for r in rows} == {"crm - main.customers"}
+    assert all(isinstance(r["ET_timestamp"], dt.datetime) for r in rows)
+    assert all(r["ET_run_id"] for r in rows)
+    assert list(rows[0])[:4] == ["ET_id", "ET_timestamp", "ET_source", "ET_run_id"]
 
-    # replace swaps in a fresh copy; append adds to it
+    # replace swaps in a fresh table, so ET_id starts over; append continues it
     engine.ingest("crm", ["main.customers"])
-    assert len(store.read_table("crm__customers")) == 3
+    assert [r["ET_id"] for r in store.read_table("crm__customers")] == [1, 2, 3]
     engine.ingest("crm", ["main.customers"], mode="append")
-    assert len(store.read_table("crm__customers")) == 6
+    assert [r["ET_id"] for r in store.read_table("crm__customers")] == [1, 2, 3, 4, 5, 6]
 
     runs = store.list_runs("crm")
     assert len(runs) == 5 and all(r.status == "succeeded" for r in runs)
@@ -81,8 +87,9 @@ def test_schema_evolves_across_batches(store):
         [{"id": 2, "amount": 7.5, "tags": ["a"], "Note Text": "hi"}],
         [{"id": "three"}],
     ]
-    assert store.write("t", iter(batches)) == 3
+    assert store.write("t", iter(batches), origin="test - t") == 3
     rows = store.read_table("t")
+    assert [r["ET_id"] for r in rows] == [1, 2, 3]
     assert rows[1]["amount"] == 7.5
     assert rows[1]["note_text"] == "hi"
     assert rows[2]["id"] == "three"
@@ -104,7 +111,19 @@ def test_postman_source_end_to_end(store, collection, environment):
     results = engine.ingest("shop")
     assert {r.dataset_key for r in results} == {"Users/List users", "Users/Get user", "Reports/Sales (OData)"}
     assert all(r.status == "succeeded" for r in results)
-    assert len(store.read_table("shop__users_list_users")) == 2
+    rows = store.read_table("shop__users_list_users")
+    assert [r["ET_id"] for r in rows] == [1, 2]
+    # the endpoint, with the query string (which can carry API keys) left off
+    assert {r["ET_source"] for r in rows} == {"shop - https://api.example.test/v2/users"}
+    user_rows = store.read_table("shop__users_get_user")
+    assert {r["ET_source"] for r in user_rows} == {"shop - https://api.example.test/v2/users/7"}
+
+
+def test_source_columns_cannot_take_et_names(store):
+    store.write("t", iter([[{"ET_id": "theirs", "et_source": "x", "name": "a"}]]), origin="test - t")
+    [row] = store.read_table("t")
+    assert row["ET_id"] == 1 and row["ET_source"] == "test - t"
+    assert row["et_id_src"] == "theirs" and row["et_source_src"] == "x"
 
 
 def test_source_names_are_validated(store, source_db):
