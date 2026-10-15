@@ -77,11 +77,22 @@ function Publish-Url($url) {
         if ($updated -eq $content) { Write-Log "Page already points at this URL."; return }
         [System.IO.File]::WriteAllText($PageFile, $updated)
         Push-Location $RepoDir
+        # git reports progress on stderr; don't let that count as a PowerShell error.
+        $ErrorActionPreference = "Continue"
         try {
-            git add -- $PageRel | Out-Null
-            git commit -m "Point source management page at $url" -- $PageRel | Out-Null
-            git push origin main 2>&1 | ForEach-Object { Write-Log "git: $_" }
-        } finally { Pop-Location }
+            foreach ($step in @(
+                @("add", "--", $PageRel),
+                @("commit", "-m", "Point source management page at $url", "--", $PageRel),
+                @("push", "origin", "main")
+            )) {
+                $out = & git @step 2>&1 | ForEach-Object { "$_" }
+                $out | Where-Object { $_ } | ForEach-Object { Write-Log "git $($step[0]): $_" }
+                if ($LASTEXITCODE -ne 0) { throw "git $($step[0]) failed (exit $LASTEXITCODE)" }
+            }
+        } finally {
+            $ErrorActionPreference = "Stop"
+            Pop-Location
+        }
         Write-Log "Page updated and pushed; GitHub Pages picks it up in about a minute."
     } catch {
         Write-Log "ERROR publishing the tunnel URL: $($_.Exception.Message)"
