@@ -7,7 +7,8 @@ quick tunnel (the same pattern as acomwebsite's tunnel-watchdog.ps1).
   * cloudflared opens a quick tunnel to it. Quick tunnel URLs are random and
     change on every restart, so whenever a new one is assigned this script
     writes it into API_BASE in docs/source_management/index.html, commits that
-    one file, and pushes; GitHub Pages then serves the page pointing at it.
+    one line (scripts/publish_api_base.py), and pushes; GitHub Pages then
+    serves the page pointing at it.
   * If either process exits, it is restarted.
 
 Anyone on the internet can reach the tunnel URL. Every API call still needs
@@ -26,10 +27,9 @@ param(
 
 $ErrorActionPreference = "Stop"
 $RepoDir  = Split-Path -Parent $PSScriptRoot
-$PageRel  = "docs/source_management/index.html"
-$PageFile = Join-Path $RepoDir $PageRel
 $LogDir   = Join-Path $RepoDir "logs"
 $Eyetable = Join-Path $RepoDir ".venv\Scripts\eyetable.exe"
+$Python   = Join-Path $RepoDir ".venv\Scripts\python.exe"
 
 New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
 
@@ -71,31 +71,16 @@ function Start-Tunnel {
 
 function Publish-Url($url) {
     Write-Log "Tunnel URL: $url"
+    # publish_api_base.py commits only the API_BASE line, built from the committed
+    # page, so work in progress in the repo is never swept into this commit.
+    $ErrorActionPreference = "Continue"  # git and python report on stderr; that isn't failure
     try {
-        $content = [System.IO.File]::ReadAllText($PageFile)
-        $updated = $content -replace "var API_BASE = '[^']*';", "var API_BASE = '$url';"
-        if ($updated -eq $content) { Write-Log "Page already points at this URL."; return }
-        [System.IO.File]::WriteAllText($PageFile, $updated)
-        Push-Location $RepoDir
-        # git reports progress on stderr; don't let that count as a PowerShell error.
-        $ErrorActionPreference = "Continue"
-        try {
-            foreach ($step in @(
-                @("add", "--", $PageRel),
-                @("commit", "-m", "Point source management page at $url", "--", $PageRel),
-                @("push", "origin", "main")
-            )) {
-                $out = & git @step 2>&1 | ForEach-Object { "$_" }
-                $out | Where-Object { $_ } | ForEach-Object { Write-Log "git $($step[0]): $_" }
-                if ($LASTEXITCODE -ne 0) { throw "git $($step[0]) failed (exit $LASTEXITCODE)" }
-            }
-        } finally {
-            $ErrorActionPreference = "Stop"
-            Pop-Location
-        }
-        Write-Log "Page updated and pushed; GitHub Pages picks it up in about a minute."
-    } catch {
-        Write-Log "ERROR publishing the tunnel URL: $($_.Exception.Message)"
+        $out = & $Python (Join-Path $PSScriptRoot "publish_api_base.py") $url 2>&1 | ForEach-Object { "$_" }
+        $out | Where-Object { $_ } | ForEach-Object { Write-Log "publish: $_" }
+        if ($LASTEXITCODE -ne 0) { Write-Log "ERROR publishing the tunnel URL (exit $LASTEXITCODE)" }
+        else { Write-Log "GitHub Pages picks up the new URL in about a minute." }
+    } finally {
+        $ErrorActionPreference = "Stop"
     }
 }
 
