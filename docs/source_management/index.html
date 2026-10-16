@@ -171,6 +171,67 @@
   .stat .v { font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; }
   .stat { min-width: 0; }
   .stat .v.mono { font-size: 14px; font-weight: 500; overflow-wrap: anywhere; }
+
+  /* -- query window, docked to the bottom ------------------------------- */
+  body { padding-bottom: calc(var(--dock-current, 44px) + 16px); }
+  .dock {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 20;
+    height: var(--dock-current, 44px);
+    display: grid; grid-template-rows: auto minmax(0, 1fr);
+    background: var(--surface); border-top: 1px solid var(--border);
+    box-shadow: 0 -6px 18px rgba(16, 24, 40, .08);
+  }
+  .dock-resize { position: absolute; top: -5px; left: 0; right: 0; height: 10px; cursor: ns-resize; touch-action: none; }
+  .dock-resize::after { content: ""; position: absolute; left: 50%; top: 3px; width: 40px; height: 4px; margin-left: -20px; border-radius: 2px; background: var(--border); }
+  .dock-resize:hover::after, .dock-resize:focus-visible::after { background: var(--accent); }
+  .dock.collapsed .dock-resize { display: none; }
+  .dock-bar { display: flex; align-items: center; gap: 8px 12px; padding: 6px 16px; min-height: 44px; flex-wrap: wrap; border-bottom: 1px solid var(--border); }
+  .dock.collapsed .dock-bar { border-bottom: 0; }
+  .dock-toggle { display: inline-flex; align-items: center; gap: 6px; background: none; border: 0; padding: 4px 2px; font-weight: 600; cursor: pointer; }
+  .dock-toggle svg { transition: transform .15s; }
+  .dock.collapsed .dock-toggle svg { transform: rotate(180deg); }
+  .dock-bar .hint { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 1 1 200px; }
+  .dock-bar .controls { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+  #q-limit { width: auto; padding: 3px 6px; font-size: 13px; }
+  kbd { font-family: var(--mono); font-size: 11px; padding: 0 4px; border-radius: 4px; border: 1px solid currentColor; opacity: .75; }
+  .dock-body { display: grid; grid-template-columns: 250px minmax(0, 1fr); min-height: 0; }
+  .dock.collapsed .dock-body { display: none; }
+  .dock-tables { border-right: 1px solid var(--border); overflow: auto; padding: 6px 0 10px; font-size: 13px; min-height: 0; }
+  .dock-tables h3 { margin: 8px 12px 4px; font-size: 11px; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); }
+  .dock-main { display: grid; grid-template-rows: minmax(64px, 36%) auto minmax(0, 1fr); min-width: 0; min-height: 0; }
+  #q-sql {
+    width: 100%; height: 100%; resize: none; border: 0; border-bottom: 1px solid var(--border);
+    padding: 10px 14px; background: var(--surface); color: var(--text);
+    font: 13px/1.55 var(--mono); tab-size: 2;
+  }
+  #q-sql:focus-visible { outline: none; box-shadow: inset 0 0 0 2px var(--focus); }
+  .q-status { display: flex; align-items: center; gap: 12px; padding: 6px 14px; min-height: 34px; font-size: 13px; color: var(--muted); border-bottom: 1px solid var(--border); }
+  .q-status .err { color: var(--err); white-space: pre-wrap; font-family: var(--mono); font-size: 12px; }
+  .q-status .ok { color: var(--ok); }
+  .q-results { overflow: auto; min-height: 0; }
+  .q-results table { font-size: 12.5px; }
+  .q-results th { z-index: 1; }
+  .q-results .empty { padding: 20px 16px; }
+  .tbl-head { display: flex; align-items: center; gap: 2px; padding: 1px 8px 1px 6px; }
+  .tbl-head button { background: none; border: 0; cursor: pointer; border-radius: 5px; padding: 3px 5px; color: inherit; }
+  .tbl-head button:hover { background: var(--surface-2); }
+  .tbl-head .caret { width: 22px; color: var(--muted); }
+  .tbl-head .caret svg { transition: transform .12s; }
+  .tbl-head .caret[aria-expanded=true] svg { transform: rotate(90deg); }
+  .tbl-head .name { flex: 1; min-width: 0; text-align: left; font-family: var(--mono); font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tbl-head .peek { color: var(--accent); font-size: 12px; }
+  .tbl .alias { margin: -2px 0 2px 36px; color: var(--muted); font-size: 11.5px; font-family: var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tbl-cols { list-style: none; margin: 0 0 4px; padding: 0 8px 0 30px; }
+  .tbl-cols button { display: flex; gap: 8px; width: 100%; background: none; border: 0; cursor: pointer; padding: 2px 6px; border-radius: 4px; text-align: left; color: inherit; font-family: var(--mono); font-size: 12px; }
+  .tbl-cols button:hover { background: var(--surface-2); }
+  .tbl-cols .t { margin-left: auto; color: var(--muted); font-size: 11px; white-space: nowrap; }
+  .dock-tables .none { padding: 8px 14px; color: var(--muted); }
+  @media (max-width: 760px) {
+    .dock-body { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 30%) minmax(0, 1fr); }
+    .dock-tables { border-right: 0; border-bottom: 1px solid var(--border); }
+    .dock-bar .hint, .dock-bar .wide-only, .dock-bar kbd { display: none; }
+    .dock-bar { padding: 6px 12px; }
+  }
   [hidden] { display: none !important; }
 </style>
 </head>
@@ -293,6 +354,35 @@
     </div>
   </section>
 </main>
+
+<section class="dock" id="dock" aria-label="Query window">
+  <div class="dock-resize" id="dock-resize" role="separator" aria-orientation="horizontal" aria-label="Resize the query window" tabindex="0"></div>
+  <div class="dock-bar" id="dock-bar">
+    <button class="dock-toggle" id="dock-toggle" type="button" aria-expanded="true" aria-controls="dock-body">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>
+      Query
+    </button>
+    <span class="hint">Read-only SQL over your data. Every source is a table: <code>SELECT * FROM <span id="q-example">my_source</span></code></span>
+    <span class="controls">
+      <label class="check" for="q-limit">Rows</label>
+      <select id="q-limit" aria-label="Maximum rows to return">
+        <option value="100">100</option>
+        <option value="1000" selected>1,000</option>
+        <option value="10000">10,000</option>
+      </select>
+      <button class="btn small" id="q-csv" type="button" disabled><span class="wide-only">Download </span>CSV</button>
+      <button class="btn primary small" id="q-run" type="button" disabled title="Runs the selected text if you have selected some">Run <kbd id="q-kbd">Ctrl+Enter</kbd></button>
+    </span>
+  </div>
+  <div class="dock-body" id="dock-body">
+    <nav class="dock-tables" id="q-tables" aria-label="Tables you can query"><div class="none">Connect to see your tables.</div></nav>
+    <div class="dock-main">
+      <textarea id="q-sql" spellcheck="false" autocomplete="off" aria-label="SQL query" placeholder="SELECT * FROM my_source LIMIT 100"></textarea>
+      <div class="q-status" id="q-status" role="status" aria-live="polite">Connect to run queries.</div>
+      <div class="q-results" id="q-results"></div>
+    </div>
+  </div>
+</section>
 
 <script>
   // The eyetable API this page calls when published on GitHub Pages.
@@ -461,12 +551,15 @@
         setStatus('ok', 'Connected to ' + host);
         renderSources();
         renderDestination();
+        updateQueryControls();
+        loadSchema();
         if (state.selected) selectSource(state.selected);
       }, function (err) {
         state.connected = false;
         setStatus('err', err.status === 401 ? 'Token rejected' : 'Not connected');
         clear($('sources')).appendChild(el('div', { class: 'empty', text: err.message }));
         renderDestination();
+        updateQueryControls();
         throw err;
       });
     }
@@ -704,6 +797,192 @@
       });
     }
 
+
+    // -- query window ------------------------------------------------------
+    var KEY_SQL = 'eyetable.querySql', KEY_DOCK = 'eyetable.dock';
+    var query = { schema: null, result: null, running: false, height: 0, collapsed: false };
+    var dock = $('dock');
+    var isMac = /Mac|iPhone|iPad/.test(navigator.platform || '');
+    $('q-kbd').textContent = isMac ? '⌘↩' : 'Ctrl+Enter';
+
+    function quoteIdent(name) { return /^[a-z_][a-z0-9_]*$/.test(name) ? name : '"' + name.replace(/"/g, '""') + '"'; }
+
+    function setDock(height, collapsed) {
+      var max = Math.max(200, Math.round(window.innerHeight * 0.85));
+      query.height = Math.max(160, Math.min(height || Math.round(window.innerHeight * 0.42), max));
+      query.collapsed = !!collapsed;
+      dock.classList.toggle('collapsed', query.collapsed);
+      $('dock-toggle').setAttribute('aria-expanded', String(!query.collapsed));
+      var current = query.collapsed ? $('dock-bar').offsetHeight : query.height;
+      document.documentElement.style.setProperty('--dock-current', current + 'px');
+      write('localStorage', KEY_DOCK, JSON.stringify({ h: query.height, collapsed: query.collapsed }));
+    }
+
+    function insertText(text) {
+      var ta = $('q-sql');
+      if (query.collapsed) setDock(query.height, false);
+      ta.focus();
+      ta.setRangeText(text, ta.selectionStart, ta.selectionEnd, 'end');
+      saveSql();
+    }
+
+    var saveTimer = null;
+    function saveSql() {
+      clearTimeout(saveTimer);
+      saveTimer = setTimeout(function () { write('localStorage', KEY_SQL, $('q-sql').value); }, 300);
+    }
+
+    function updateQueryControls() {
+      $('q-run').disabled = !state.connected || query.running;
+      $('q-run').firstChild.nodeValue = query.running ? 'Running… ' : 'Run ';
+      $('q-csv').disabled = !query.result || !query.result.columns.length;
+      if (!state.connected && !query.running) {
+        clear($('q-status')).appendChild(document.createTextNode('Connect to run queries.'));
+      }
+    }
+
+    function loadSchema() {
+      return api('/api/schema').then(function (schema) {
+        query.schema = schema;
+        renderTables();
+        var first = schema.sources.filter(function (s) { return s.table; })[0];
+        if (first) $('q-example').textContent = first.name;
+        if (first && !$('q-sql').value.trim()) {
+          $('q-sql').value = 'SELECT *\nFROM ' + first.name + '\nLIMIT 100;';
+        }
+        if (!query.result && !query.running) clear($('q-status')).appendChild(document.createTextNode('Write a query and press Run.'));
+      }, function (err) {
+        clear($('q-tables')).appendChild(el('div', { class: 'none', text: err.message }));
+      });
+    }
+
+    function tableEntry(name, table, columns) {
+      var cols = el('ul', { class: 'tbl-cols', hidden: '' }, columns.map(function (c) {
+        var b = el('button', { type: 'button', title: 'Insert ' + quoteIdent(c.name) }, [
+          el('span', { text: c.name }), el('span', { class: 't', text: c.type.toLowerCase() })
+        ]);
+        b.addEventListener('click', function () { insertText(quoteIdent(c.name)); });
+        return el('li', null, [b]);
+      }));
+      var caret = el('button', { type: 'button', class: 'caret', 'aria-expanded': 'false', 'aria-label': 'Show columns of ' + name });
+      caret.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>';
+      caret.addEventListener('click', function () {
+        var open = caret.getAttribute('aria-expanded') !== 'true';
+        caret.setAttribute('aria-expanded', String(open));
+        cols.hidden = !open;
+      });
+      var nameBtn = el('button', { type: 'button', class: 'name', text: name, title: 'Insert ' + name });
+      nameBtn.addEventListener('click', function () { insertText(quoteIdent(name)); });
+      var peek = el('button', { type: 'button', class: 'peek', text: '▶', title: 'Show the first 100 rows of ' + name, 'aria-label': 'Preview ' + name });
+      peek.addEventListener('click', function () {
+        $('q-sql').value = 'SELECT *\nFROM ' + quoteIdent(name) + '\nLIMIT 100;';
+        saveSql();
+        runQuery();
+      });
+      return el('div', { class: 'tbl' }, [
+        el('div', { class: 'tbl-head' }, [caret, nameBtn, peek]),
+        table && table !== name ? el('div', { class: 'alias', text: 'eyetable_raw.' + table, title: 'Also queryable by this table name' }) : null,
+        cols
+      ]);
+    }
+
+    function renderTables() {
+      var nav = clear($('q-tables'));
+      var schema = query.schema;
+      if (!schema) return;
+      var byTable = {};
+      schema.tables.forEach(function (t) { byTable[t.table] = t.columns; });
+      var files = schema.sources.filter(function (s) { return s.table && byTable[s.table]; });
+      var named = {};
+      files.forEach(function (s) { named[s.table] = true; });
+      var others = schema.tables.filter(function (t) { return !named[t.table]; });
+      if (!files.length && !others.length) {
+        nav.appendChild(el('div', { class: 'none', text: 'Nothing to query yet. Load a file above.' }));
+        return;
+      }
+      if (files.length) {
+        nav.appendChild(el('h3', { text: 'Sources' }));
+        files.forEach(function (s) { nav.appendChild(tableEntry(s.name, s.table, byTable[s.table])); });
+      }
+      if (others.length) {
+        nav.appendChild(el('h3', { text: 'Other tables' }));
+        others.forEach(function (t) { nav.appendChild(tableEntry(t.table, null, t.columns)); });
+      }
+    }
+
+    function runQuery() {
+      if (!state.connected || query.running) return;
+      var ta = $('q-sql');
+      var selected = ta.selectionStart !== ta.selectionEnd && document.activeElement === ta;
+      var sql = selected ? ta.value.slice(ta.selectionStart, ta.selectionEnd) : ta.value;
+      if (!sql.trim()) { ta.focus(); return; }
+      if (query.collapsed) setDock(query.height, false);
+      query.running = true;
+      updateQueryControls();
+      clear($('q-status')).appendChild(document.createTextNode(selected ? 'Running the selected text…' : 'Running…'));
+      api('/api/query', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sql: sql, limit: Number($('q-limit').value) })
+      }).then(function (r) {
+        query.result = r;
+        var parts = [plural(r.row_count, 'row') + (r.truncated ? ' shown; the ' + fmtInt(r.limit) + '-row limit was reached' : ''), r.elapsed_ms + ' ms'];
+        if (selected) parts.push('selection only');
+        clear($('q-status')).appendChild(el('span', { class: 'ok', text: parts.join(' · ') }));
+        var numeric = {};
+        r.columns.forEach(function (c, i) { numeric[c] = r.rows.length && r.rows.every(function (row) { return row[i] === null || typeof row[i] === 'number'; }); });
+        clear($('q-results')).appendChild(r.columns.length
+          ? dataTable(r.columns, r.rows, { empty: 'The query returned no rows.', numeric: numeric })
+          : el('div', { class: 'empty', text: 'The query ran but returned no columns.' }));
+      }, function (err) {
+        query.result = null;
+        clear($('q-status')).appendChild(el('span', { class: 'err', text: err.message }));
+        clear($('q-results'));
+      }).then(function () {
+        query.running = false;
+        updateQueryControls();
+      });
+    }
+
+    function downloadCsv() {
+      var r = query.result;
+      if (!r) return;
+      var cell = function (v) {
+        if (v === null || v === undefined) return '';
+        if (typeof v === 'object') v = JSON.stringify(v);
+        v = String(v);
+        return /[",\r\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v;
+      };
+      var lines = [r.columns.map(cell).join(',')].concat(r.rows.map(function (row) { return row.map(cell).join(','); }));
+      var url = URL.createObjectURL(new Blob(['﻿' + lines.join('\r\n') + '\r\n'], { type: 'text/csv;charset=utf-8' }));
+      var a = el('a', { href: url, download: 'eyetable-query.csv' });
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+    }
+
+    $('q-run').addEventListener('click', runQuery);
+    $('q-csv').addEventListener('click', downloadCsv);
+    $('q-sql').addEventListener('input', saveSql);
+    $('q-sql').addEventListener('keydown', function (e) {
+      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); runQuery(); }
+    });
+    $('dock-toggle').addEventListener('click', function () { setDock(query.height, !query.collapsed); });
+    (function () {
+      var handle = $('dock-resize'), dragging = false;
+      handle.addEventListener('pointerdown', function (e) { dragging = true; handle.setPointerCapture(e.pointerId); e.preventDefault(); });
+      handle.addEventListener('pointermove', function (e) { if (dragging) setDock(window.innerHeight - e.clientY, false); });
+      handle.addEventListener('pointerup', function () { dragging = false; });
+      handle.addEventListener('keydown', function (e) {
+        if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+          e.preventDefault();
+          setDock(query.height + (e.key === 'ArrowUp' ? 32 : -32), false);
+        }
+      });
+    })();
+    window.addEventListener('resize', function () { setDock(query.height, query.collapsed); });
+
     // -- wiring ------------------------------------------------------------
     var drop = $('drop');
     $('file-input').addEventListener('change', function (e) { if (e.target.files[0]) stage(e.target.files[0]); });
@@ -735,6 +1014,14 @@
     var savedToken = read('sessionStorage', KEY_TOKEN) || read('localStorage', KEY_TOKEN);
     $('api-token').value = savedToken;
     $('remember').checked = !!read('localStorage', KEY_TOKEN);
+    $('q-sql').value = read('localStorage', KEY_SQL);
+    (function () {
+      var saved = {};
+      try { saved = JSON.parse(read('localStorage', KEY_DOCK) || '{}'); } catch (e) {}
+      var small = window.innerWidth < 760 || window.innerHeight < 640;
+      setDock(saved.h, saved.collapsed === undefined ? small : saved.collapsed);
+    })();
+    updateQueryControls();
     renderDestination();
     // A newer tunnel URL from the published page beats an old saved one, and
     // beats this copy's own API_BASE when the browser served it from cache.

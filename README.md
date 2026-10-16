@@ -142,6 +142,35 @@ only call the API from the origins in `EYETABLE_CORS_ORIGINS` (default
 `https://tootallted.github.io`). Uploads are limited to 50 MB
 (`EYETABLE_MAX_UPLOAD_MB`). API docs: `/api/docs`.
 
+### Query window
+
+The panel docked at the bottom of the page runs your own SQL over everything
+that has been loaded. Every source is a table you can query by its name:
+
+```sql
+SELECT p.sku, p.qty, o.units
+FROM parts p
+JOIN orders o ON o.sku = p.sku
+WHERE p."ET_timestamp" > now() - interval '1 day';
+```
+
+* The sidebar lists each source with its columns: click a name to insert it,
+  ▶ to see its first 100 rows. The physical table (`eyetable_raw.parts__data`)
+  works too.
+* **Ctrl+Enter** (⌘↩ on a Mac) runs the query; if text is selected, only the
+  selection runs. Results show up to 100 / 1,000 / 10,000 rows and can be
+  downloaded as CSV. Drag the panel's top edge to resize it, or collapse it.
+* Mixed-case columns need double quotes in Postgres: `"ET_id"`, `"ET_source"`.
+
+Queries are read-only by construction, because the API is public: only a
+single `SELECT` / `WITH` / `VALUES` / `TABLE` statement runs, through a
+server-side cursor inside a read-only transaction that is always rolled back,
+with a 30-second timeout (`EYETABLE_QUERY_TIMEOUT_S`). On Postgres it runs as
+`eyetable_reader` (`EYETABLE_QUERY_DATABASE_URL`, created by
+`scripts/setup-postgres.ps1`), a role that can only `SELECT` from
+`eyetable_raw` and cannot see eyetable's own `eyetable` schema (source configs
+and uploaded files).
+
 ### Public access from the GitHub Pages page
 
 `scripts/run-public.ps1` makes the API on this PC reachable from the published

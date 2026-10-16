@@ -19,17 +19,24 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel, Field
 
 from eyetable import __version__
 from eyetable.connectors.file import DATASET_KEY
 from eyetable.engine import Engine
 from eyetable.identifiers import SOURCE_NAME, table_name
+from eyetable.query import MAX_LIMIT, QueryError, QueryRunner
 from eyetable.ratelimit import SlidingWindow, client_ip
 from eyetable.store import SourceNotFound
 
 DEFAULT_CORS_ORIGINS = ["https://tootallted.github.io"]
 DEFAULT_MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 PAGES_DIR = Path(__file__).resolve().parents[2] / "docs"  # the GitHub Pages site, in a source checkout
+
+
+class QueryIn(BaseModel):
+    sql: str = Field(max_length=100_000)
+    limit: int = Field(default=1000, ge=1, le=MAX_LIMIT)
 
 
 def _json_safe(value: Any) -> Any:
@@ -47,10 +54,12 @@ def create_app(
     requests_per_minute: int = 240,
     uploads_per_hour: int = 120,
     auth_failures_per_15_minutes: int = 10,
+    query_runner: QueryRunner | None = None,
 ) -> FastAPI:
     if not token:
         raise ValueError("an API token is required")
     store = engine.store
+    queries = query_runner or QueryRunner(store)
     app = FastAPI(title="eyetable", version=__version__, docs_url="/api/docs", openapi_url="/api/openapi.json")
 
     requests_limit = SlidingWindow(requests_per_minute, 60)
@@ -164,6 +173,36 @@ def create_app(
             "table": table,
             "columns": columns,
             "rows": [[_json_safe(r[c]) for c in columns] for r in rows],
+        })
+
+    def file_aliases() -> dict[str, str]:
+        return {s.name: table_name(s.name, DATASET_KEY) for s in store.list_sources() if s.type == "file"}
+
+    @app.get("/api/schema", dependencies=auth)
+    def schema() -> dict[str, Any]:
+        """What the query window can query: each source by name, and every table."""
+        sources = []
+        for src in store.list_sources():
+            entry: dict[str, Any] = {"name": src.name, "type": src.type}
+            if src.type == "file":
+                entry["table"] = table_name(src.name, DATASET_KEY)
+            sources.append(entry)
+        return {"sources": sources, "tables": queries.tables()}
+
+    @app.post("/api/query", dependencies=auth)
+    def query(body: QueryIn) -> dict[str, Any]:
+        """Run one read-only query; file sources are queryable by their own names."""
+        try:
+            result = queries.run(body.sql, body.limit, file_aliases())
+        except QueryError as exc:
+            raise HTTPException(400, str(exc)) from None
+        return jsonable_encoder({
+            "columns": result.columns,
+            "rows": [[_json_safe(v) for v in row] for row in result.rows],
+            "row_count": len(result.rows),
+            "truncated": result.truncated,
+            "limit": body.limit,
+            "elapsed_ms": result.elapsed_ms,
         })
 
     @app.post("/api/sources/{name}/uploads", dependencies=auth)

@@ -244,6 +244,7 @@ def serve(
     import uvicorn
 
     from eyetable.api import DEFAULT_CORS_ORIGINS, DEFAULT_MAX_UPLOAD_BYTES, create_app
+    from eyetable.query import QueryRunner
 
     s = load_settings()
     token = os.environ.get("EYETABLE_API_TOKEN", "")
@@ -256,11 +257,18 @@ def serve(
     max_mb = os.environ.get("EYETABLE_MAX_UPLOAD_MB")
     store = CoreStore(s.database_url, s.meta_schema, s.data_schema)
     store.init()
+    query_url = os.environ.get("EYETABLE_QUERY_DATABASE_URL") or None
+    if query_url is None and store.db.dialect.name == "postgresql":
+        console.print(
+            "[yellow]note:[/yellow] EYETABLE_QUERY_DATABASE_URL is not set, so the query window runs as the main "
+            "database role (still read-only); scripts/setup-postgres.ps1 creates a SELECT-only role for it"
+        )
     app_ = create_app(
         Engine(store),
         token,
         cors_origins=origins or DEFAULT_CORS_ORIGINS,
         max_upload_bytes=int(max_mb) * 1024 * 1024 if max_mb else DEFAULT_MAX_UPLOAD_BYTES,
+        query_runner=QueryRunner(store, query_url, float(os.environ.get("EYETABLE_QUERY_TIMEOUT_S", "30"))),
     )
     console.print(f"source management: [bold]http://{host}:{port}/source_management/[/bold]")
     uvicorn.run(app_, host=host, port=port)
