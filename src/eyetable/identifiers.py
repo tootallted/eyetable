@@ -7,7 +7,10 @@ import re
 MAX_TABLE_NAME = 50
 MAX_COLUMN_NAME = 63
 
-SOURCE_NAME = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
+# Source names double as table names and query names, so they stay within
+# Postgres's 63-character identifier limit.
+MAX_SOURCE_NAME = 63
+SOURCE_NAME = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
 
 
 def sanitize(name: str) -> str:
@@ -24,6 +27,14 @@ def shorten(name: str, limit: int) -> str:
         return name
     digest = hashlib.sha1(name.encode()).hexdigest()[:8]
     return f"{name[: limit - 9]}_{digest}"
+
+
+def source_name(text: str) -> str:
+    """A valid source name made from arbitrary text (a file or tab name, say)."""
+    name = sanitize(text)
+    if not name[0].isalpha():
+        name = f"s_{name.lstrip('_')}"
+    return shorten(name, MAX_SOURCE_NAME)
 
 
 def table_name(source: str, dataset_name: str) -> str:

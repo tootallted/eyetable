@@ -36,6 +36,9 @@ ones you want into a core Postgres database where every run is logged.
   load with `eyetable upload`). Name the source once; each later version of the
   file either replaces the table's contents or is appended to them. Every
   uploaded file is kept in `eyetable.uploads`.
+* **Google Sheets**: paste (or drop) a sheet link and every tab becomes its
+  own source named `<file name>_<tab name>`. Loading the link again refreshes
+  those tabs, by replacing or appending, and picks up new tabs.
 * **Core storage** is Postgres. Metadata lives in the `eyetable` schema; each
   ingested dataset lands in `eyetable_raw.<source>__<dataset>`. Column types are
   inferred and widened as data changes; new fields become new columns.
@@ -141,6 +144,26 @@ Every `/api` route except `/api/health` requires the token, and browsers may
 only call the API from the origins in `EYETABLE_CORS_ORIGINS` (default
 `https://tootallted.github.io`). Uploads are limited to 50 MB
 (`EYETABLE_MAX_UPLOAD_MB`). API docs: `/api/docs`.
+
+### Google Sheets
+
+Paste a Google Sheets link into **Google Sheet link** (or drag the link onto
+the page). **Check tabs** lists every tab with the source it becomes, its
+size, and whether it is new or was loaded before; **Load** loads them all.
+
+* Names: the file "General Ledger 2026" with tab "Q1 Actuals" becomes source
+  `general_ledger_2026_q1_actuals` (table `…__data`), queryable by that name.
+  Names are lowercased, punctuation becomes `_`, and they are capped at 63
+  characters; a name starting with a digit gets an `s_` prefix.
+* Tabs loaded before are replaced or appended to (your choice); new tabs
+  become new sources; empty tabs are skipped. A tab whose name is already used
+  by another source is skipped rather than overwritten.
+* `ET_source` reads `<source> - <file name> / <tab name>`, and each load keeps a
+  CSV snapshot of the tab in `eyetable.uploads`.
+* The sheet must be shared as **Anyone with the link can view** (or published
+  to the web): eyetable downloads it the way *File → Download → Microsoft
+  Excel* does, with no Google account. Formulas come in as their values.
+* From the command line: `eyetable gsheet <link> [--mode append]`.
 
 ### Query window
 

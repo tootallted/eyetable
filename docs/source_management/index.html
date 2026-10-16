@@ -126,6 +126,17 @@
   .drop strong { font-size: 16px; }
   .drop input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
 
+  .or { display: flex; align-items: center; gap: 12px; color: var(--muted); font-size: 13px; }
+  .or::before, .or::after { content: ""; flex: 1; border-top: 1px solid var(--border); }
+  .gs { display: grid; gap: 10px; }
+  .gs-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
+  .gs-title { font-weight: 600; overflow-wrap: anywhere; }
+  .gs-title a { color: inherit; }
+  .gs-tabs td.src { font-family: var(--mono); font-size: 12px; }
+  .pill-new, .pill-again, .pill-skip { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; white-space: nowrap; }
+  .pill-new { background: var(--ok-soft); color: var(--ok); }
+  .pill-again { background: var(--accent-soft); color: var(--accent); }
+  .pill-skip { background: var(--warn-soft); color: var(--warn); }
   .file-chip { display: flex; gap: 12px; align-items: center; padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px; }
   .file-chip .meta { min-width: 0; margin-right: auto; }
   .file-chip .name { font-weight: 600; overflow-wrap: anywhere; }
@@ -266,7 +277,7 @@
 
   <div class="grid">
     <section class="card" aria-labelledby="load-title">
-      <h2 id="load-title">Load a file</h2>
+      <h2 id="load-title">Load data</h2>
       <div class="card-body">
         <label class="drop" id="drop">
           <input type="file" id="file-input" accept=".csv,text/csv">
@@ -322,6 +333,33 @@
           </div>
         </div>
         <div id="load-result" role="status"></div>
+
+        <div class="or"><span>or a Google Sheet</span></div>
+        <div class="gs">
+          <label class="field" for="gs-url">Google Sheet link</label>
+          <div class="gs-row">
+            <input type="url" id="gs-url" placeholder="https://docs.google.com/spreadsheets/d/…" autocomplete="off" spellcheck="false">
+            <button class="btn" id="gs-check" type="button" disabled>Check tabs</button>
+          </div>
+          <p class="hint">Every tab becomes its own source, named <code>file name_tab name</code>. Share the sheet as
+            “Anyone with the link can view” first. Paste or drop the same link again later to refresh its tabs.</p>
+          <div id="gs-plan" hidden style="display:grid; gap:12px">
+            <div class="gs-title" id="gs-title"></div>
+            <div class="table-wrap gs-tabs" id="gs-tabs"></div>
+            <div class="modes" id="gs-modes" role="radiogroup" aria-label="What to do with tabs loaded before" hidden>
+              <label class="mode">
+                <span class="t"><input type="radio" name="gs-mode" value="replace" checked> Replace contents</span>
+                <span class="d">Tabs loaded before are rebuilt from the sheet. ET_id starts again at 1.</span>
+              </label>
+              <label class="mode">
+                <span class="t"><input type="radio" name="gs-mode" value="append"> Append rows</span>
+                <span class="d">The sheet's rows are added after what is there. ET_id continues.</span>
+              </label>
+            </div>
+            <button class="btn primary" id="gs-load" type="button" disabled>Load tabs</button>
+          </div>
+          <div id="gs-result" role="status"></div>
+        </div>
       </div>
     </section>
 
@@ -552,6 +590,7 @@
         renderSources();
         renderDestination();
         updateQueryControls();
+        renderSheetControls();
         loadSchema();
         if (state.selected) selectSource(state.selected);
       }, function (err) {
@@ -560,6 +599,7 @@
         clear($('sources')).appendChild(el('div', { class: 'empty', text: err.message }));
         renderDestination();
         updateQueryControls();
+        renderSheetControls();
         throw err;
       });
     }
@@ -577,9 +617,9 @@
       var rows = state.sources.map(function (s) {
         var tr = el('tr', { class: 'clickable' + (s.name === state.selected ? ' selected' : ''), tabindex: '0' }, [
           el('td', null, [el('strong', { text: s.name })]),
-          el('td', null, [el('span', { class: 'tag', text: s.type })]),
+          el('td', null, [el('span', { class: 'tag', text: typeLabel(s.type) })]),
           el('td', { class: 'mono', text: s.table ? 'eyetable_raw.' + s.table : s.datasets + ' dataset(s)' }),
-          el('td', { class: 'num', text: s.type === 'file' ? fmtInt(s.rows) : '—' }),
+          el('td', { class: 'num', text: s.table ? fmtInt(s.rows) : '—' }),
           el('td', { text: s.last_upload ? s.last_upload.filename : '—' }),
           el('td', { text: fmtTime(s.updated_at) })
         ]);
@@ -601,7 +641,7 @@
       }
       Promise.all([
         api('/api/sources/' + encodeURIComponent(name)),
-        src && src.type === 'file' ? api('/api/sources/' + encodeURIComponent(name) + '/preview?limit=20') : Promise.resolve(null)
+        src && src.table ? api('/api/sources/' + encodeURIComponent(name) + '/preview?limit=20') : Promise.resolve(null)
       ]).then(function (results) { renderDetail(results[0], results[1]); }, function (err) {
         $('detail').hidden = false;
         clear($('detail-preview')).appendChild(banner('err', err.message));
@@ -611,13 +651,13 @@
     function renderDetail(src, preview) {
       $('detail').hidden = false;
       $('detail-name').textContent = src.name;
-      $('detail-type').textContent = src.type + ' source';
+      $('detail-type').textContent = typeLabel(src.type) + ' source';
       var stats = clear($('detail-stats'));
       var stat = function (k, v, mono) { stats.appendChild(el('div', { class: 'stat' }, [el('div', { class: 'k', text: k }), el('div', { class: 'v' + (mono ? ' mono' : ''), text: v })])); };
-      if (src.type === 'file') {
+      if (src.table) {
         stat('Rows', fmtInt(src.rows));
         stat('Columns', fmtInt(src.columns));
-        stat('Files loaded', fmtInt(src.uploads.length));
+        stat(src.type === 'gsheet' ? 'Times loaded' : 'Files loaded', fmtInt(src.uploads.length));
         stat('Table', 'eyetable_raw.' + src.table, true);
       } else {
         stat('Datasets', fmtInt(src.datasets));
@@ -704,6 +744,8 @@
       $('file-input').value = '';
       clear($('local-preview'));
     }
+
+    function typeLabel(type) { return type === 'gsheet' ? 'google sheet' : type; }
 
     function fileSources() { return state.sources.filter(function (s) { return s.type === 'file'; }); }
 
@@ -983,19 +1025,147 @@
     })();
     window.addEventListener('resize', function () { setDock(query.height, query.collapsed); });
 
+
+    // -- Google Sheets -----------------------------------------------------
+    var SHEET_LINK = /docs\.google\.com\/spreadsheets\//;
+    var sheet = { plan: null, url: '', busy: false };
+
+    function loadableTabs() { return sheet.plan ? sheet.plan.tabs.filter(function (t) { return !t.problem; }) : []; }
+
+    function renderSheetControls() {
+      $('gs-check').disabled = sheet.busy || !state.connected || !$('gs-url').value.trim();
+      $('gs-load').disabled = sheet.busy || !state.connected || !loadableTabs().length;
+      if (!sheet.busy) {
+        $('gs-check').textContent = 'Check tabs';
+        $('gs-load').textContent = loadableTabs().length ? 'Load ' + plural(loadableTabs().length, 'tab') : 'Nothing to load';
+      }
+    }
+
+    function sheetRequest(path, body) {
+      return api(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    }
+
+    function checkSheet() {
+      var url = $('gs-url').value.trim();
+      clear($('gs-result'));
+      if (!url || sheet.busy) return;
+      if (!SHEET_LINK.test(url) && !/^[A-Za-z0-9_-]{25,}$/.test(url)) {
+        $('gs-result').appendChild(banner('err', "That isn't a Google Sheets link. It should start with https://docs.google.com/spreadsheets/"));
+        return;
+      }
+      if (!state.connected) { $('gs-result').appendChild(banner('warn', 'Connect to the API first.')); return; }
+      sheet.plan = null;
+      sheet.url = url;
+      $('gs-plan').hidden = true;
+      sheet.busy = true;
+      renderSheetControls();
+      $('gs-check').textContent = 'Checking…';
+      sheetRequest('/api/gsheets/inspect', { url: url }).then(function (plan) {
+        sheet.plan = plan;
+        renderSheetPlan();
+      }, function (err) {
+        $('gs-result').appendChild(banner('err', err.message));
+      }).then(function () {
+        sheet.busy = false;
+        renderSheetControls();
+      });
+    }
+
+    function renderSheetPlan() {
+      var plan = sheet.plan;
+      $('gs-plan').hidden = false;
+      var title = clear($('gs-title'));
+      title.appendChild(el('a', { href: plan.url, target: '_blank', rel: 'noopener noreferrer', text: plan.title }));
+      title.appendChild(document.createTextNode(' · ' + plural(plan.tabs.length, 'tab')));
+      var head = el('tr', null, ['Tab', 'Source', 'Size', ''].map(function (h) { return el('th', { text: h, scope: 'col' }); }));
+      var body = plan.tabs.map(function (t) {
+        var status = t.problem ? el('span', { class: 'pill-skip', text: 'Skipped: ' + t.problem })
+          : t.exists ? el('span', { class: 'pill-again', text: 'Loaded before' })
+          : el('span', { class: 'pill-new', text: 'New source' });
+        return el('tr', null, [
+          el('td', { text: t.tab }),
+          el('td', { class: 'src', text: t.problem ? '—' : t.source }),
+          el('td', { class: 'num', text: t.problem ? '' : plural(t.columns, 'col') + ' × ' + plural(t.rows, 'row') }),
+          el('td', null, [status])
+        ]);
+      });
+      clear($('gs-tabs')).appendChild(el('table', null, [el('thead', null, [head]), el('tbody', null, body)]));
+      $('gs-modes').hidden = !plan.tabs.some(function (t) { return t.exists && !t.problem; });
+      renderSheetControls();
+    }
+
+    function loadSheet() {
+      var plan = sheet.plan;
+      if (!plan || sheet.busy) return;
+      var again = plan.tabs.filter(function (t) { return t.exists && !t.problem; });
+      var checked = document.querySelector('input[name=gs-mode]:checked');
+      var mode = again.length && checked ? checked.value : 'replace';
+      if (again.length && mode === 'replace' &&
+          !confirm('Replace what is in ' + plural(again.length, 'source') + ' already loaded from "' + plan.title + '"?')) return;
+      sheet.busy = true;
+      renderSheetControls();
+      $('gs-load').textContent = 'Loading…';
+      clear($('gs-result'));
+      sheetRequest('/api/gsheets', { url: sheet.url, mode: mode }).then(function (load) {
+        var loaded = [], skipped = [], failed = [];
+        load.results.forEach(function (r, i) {
+          var tab = load.tabs[i];
+          if (r.status === 'succeeded') loaded.push({ tab: tab, rows: r.rows });
+          else if (r.status === 'skipped') skipped.push(tab.tab + ' (' + r.error + ')');
+          else failed.push(tab.tab + ': ' + r.error);
+        });
+        var rows = loaded.reduce(function (n, l) { return n + l.rows; }, 0);
+        var text = loaded.length
+          ? plural(loaded.length, 'tab') + ' of "' + load.title + '" loaded, ' + plural(rows, 'row') + ': ' + loaded.map(function (l) { return l.tab.source; }).join(', ') + '.'
+          : 'No tabs were loaded from "' + load.title + '".';
+        if (skipped.length) text += ' Skipped ' + skipped.join(', ') + '.';
+        if (failed.length) text += ' Failed: ' + failed.join('; ') + '.';
+        $('gs-result').appendChild(banner(failed.length || !loaded.length ? 'warn' : 'ok', text));
+        sheet.plan = null;
+        $('gs-plan').hidden = true;
+        if (loaded.length) state.selected = loaded[0].tab.source;
+        return refresh();
+      }, function (err) {
+        $('gs-result').appendChild(banner('err', 'Not loaded: ' + err.message));
+      }).then(function () {
+        sheet.busy = false;
+        renderSheetControls();
+      });
+    }
+
+    $('gs-url').addEventListener('input', renderSheetControls);
+    $('gs-url').addEventListener('paste', function () { setTimeout(checkSheet, 0); });
+    $('gs-url').addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); checkSheet(); } });
+    $('gs-check').addEventListener('click', checkSheet);
+    $('gs-load').addEventListener('click', loadSheet);
+
     // -- wiring ------------------------------------------------------------
     var drop = $('drop');
     $('file-input').addEventListener('change', function (e) { if (e.target.files[0]) stage(e.target.files[0]); });
     ['dragenter', 'dragover'].forEach(function (t) {
-      document.addEventListener(t, function (e) { if (e.dataTransfer && Array.prototype.indexOf.call(e.dataTransfer.types, 'Files') >= 0) { e.preventDefault(); drop.classList.add('over'); } });
+      document.addEventListener(t, function (e) {
+        var types = e.dataTransfer ? Array.prototype.slice.call(e.dataTransfer.types) : [];
+        if (types.indexOf('Files') >= 0) { e.preventDefault(); drop.classList.add('over'); }
+        else if (types.indexOf('text/uri-list') >= 0 || types.indexOf('text/plain') >= 0) e.preventDefault();
+      });
     });
     ['dragleave', 'drop'].forEach(function (t) {
       document.addEventListener(t, function (e) { if (t === 'drop' || e.relatedTarget === null) drop.classList.remove('over'); });
     });
     document.addEventListener('drop', function (e) {
-      if (!e.dataTransfer || !e.dataTransfer.files.length) return;
-      e.preventDefault();
-      stage(e.dataTransfer.files[0]);
+      if (!e.dataTransfer) return;
+      if (e.dataTransfer.files.length) {
+        e.preventDefault();
+        stage(e.dataTransfer.files[0]);
+        return;
+      }
+      var text = (e.dataTransfer.getData('text/uri-list') || e.dataTransfer.getData('text/plain') || '').split(/\s+/)[0];
+      if (SHEET_LINK.test(text)) {
+        e.preventDefault();
+        $('gs-url').value = text;
+        $('gs-url').scrollIntoView({ block: 'center', behavior: 'smooth' });
+        checkSheet();
+      }
     });
     $('clear-file').addEventListener('click', unstage);
     $('dest-new').addEventListener('click', function () { setDest('new'); });

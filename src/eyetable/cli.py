@@ -272,3 +272,23 @@ def serve(
     )
     console.print(f"source management: [bold]http://{host}:{port}/source_management/[/bold]")
     uvicorn.run(app_, host=host, port=port)
+
+
+@app.command()
+def gsheet(
+    url: Annotated[str, typer.Argument(help="Google Sheets link (shared as 'Anyone with the link').")],
+    mode: Annotated[str, typer.Option(help="replace or append, for tabs loaded before")] = "replace",
+) -> None:
+    """Load every tab of a Google Sheet into its own source "<file name>_<tab name>"."""
+    try:
+        load = _engine().ingest_gsheet(url, mode)
+    except Exception as exc:
+        _fail(str(exc))
+    console.print(f"[bold]{load.title}[/bold]")
+    table = Table("tab", "source", "status", "rows", "note")
+    for plan, r in zip(load.tabs, load.results):
+        color = {"succeeded": "green", "skipped": "yellow"}.get(r.status, "red")
+        table.add_row(plan.tab, plan.source, f"[{color}]{r.status}[/{color}]", str(r.rows), r.error or "")
+    console.print(table)
+    if any(r.status == "failed" for r in load.results):
+        raise typer.Exit(1)

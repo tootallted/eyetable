@@ -1,15 +1,24 @@
 """The eyetable engine: register sources, discover their datasets, ingest them."""
 
+import csv
+import datetime as dt
+import io
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
+from eyetable import gsheets
 from eyetable.connectors import Connector, build_connector
 from eyetable.connectors.file import DATASET_KEY, FileConnector
 from eyetable.credentials import resolve_env
 from eyetable.identifiers import SOURCE_NAME, table_name
-from eyetable.models import DatasetInfo
-from eyetable.store import CoreStore
+from eyetable.models import ColumnInfo, DatasetInfo
+from eyetable.store import CoreStore, SourceNotFound
+from eyetable.types import infer_columns
+
+# Source types whose data is one table, <source>__data, loaded by pushing data in
+# (a dropped file, a Google Sheet tab) rather than by a connector pulling it.
+SINGLE_TABLE_TYPES = ("file", "gsheet")
 
 ConnectorFactory = Callable[[str, dict[str, Any]], Connector]
 
@@ -27,6 +36,36 @@ class RunResult:
 
 class UnknownDataset(KeyError):
     pass
+
+
+@dataclass
+class SheetTabPlan:
+    tab: str
+    index: int
+    source: str
+    table: str
+    columns: int
+    rows: int
+    exists: bool  # this tab was loaded before; it will be replaced or appended to
+    problem: str | None = None  # why this tab can't be loaded
+
+
+@dataclass
+class SheetLoad:
+    title: str
+    spreadsheet_id: str
+    url: str
+    tabs: list[SheetTabPlan] = field(default_factory=list)
+    results: list[RunResult] = field(default_factory=list)
+
+
+def _csv_snapshot(headers: list[str], records: list[dict[str, Any]]) -> bytes:
+    out = io.StringIO()
+    writer = csv.writer(out)  # csv's default line ending is \r\n
+    writer.writerow(headers)
+    for r in records:
+        writer.writerow(["" if r[h] is None else (r[h].isoformat() if isinstance(r[h], (dt.date, dt.time)) else r[h]) for h in headers])
+    return out.getvalue().encode("utf-8")
 
 
 class Engine:
@@ -100,6 +139,89 @@ class Engine:
         self.store.finish_run(run_id, "succeeded", rows)
         self.store.save_catalog(source, [dataset])
         return RunResult(run_id, DATASET_KEY, table, "succeeded", rows, upload_id=upload_id)
+
+    def plan_gsheet(self, book: gsheets.Workbook) -> SheetLoad:
+        """What loading this spreadsheet would do, tab by tab, without changing anything."""
+        load = SheetLoad(book.title, book.spreadsheet_id, book.url)
+        taken: set[str] = set()
+        for tab in book.tabs:
+            name = base = gsheets.source_name(book.title, tab.title)
+            n = 2
+            while name in taken:  # two tabs whose names differ only in punctuation
+                name = gsheets.make_source_name(f"{base}_{n}")
+                n += 1
+            taken.add(name)
+            plan = SheetTabPlan(tab.title, tab.index, name, table_name(name, DATASET_KEY),
+                                len(tab.headers), len(tab.records), exists=False)
+            if not tab.headers:
+                plan.problem = "the tab is empty"
+            else:
+                try:
+                    src = self.store.get_source(name)
+                except SourceNotFound:
+                    pass
+                else:
+                    if src.type != "gsheet" or src.config.get("spreadsheet_id") != book.spreadsheet_id:
+                        plan.problem = f"a different source is already named {name}"
+                    else:
+                        plan.exists = True
+            load.tabs.append(plan)
+        return load
+
+    def ingest_gsheet(
+        self,
+        url: str,
+        mode: str = "replace",
+        fetch: Callable[[str], gsheets.Workbook] = gsheets.fetch_workbook,
+    ) -> SheetLoad:
+        """Load every tab of a Google Sheet, each into its own source "<file>_<tab>".
+
+        Tabs seen for the first time become new sources; tabs loaded before are
+        replaced or appended to, per `mode`. A tab that can't be loaded (empty,
+        or its name is taken by another source) is reported and skipped.
+        """
+        if mode not in ("replace", "append"):
+            raise ValueError(f"mode must be replace or append, got {mode!r}")
+        book = fetch(url)
+        load = self.plan_gsheet(book)
+        tabs = {t.index: t for t in book.tabs}
+        for plan in load.tabs:
+            if plan.problem:
+                load.results.append(RunResult(0, plan.tab, plan.table, "skipped", 0, plan.problem))
+                continue
+            tab = tabs[plan.index]
+            tab_mode = mode if plan.exists else "replace"
+            if not plan.exists:
+                if not SOURCE_NAME.match(plan.source):
+                    load.results.append(RunResult(0, plan.tab, plan.table, "skipped", 0, f"{plan.source} is not a valid source name"))
+                    continue
+                self.store.save_source(plan.source, "gsheet", {
+                    "spreadsheet_id": book.spreadsheet_id, "published": book.published, "url": book.url,
+                    "file_title": book.title, "tab_title": tab.title,
+                })
+            label = f"{book.title} / {tab.title}"
+            upload_id = self.store.save_upload(plan.source, f"{label}.csv", _csv_snapshot(tab.headers, tab.records), tab_mode)
+            run_id = self.store.start_run(plan.source, DATASET_KEY, plan.table, tab_mode)
+            self.store.link_upload(upload_id, run_id)
+            batches = (tab.records[i : i + 1000] for i in range(0, len(tab.records), 1000))
+            try:
+                rows = self.store.write(plan.table, batches, tab_mode, run_id, origin=f"{plan.source} - {label}")
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+                self.store.finish_run(run_id, "failed", 0, error)
+                load.results.append(RunResult(run_id, plan.tab, plan.table, "failed", 0, error, upload_id))
+                continue
+            self.store.finish_run(run_id, "succeeded", rows)
+            kinds = infer_columns(tab.records)
+            self.store.save_catalog(plan.source, [DatasetInfo(
+                key=DATASET_KEY, name=DATASET_KEY, kind="sheet",
+                columns=[ColumnInfo(h, kinds.get(h) or "text") for h in tab.headers],
+                row_count=len(tab.records),
+                detail={"spreadsheet_id": book.spreadsheet_id, "file_title": book.title, "tab_title": tab.title,
+                        "url": book.url, "upload_id": upload_id},
+            )])
+            load.results.append(RunResult(run_id, plan.tab, plan.table, "succeeded", rows, upload_id=upload_id))
+        return load
 
     def discover(self, source: str) -> list[DatasetInfo]:
         """Walk the source's metadata, record every dataset found in the catalog."""

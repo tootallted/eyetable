@@ -11,6 +11,7 @@ locked out for a while.
 """
 
 import secrets
+from collections.abc import Callable
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -23,7 +24,8 @@ from pydantic import BaseModel, Field
 
 from eyetable import __version__
 from eyetable.connectors.file import DATASET_KEY
-from eyetable.engine import Engine
+from eyetable.engine import SINGLE_TABLE_TYPES, Engine
+from eyetable.gsheets import SheetError, fetch_workbook
 from eyetable.identifiers import SOURCE_NAME, table_name
 from eyetable.query import MAX_LIMIT, QueryError, QueryRunner
 from eyetable.ratelimit import SlidingWindow, client_ip
@@ -32,6 +34,11 @@ from eyetable.store import SourceNotFound
 DEFAULT_CORS_ORIGINS = ["https://tootallted.github.io"]
 DEFAULT_MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 PAGES_DIR = Path(__file__).resolve().parents[2] / "docs"  # the GitHub Pages site, in a source checkout
+
+
+class SheetIn(BaseModel):
+    url: str = Field(max_length=2000)
+    mode: str = "replace"
 
 
 class QueryIn(BaseModel):
@@ -55,11 +62,15 @@ def create_app(
     uploads_per_hour: int = 120,
     auth_failures_per_15_minutes: int = 10,
     query_runner: QueryRunner | None = None,
+    sheet_fetch: Callable[[str], Any] | None = None,
 ) -> FastAPI:
     if not token:
         raise ValueError("an API token is required")
     store = engine.store
     queries = query_runner or QueryRunner(store)
+    if sheet_fetch is None:
+        def sheet_fetch(url: str):
+            return fetch_workbook(url, max_bytes=max_upload_bytes)
     app = FastAPI(title="eyetable", version=__version__, docs_url="/api/docs", openapi_url="/api/openapi.json")
 
     requests_limit = SlidingWindow(requests_per_minute, 60)
@@ -85,7 +96,7 @@ def create_app(
             wait = requests_limit.hit(ip)
             if wait:
                 return too_many(wait, "requests")
-            if request.method == "POST" and request.url.path.endswith("/uploads"):
+            if request.method == "POST" and (request.url.path.endswith("/uploads") or request.url.path == "/api/gsheets"):
                 wait = uploads_limit.hit(ip)
                 if wait:
                     return too_many(wait, "uploads")
@@ -124,7 +135,7 @@ def create_app(
             "updated_at": src.updated_at,
             "datasets": len(datasets),
         }
-        if src.type == "file":
+        if src.type in SINGLE_TABLE_TYPES:
             table = table_name(src.name, DATASET_KEY)
             uploads = store.list_uploads(src.name, limit=1)
             summary.update(
@@ -162,8 +173,8 @@ def create_app(
     @app.get("/api/sources/{name}/preview", dependencies=auth)
     def preview(name: str, limit: int = 20) -> dict[str, Any]:
         src = get_source(name)
-        if src.type != "file":
-            raise HTTPException(400, "preview is available for file sources")
+        if src.type not in SINGLE_TABLE_TYPES:
+            raise HTTPException(400, "preview is available for file and Google Sheet sources")
         table = table_name(name, DATASET_KEY)
         if not store.table_exists(table):
             return {"table": table, "columns": [], "rows": []}
@@ -176,7 +187,7 @@ def create_app(
         })
 
     def file_aliases() -> dict[str, str]:
-        return {s.name: table_name(s.name, DATASET_KEY) for s in store.list_sources() if s.type == "file"}
+        return {s.name: table_name(s.name, DATASET_KEY) for s in store.list_sources() if s.type in SINGLE_TABLE_TYPES}
 
     @app.get("/api/schema", dependencies=auth)
     def schema() -> dict[str, Any]:
@@ -184,7 +195,7 @@ def create_app(
         sources = []
         for src in store.list_sources():
             entry: dict[str, Any] = {"name": src.name, "type": src.type}
-            if src.type == "file":
+            if src.type in SINGLE_TABLE_TYPES:
                 entry["table"] = table_name(src.name, DATASET_KEY)
             sources.append(entry)
         return {"sources": sources, "tables": queries.tables()}
@@ -204,6 +215,29 @@ def create_app(
             "limit": body.limit,
             "elapsed_ms": result.elapsed_ms,
         })
+
+    def sheet_error(exc: Exception) -> HTTPException:
+        return HTTPException(400, str(exc))
+
+    @app.post("/api/gsheets/inspect", dependencies=auth)
+    def inspect_gsheet(body: SheetIn) -> dict[str, Any]:
+        """The tabs of a Google Sheet and the source each would become. Changes nothing."""
+        try:
+            load = engine.plan_gsheet(sheet_fetch(body.url))
+        except SheetError as exc:
+            raise sheet_error(exc) from None
+        return jsonable_encoder(load)
+
+    @app.post("/api/gsheets", dependencies=auth)
+    def load_gsheet(body: SheetIn) -> dict[str, Any]:
+        """Load every tab of a Google Sheet into its own source "<file>_<tab>"."""
+        if body.mode not in ("replace", "append"):
+            raise HTTPException(400, "mode must be replace or append")
+        try:
+            load = engine.ingest_gsheet(body.url, body.mode, fetch=sheet_fetch)
+        except SheetError as exc:
+            raise sheet_error(exc) from None
+        return jsonable_encoder(load)
 
     @app.post("/api/sources/{name}/uploads", dependencies=auth)
     def upload(
