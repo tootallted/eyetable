@@ -389,11 +389,11 @@
   // scripts/run-public.ps1 rewrites this line with each new tunnel URL; the
   // page also re-reads it from the live copy, so a cached page still finds it.
   // Served by `eyetable serve` itself, the page ignores it and uses its own origin.
-  var API_BASE = 'https://lets-undefined-tunes-neither.trycloudflare.com';
+  var API_BASE = 'https://emerging-important-rico-likes.trycloudflare.com';
 
   (function () {
     'use strict';
-    var SOURCE_NAME = /^[a-z][a-z0-9_]{0,39}$/;
+    var SOURCE_NAME = /^[a-z][a-z0-9_]{0,62}$/;
     var ET_COLUMNS = ['ET_id', 'ET_timestamp', 'ET_source', 'ET_run_id'];
     var KEY_BASE = 'eyetable.apiBase', KEY_TOKEN = 'eyetable.apiToken';
 
@@ -646,7 +646,7 @@
       var s = name.toLowerCase().replace(/\.[^.]*$/, '').replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
       if (!s) s = 'source';
       if (!/^[a-z]/.test(s)) s = 's_' + s;
-      return s.slice(0, 40).replace(/_+$/, '');
+      return s.slice(0, 63).replace(/_+$/, '');
     }
 
     // Small RFC 4180 parser, for the local preview only; the API parses for real.
@@ -754,7 +754,7 @@
         var valid = SOURCE_NAME.test(name) && !taken;
         note.className = 'note' + (name && !valid ? ' bad' : '');
         note.textContent = taken ? 'A source named ' + name + ' already exists. Choose Existing source to load a new version.'
-          : name && !SOURCE_NAME.test(name) ? 'Use lowercase letters, digits and _, starting with a letter (max 40).'
+          : name && !SOURCE_NAME.test(name) ? 'Use lowercase letters, digits and _, starting with a letter (max 63).'
           : 'Lowercase letters, digits and _, starting with a letter.';
         ok = ok && valid;
       } else {
