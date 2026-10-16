@@ -465,7 +465,7 @@
       return fetch(location.pathname + '?fresh=' + Date.now(), { cache: 'no-store' })
         .then(function (r) { return r.ok ? r.text() : ''; })
         .then(function (html) {
-          var m = html.match(/var API_BASE = '([^']*)';/);
+          var m = html.match(/var API_BASE\s*=\s*'([^']*)';/);  // written so it never matches itself
           return m && m[1] ? m[1] : null;
         })
         .catch(function () { return null; });
