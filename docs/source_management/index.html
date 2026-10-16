@@ -137,6 +137,11 @@
   .pill-new { background: var(--ok-soft); color: var(--ok); }
   .pill-again { background: var(--accent-soft); color: var(--accent); }
   .pill-skip { background: var(--warn-soft); color: var(--warn); }
+  .gs-google { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 13px; color: var(--muted); }
+  .gs-google .who { color: var(--text); font-weight: 500; overflow-wrap: anywhere; }
+  .btn.google { gap: 8px; }
+  .btn.google svg { flex: none; }
+  .banner .btn { margin-top: 8px; }
   .file-chip { display: flex; gap: 12px; align-items: center; padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px; }
   .file-chip .meta { min-width: 0; margin-right: auto; }
   .file-chip .name { font-weight: 600; overflow-wrap: anywhere; }
@@ -341,8 +346,9 @@
             <input type="url" id="gs-url" placeholder="https://docs.google.com/spreadsheets/d/…" autocomplete="off" spellcheck="false">
             <button class="btn" id="gs-check" type="button" disabled>Check tabs</button>
           </div>
-          <p class="hint">Every tab becomes its own source, named <code>file name_tab name</code>. Share the sheet as
-            “Anyone with the link can view” first. Paste or drop the same link again later to refresh its tabs.</p>
+          <p class="hint">Every tab becomes its own source, named <code>file name_tab name</code>. Paste or drop the
+            same link again later to refresh its tabs.</p>
+          <div class="gs-google" id="gs-google"></div>
           <div id="gs-plan" hidden style="display:grid; gap:12px">
             <div class="gs-title" id="gs-title"></div>
             <div class="table-wrap gs-tabs" id="gs-tabs"></div>
@@ -427,6 +433,9 @@
   // scripts/run-public.ps1 rewrites this line with each new tunnel URL; the
   // page also re-reads it from the live copy, so a cached page still finds it.
   // Served by `eyetable serve` itself, the page ignores it and uses its own origin.
+  // OAuth client ID for "Sign in with Google" (read private sheets as yourself). Not a secret.
+  var GOOGLE_CLIENT_ID = '';
+
   var API_BASE = 'https://angel-beliefs-spot-adds.trycloudflare.com';
 
   (function () {
@@ -1026,6 +1035,112 @@
     window.addEventListener('resize', function () { setDock(query.height, query.collapsed); });
 
 
+
+    // -- Sign in with Google (private sheets) --------------------------------
+    // The page asks Google for a short-lived, read-only Sheets token for whoever
+    // is using it, and sends it with sheet requests; the API reads the sheet as
+    // that person and keeps nothing. The token lives only in this page's memory.
+    var GOOGLE_SCOPES = 'openid email https://www.googleapis.com/auth/spreadsheets.readonly';
+    var gauth = { client: null, failed: false, token: '', expires: 0, email: '', pending: null };
+    var GOOGLE_MARK = '<svg width="16" height="16" viewBox="0 0 48 48" aria-hidden="true"><path fill="#EA4335" d="M24 9.5c3.5 0 6.6 1.2 9 3.6l6.7-6.7C35.6 2.4 30.2 0 24 0 14.6 0 6.6 5.4 2.7 13.3l7.8 6C12.4 13.6 17.7 9.5 24 9.5z"/><path fill="#4285F4" d="M46.5 24.5c0-1.6-.1-3.1-.4-4.5H24v9h12.7c-.6 3-2.3 5.5-4.8 7.2l7.6 5.9c4.4-4.1 7-10.1 7-17.6z"/><path fill="#FBBC05" d="M10.5 28.7c-.5-1.4-.8-3-.8-4.7s.3-3.3.8-4.7l-7.8-6C1 16.6 0 20.2 0 24s1 7.4 2.7 10.7l7.8-6z"/><path fill="#34A853" d="M24 48c6.5 0 11.9-2.1 15.9-5.8l-7.6-5.9c-2.1 1.4-4.9 2.3-8.3 2.3-6.3 0-11.6-4.1-13.5-9.8l-7.8 6C6.6 42.6 14.6 48 24 48z"/></svg>';
+
+    function googleToken() { return gauth.token && Date.now() < gauth.expires ? gauth.token : ''; }
+
+    function googleButton(label, then) {
+      var b = el('button', { type: 'button', class: 'btn small google' });
+      b.innerHTML = GOOGLE_MARK;
+      b.appendChild(document.createTextNode(label));
+      b.addEventListener('click', function () {
+        signInWithGoogle().then(then || function () {}, function (err) {
+          clear($('gs-result')).appendChild(banner('err', err.message));
+        });
+      });
+      return b;
+    }
+
+    function renderGoogle() {
+      var box = clear($('gs-google'));
+      if (!GOOGLE_CLIENT_ID) {
+        box.appendChild(document.createTextNode('Private sheets: Google sign-in is not set up for this page yet, so share sheets as “Anyone with the link can view”.'));
+        return;
+      }
+      if (gauth.failed) { box.appendChild(document.createTextNode("Google sign-in couldn't load (blocked by an extension or offline?).")); return; }
+      if (!gauth.client) { box.appendChild(document.createTextNode('Loading Google sign-in…')); return; }
+      if (googleToken()) {
+        box.appendChild(document.createTextNode('Reading sheets as '));
+        box.appendChild(el('span', { class: 'who', text: gauth.email || 'your Google account' }));
+        var out = el('button', { type: 'button', class: 'link', text: 'Sign out' });
+        out.addEventListener('click', signOutGoogle);
+        box.appendChild(out);
+      } else {
+        box.appendChild(document.createTextNode('Private sheet?'));
+        box.appendChild(googleButton('Sign in with Google'));
+      }
+    }
+
+    function initGoogle() {
+      renderGoogle();
+      if (!GOOGLE_CLIENT_ID) return;
+      var script = el('script', { src: 'https://accounts.google.com/gsi/client', async: '' });
+      script.onload = function () {
+        gauth.client = window.google.accounts.oauth2.initTokenClient({
+          client_id: GOOGLE_CLIENT_ID,
+          scope: GOOGLE_SCOPES,
+          callback: function (resp) {
+            var pending = gauth.pending;
+            gauth.pending = null;
+            if (resp.error) { if (pending) pending.reject(new Error('Google sign-in: ' + (resp.error_description || resp.error))); return; }
+            if (!window.google.accounts.oauth2.hasGrantedAllScopes(resp, 'https://www.googleapis.com/auth/spreadsheets.readonly')) {
+              if (pending) pending.reject(new Error('Google sign-in finished without permission to read Sheets; sign in again and allow it.'));
+              return;
+            }
+            gauth.token = resp.access_token;
+            gauth.expires = Date.now() + (Number(resp.expires_in || 3600) - 60) * 1000;
+            fetch('https://www.googleapis.com/oauth2/v3/userinfo', { headers: { Authorization: 'Bearer ' + gauth.token } })
+              .then(function (r) { return r.ok ? r.json() : {}; })
+              .then(function (info) { gauth.email = info.email || ''; }, function () {})
+              .then(function () { renderGoogle(); if (pending) pending.resolve(gauth.token); });
+          },
+          error_callback: function (err) {
+            var pending = gauth.pending;
+            gauth.pending = null;
+            if (pending) pending.reject(new Error(err && err.type === 'popup_closed' ? 'Google sign-in was closed before it finished.'
+              : err && err.type === 'popup_failed_to_open' ? 'Your browser blocked the Google sign-in popup; allow popups for this page.'
+              : 'Google sign-in failed.'));
+          }
+        });
+        renderGoogle();
+      };
+      script.onerror = function () { gauth.failed = true; renderGoogle(); };
+      document.head.appendChild(script);
+    }
+
+    // Must run straight from a click, or the browser blocks Google's popup.
+    function signInWithGoogle() {
+      if (!gauth.client) return Promise.reject(new Error('Google sign-in is still loading; try again in a moment.'));
+      return new Promise(function (resolve, reject) {
+        gauth.pending = { resolve: resolve, reject: reject };
+        gauth.client.requestAccessToken(gauth.email ? { prompt: '', login_hint: gauth.email } : { prompt: 'select_account' });
+      });
+    }
+
+    function signOutGoogle() {
+      if (gauth.token && window.google) window.google.accounts.oauth2.revoke(gauth.token, function () {});
+      gauth.token = '';
+      gauth.expires = 0;
+      gauth.email = '';
+      renderGoogle();
+    }
+
+    // A sheet error, with a way past it when signing in with Google could help.
+    function sheetErrorBanner(prefix, err, retry) {
+      var b = banner('err', prefix + err.message);
+      if (err.status === 403 && GOOGLE_CLIENT_ID && gauth.client) {
+        b.appendChild(el('div', null, [googleButton(googleToken() ? 'Sign in with another Google account' : 'Sign in with Google and try again', retry)]));
+      }
+      return b;
+    }
+
     // -- Google Sheets -----------------------------------------------------
     var SHEET_LINK = /docs\.google\.com\/spreadsheets\//;
     var sheet = { plan: null, url: '', busy: false };
@@ -1060,11 +1175,11 @@
       sheet.busy = true;
       renderSheetControls();
       $('gs-check').textContent = 'Checking…';
-      sheetRequest('/api/gsheets/inspect', { url: url }).then(function (plan) {
+      sheetRequest('/api/gsheets/inspect', { url: url, google_token: googleToken() || null }).then(function (plan) {
         sheet.plan = plan;
         renderSheetPlan();
       }, function (err) {
-        $('gs-result').appendChild(banner('err', err.message));
+        $('gs-result').appendChild(sheetErrorBanner('', err, checkSheet));
       }).then(function () {
         sheet.busy = false;
         renderSheetControls();
@@ -1106,7 +1221,7 @@
       renderSheetControls();
       $('gs-load').textContent = 'Loading…';
       clear($('gs-result'));
-      sheetRequest('/api/gsheets', { url: sheet.url, mode: mode }).then(function (load) {
+      sheetRequest('/api/gsheets', { url: sheet.url, mode: mode, google_token: googleToken() || null }).then(function (load) {
         var loaded = [], skipped = [], failed = [];
         load.results.forEach(function (r, i) {
           var tab = load.tabs[i];
@@ -1126,7 +1241,7 @@
         if (loaded.length) state.selected = loaded[0].tab.source;
         return refresh();
       }, function (err) {
-        $('gs-result').appendChild(banner('err', 'Not loaded: ' + err.message));
+        $('gs-result').appendChild(sheetErrorBanner('Not loaded: ', err, checkSheet));
       }).then(function () {
         sheet.busy = false;
         renderSheetControls();
@@ -1138,6 +1253,7 @@
     $('gs-url').addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); checkSheet(); } });
     $('gs-check').addEventListener('click', checkSheet);
     $('gs-load').addEventListener('click', loadSheet);
+    initGoogle();
 
     // -- wiring ------------------------------------------------------------
     var drop = $('drop');

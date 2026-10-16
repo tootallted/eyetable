@@ -25,7 +25,7 @@ from pydantic import BaseModel, Field
 from eyetable import __version__
 from eyetable.connectors.file import DATASET_KEY
 from eyetable.engine import SINGLE_TABLE_TYPES, Engine
-from eyetable.gsheets import SheetError, fetch_workbook
+from eyetable.gsheets import SheetError, fetch_workbook, fetch_workbook_signed_in
 from eyetable.identifiers import SOURCE_NAME, table_name
 from eyetable.query import MAX_LIMIT, QueryError, QueryRunner
 from eyetable.ratelimit import SlidingWindow, client_ip
@@ -39,6 +39,9 @@ PAGES_DIR = Path(__file__).resolve().parents[2] / "docs"  # the GitHub Pages sit
 class SheetIn(BaseModel):
     url: str = Field(max_length=2000)
     mode: str = "replace"
+    # A short-lived Google access token from the page's "Sign in with Google", to read
+    # private sheets as that person. Used for this request only; never stored or logged.
+    google_token: str | None = Field(default=None, max_length=4096)
 
 
 class QueryIn(BaseModel):
@@ -62,14 +65,16 @@ def create_app(
     uploads_per_hour: int = 120,
     auth_failures_per_15_minutes: int = 10,
     query_runner: QueryRunner | None = None,
-    sheet_fetch: Callable[[str], Any] | None = None,
+    sheet_fetch: Callable[[str, str | None], Any] | None = None,
 ) -> FastAPI:
     if not token:
         raise ValueError("an API token is required")
     store = engine.store
     queries = query_runner or QueryRunner(store)
     if sheet_fetch is None:
-        def sheet_fetch(url: str):
+        def sheet_fetch(url: str, google_token: str | None = None):
+            if google_token:
+                return fetch_workbook_signed_in(url, google_token, max_bytes=max_upload_bytes)
             return fetch_workbook(url, max_bytes=max_upload_bytes)
     app = FastAPI(title="eyetable", version=__version__, docs_url="/api/docs", openapi_url="/api/openapi.json")
 
@@ -216,14 +221,15 @@ def create_app(
             "elapsed_ms": result.elapsed_ms,
         })
 
-    def sheet_error(exc: Exception) -> HTTPException:
-        return HTTPException(400, str(exc))
+    def sheet_error(exc: SheetError) -> HTTPException:
+        # 403 tells the page that signing in with Google (again) may get past this.
+        return HTTPException(403 if exc.needs_sign_in else 400, str(exc))
 
     @app.post("/api/gsheets/inspect", dependencies=auth)
     def inspect_gsheet(body: SheetIn) -> dict[str, Any]:
         """The tabs of a Google Sheet and the source each would become. Changes nothing."""
         try:
-            load = engine.plan_gsheet(sheet_fetch(body.url))
+            load = engine.plan_gsheet(sheet_fetch(body.url, body.google_token))
         except SheetError as exc:
             raise sheet_error(exc) from None
         return jsonable_encoder(load)
@@ -234,7 +240,7 @@ def create_app(
         if body.mode not in ("replace", "append"):
             raise HTTPException(400, "mode must be replace or append")
         try:
-            load = engine.ingest_gsheet(body.url, body.mode, fetch=sheet_fetch)
+            load = engine.ingest_gsheet(body.url, body.mode, fetch=lambda url: sheet_fetch(url, body.google_token))
         except SheetError as exc:
             raise sheet_error(exc) from None
         return jsonable_encoder(load)

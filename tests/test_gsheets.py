@@ -41,7 +41,7 @@ LEDGER = {
 
 
 def fake_fetch(tabs=LEDGER, title="General Ledger 2026"):
-    def fetch(url):
+    def fetch(url, google_token=None):
         sid, published = gsheets.parse_sheet_url(url)
         return gsheets.Workbook(title, sid, published, gsheets.sheet_link(sid, published),
                                 gsheets.parse_workbook(make_xlsx(tabs)))
@@ -172,3 +172,75 @@ def test_api_inspect_load_and_query(store):
 
     assert client.post("/api/gsheets", headers=AUTH, json={"url": "https://example.com/x"}).status_code == 400
     assert client.post("/api/gsheets", json={"url": LINK}).status_code == 401
+
+
+SHEETS_API_PAYLOAD = {
+    "properties": {"title": "Private Ledger"},
+    "sheets": [
+        {"properties": {"title": "Q1 Actuals", "index": 0}, "data": [{"rowData": [
+            {"values": [{"effectiveValue": {"stringValue": "Account"}}, {"effectiveValue": {"stringValue": "Amount"}},
+                        {"effectiveValue": {"stringValue": "Posted"}}, {"effectiveValue": {"stringValue": "Paid"}},
+                        {"effectiveValue": {"stringValue": "Check"}}]},
+            {"values": [{"effectiveValue": {"stringValue": "Rent"}},
+                        {"effectiveValue": {"numberValue": 1200.5}, "effectiveFormat": {"numberFormat": {"type": "CURRENCY"}}},
+                        {"effectiveValue": {"numberValue": 46053}, "effectiveFormat": {"numberFormat": {"type": "DATE"}}},
+                        {"effectiveValue": {"boolValue": True}},
+                        {"effectiveValue": {"errorValue": {"type": "DIVIDE_BY_ZERO"}}}]},
+            {"values": [{"effectiveValue": {"stringValue": "Payroll"}}, {"effectiveValue": {"numberValue": 5400}}, {}, {}]},
+            {},
+        ]}]},
+        {"properties": {"title": "Scratch", "index": 1, "hidden": True}, "data": [{}]},
+    ],
+}
+
+
+def test_signed_in_reads_private_sheets_through_the_api():
+    seen = {}
+
+    def handler(request):
+        seen["url"] = str(request.url)
+        seen["auth"] = request.headers["authorization"]
+        return httpx.Response(200, json=SHEETS_API_PAYLOAD)
+
+    book = gsheets.fetch_workbook_signed_in(LINK, "ya29.token", client=httpx.Client(transport=httpx.MockTransport(handler)))
+    assert seen["auth"] == "Bearer ya29.token"
+    assert seen["url"].startswith(f"https://sheets.googleapis.com/v4/spreadsheets/{SHEET_ID}?includeGridData=true")
+    assert book.title == "Private Ledger"
+    q1, scratch = book.tabs
+    assert q1.headers == ["Account", "Amount", "Posted", "Paid", "Check"]
+    assert q1.records == [
+        {"Account": "Rent", "Amount": 1200.5, "Posted": dt.date(2026, 1, 31), "Paid": True, "Check": "#DIV/0!"},
+        {"Account": "Payroll", "Amount": 5400, "Posted": None, "Paid": None, "Check": None},
+    ]
+    assert scratch.hidden and scratch.headers == []
+
+
+@pytest.mark.parametrize("status, body, sign_in, text", [
+    (401, {"error": {"message": "Invalid Credentials"}}, True, "expired"),
+    (403, {"error": {"message": "The caller does not have permission"}}, True, "can't open"),
+    (404, {"error": {"message": "Requested entity was not found."}}, True, "can't open"),
+    (403, {"error": {"message": "Google Sheets API has not been used in project 123 before or it is disabled."}}, False, "not enabled"),
+    (400, {"error": {"message": "This operation is not supported for this document"}}, False, "Excel file"),
+])
+def test_signed_in_errors(status, body, sign_in, text):
+    client = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(status, json=body)))
+    with pytest.raises(gsheets.SheetError, match=text) as info:
+        gsheets.fetch_workbook_signed_in(LINK, "tok", client=client)
+    assert info.value.needs_sign_in is sign_in
+
+
+def test_api_asks_for_google_sign_in_and_passes_the_token(store):
+    calls = []
+
+    def fetch(url, google_token=None):
+        calls.append(google_token)
+        if not google_token:
+            raise gsheets.SheetError("this spreadsheet is private", needs_sign_in=True)
+        return fake_fetch()(url)
+
+    client = TestClient(create_app(Engine(store), TOKEN, sheet_fetch=fetch))
+    r = client.post("/api/gsheets/inspect", headers=AUTH, json={"url": LINK})
+    assert r.status_code == 403 and "private" in r.json()["detail"]
+    r = client.post("/api/gsheets", headers=AUTH, json={"url": LINK, "google_token": "ya29.abc"})
+    assert r.status_code == 200 and [x["status"] for x in r.json()["results"]][:2] == ["succeeded", "succeeded"]
+    assert calls == [None, "ya29.abc"]

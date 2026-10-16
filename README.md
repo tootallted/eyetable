@@ -160,10 +160,24 @@ size, and whether it is new or was loaded before; **Load** loads them all.
   by another source is skipped rather than overwritten.
 * `ET_source` reads `<source> - <file name> / <tab name>`, and each load keeps a
   CSV snapshot of the tab in `eyetable.uploads`.
-* The sheet must be shared as **Anyone with the link can view** (or published
-  to the web): eyetable downloads it the way *File → Download → Microsoft
-  Excel* does, with no Google account. Formulas come in as their values.
-* From the command line: `eyetable gsheet <link> [--mode append]`.
+* **Private sheets**: click **Sign in with Google** (or the button on the
+  "this spreadsheet is private" message) and approve read-only access to
+  Sheets in Google's popup. Any sheet your Google account can open then loads.
+  The page holds a short-lived (one hour) access token in memory and sends it
+  with each sheet request; the API reads the sheet through the Sheets API as
+  you and never stores the token. **Sign out** revokes it.
+* Signed out, the sheet must be shared as **Anyone with the link can view**
+  (or published to the web): eyetable downloads it the way *File → Download →
+  Microsoft Excel* does. Either way, formulas come in as their values.
+* From the command line: `eyetable gsheet <link> [--mode append]` (link-shared
+  sheets only).
+
+Google sign-in needs an OAuth client ID, set as `GOOGLE_CLIENT_ID` in
+`docs/source_management/index.html`. It comes from a Google Cloud project in
+the adventag.com organization with the Google Sheets API enabled, an
+**Internal** OAuth consent screen (adventag.com accounts only, no Google
+review), and a *Web application* client whose authorized JavaScript origins
+are `https://tootallted.github.io` and `http://localhost:8765`.
 
 ### Query window
 
