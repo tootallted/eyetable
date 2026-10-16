@@ -295,9 +295,10 @@
 </main>
 
 <script>
-  // Default eyetable API URL for this page. Empty: same origin when served by
-  // `eyetable serve`, http://localhost:8765 on GitHub Pages. The Connection
-  // panel overrides it per browser.
+  // The eyetable API this page calls when published on GitHub Pages.
+  // scripts/run-public.ps1 rewrites this line with each new tunnel URL; the
+  // page also re-reads it from the live copy, so a cached page still finds it.
+  // Served by `eyetable serve` itself, the page ignores it and uses its own origin.
   var API_BASE = 'https://lets-undefined-tunes-neither.trycloudflare.com';
 
   (function () {
@@ -313,9 +314,13 @@
     function read(store, key) { try { return window[store].getItem(key) || ''; } catch (e) { return ''; } }
     function write(store, key, value) { try { value ? window[store].setItem(key, value) : window[store].removeItem(key); } catch (e) {} }
 
+    // On GitHub Pages the API lives elsewhere (API_BASE, kept current by
+    // scripts/run-public.ps1); served by `eyetable serve`, it is this origin.
+    var ON_PAGES = /\.github\.io$/.test(location.hostname);
+
     function defaultBase() {
+      if (!ON_PAGES && location.protocol.indexOf('http') === 0) return location.origin;
       if (API_BASE) return API_BASE;
-      if (location.protocol.indexOf('http') === 0 && !/\.github\.io$/.test(location.hostname)) return location.origin;
       return 'http://localhost:8765';
     }
 
@@ -361,12 +366,37 @@
     }
 
     // -- API ---------------------------------------------------------------
-    function api(path, options) {
-      options = options || {};
+
+    // The API's tunnel address changes whenever the PC running it restarts, and
+    // GitHub Pages lets browsers keep this page for 10 minutes. So read API_BASE
+    // from a fresh copy of the published page, past every cache.
+    function latestApiBase() {
+      if (!ON_PAGES) return Promise.resolve(null);
+      return fetch(location.pathname + '?fresh=' + Date.now(), { cache: 'no-store' })
+        .then(function (r) { return r.ok ? r.text() : ''; })
+        .then(function (html) {
+          var m = html.match(/var API_BASE = '([^']*)';/);
+          return m && m[1] ? m[1] : null;
+        })
+        .catch(function () { return null; });
+    }
+
+    function useBase(base) {
+      state.base = base;
+      $('api-base').value = base;
+      write('sessionStorage', KEY_BASE, base);
+      if (read('localStorage', KEY_BASE)) write('localStorage', KEY_BASE, base);
+    }
+
+    // One call to the API. Network failures are marked so api() can retry them.
+    function request(path, options) {
       var headers = Object.assign({ Authorization: 'Bearer ' + state.token }, options.headers || {});
       return fetch(state.base.replace(/\/+$/, '') + path, Object.assign({}, options, { headers: headers }))
         .catch(function () {
-          throw new Error("Can't reach the eyetable API at " + state.base + '. Is `eyetable serve` running?');
+          var err = new Error("Can't reach the eyetable API at " + state.base +
+            '. The PC running it may be off or restarting (its address changes on restart); try again in a minute.');
+          err.network = true;
+          throw err;
         })
         .then(function (res) {
           return res.text().then(function (text) {
@@ -382,6 +412,21 @@
             return body;
           });
         });
+    }
+
+    // request(), but if the API can't be reached and the published page now
+    // names a different address, switch to it and try once more.
+    function api(path, options) {
+      options = options || {};
+      return request(path, options).catch(function (err) {
+        if (!err.network) throw err;
+        var tried = state.base;
+        return latestApiBase().then(function (fresh) {
+          if (!fresh || fresh === tried) throw err;
+          useBase(fresh);
+          return request(path, options);
+        });
+      });
     }
 
     function setStatus(kind, text) {
@@ -688,12 +733,16 @@
     // -- start -------------------------------------------------------------
     var savedBase = read('sessionStorage', KEY_BASE) || read('localStorage', KEY_BASE);
     var savedToken = read('sessionStorage', KEY_TOKEN) || read('localStorage', KEY_TOKEN);
-    // A newer tunnel URL from the page beats an old saved one.
-    $('api-base').value = API_BASE || savedBase || defaultBase();
     $('api-token').value = savedToken;
     $('remember').checked = !!read('localStorage', KEY_TOKEN);
     renderDestination();
-    if (savedToken) connect(); else $('settings').hidden = false;
+    // A newer tunnel URL from the published page beats an old saved one, and
+    // beats this copy's own API_BASE when the browser served it from cache.
+    $('api-base').value = (ON_PAGES && API_BASE) || savedBase || defaultBase();
+    latestApiBase().then(function (fresh) {
+      if (fresh) $('api-base').value = fresh;
+      if (savedToken) connect(); else $('settings').hidden = false;
+    });
   })();
 </script>
 </body>
