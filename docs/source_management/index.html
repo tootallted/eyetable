@@ -76,6 +76,10 @@
   .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
   .pill.ok .dot { background: var(--ok); }
   .pill.err .dot { background: var(--err); }
+  .google-top { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); min-width: 0; }
+  .google-top .who { color: var(--text); font-weight: 500; max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .google-top .g { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
+  #top-msg:empty { display: none; }
 
   main { max-width: 1240px; margin: 0 auto; padding: 24px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 20px; }
   .grid { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); gap: 20px; align-items: start; }
@@ -255,10 +259,12 @@
 <header class="top">
   <div class="brand"><b>eyetable</b><span>Source management</span></div>
   <span class="pill" id="status"><span class="dot"></span><span id="status-text">Not connected</span></span>
+  <span class="google-top" id="google-top" aria-live="polite"></span>
   <button class="btn small" id="toggle-settings" type="button">Connection</button>
 </header>
 
 <main>
+  <div id="top-msg" role="status"></div>
   <section class="card settings" id="settings" hidden aria-labelledby="settings-title">
     <h2 id="settings-title">Connect to your eyetable API</h2>
     <div class="card-body">
@@ -1041,24 +1047,58 @@
     // is using it, and sends it with sheet requests; the API reads the sheet as
     // that person and keeps nothing. The token lives only in this page's memory.
     var GOOGLE_SCOPES = 'openid email https://www.googleapis.com/auth/spreadsheets.readonly';
-    var gauth = { client: null, failed: false, token: '', expires: 0, email: '', pending: null };
+    var KEY_GEMAIL = 'eyetable.googleEmail';  // only to pre-select the account next time; not a credential
+    var gauth = { client: null, failed: false, token: '', expires: 0, email: read('localStorage', KEY_GEMAIL), pending: null, timer: null };
     var GOOGLE_MARK = '<svg width="16" height="16" viewBox="0 0 48 48" aria-hidden="true"><path fill="#EA4335" d="M24 9.5c3.5 0 6.6 1.2 9 3.6l6.7-6.7C35.6 2.4 30.2 0 24 0 14.6 0 6.6 5.4 2.7 13.3l7.8 6C12.4 13.6 17.7 9.5 24 9.5z"/><path fill="#4285F4" d="M46.5 24.5c0-1.6-.1-3.1-.4-4.5H24v9h12.7c-.6 3-2.3 5.5-4.8 7.2l7.6 5.9c4.4-4.1 7-10.1 7-17.6z"/><path fill="#FBBC05" d="M10.5 28.7c-.5-1.4-.8-3-.8-4.7s.3-3.3.8-4.7l-7.8-6C1 16.6 0 20.2 0 24s1 7.4 2.7 10.7l7.8-6z"/><path fill="#34A853" d="M24 48c6.5 0 11.9-2.1 15.9-5.8l-7.6-5.9c-2.1 1.4-4.9 2.3-8.3 2.3-6.3 0-11.6-4.1-13.5-9.8l-7.8 6C6.6 42.6 14.6 48 24 48z"/></svg>';
 
     function googleToken() { return gauth.token && Date.now() < gauth.expires ? gauth.token : ''; }
 
-    function googleButton(label, then) {
+    function googleButton(label, then, messageArea) {
       var b = el('button', { type: 'button', class: 'btn small google' });
       b.innerHTML = GOOGLE_MARK;
       b.appendChild(document.createTextNode(label));
       b.addEventListener('click', function () {
-        signInWithGoogle().then(then || function () {}, function (err) {
-          clear($('gs-result')).appendChild(banner('err', err.message));
+        if (!GOOGLE_CLIENT_ID) {
+          clear($(messageArea || 'top-msg')).appendChild(banner('warn',
+            "Google sign-in isn't switched on for this page yet: it needs eyetable's Google Cloud OAuth client ID (a one-time setup). " +
+            'Until then, private sheets need to be shared as “Anyone with the link can view”.'));
+          return;
+        }
+        signInWithGoogle().then(function (token) {
+          clear($(messageArea || 'top-msg'));
+          if (then) then(token);
+        }, function (err) {
+          clear($(messageArea || 'top-msg')).appendChild(banner('err', err.message));
         });
       });
       return b;
     }
 
+    // The sign-in control in the page header: always there, whatever you are doing.
+    function renderGoogleTop() {
+      var top = clear($('google-top'));
+      if (googleToken()) {
+        var who = el('span', { class: 'g', title: 'Signed in with Google: private sheets you can open will load' });
+        who.innerHTML = GOOGLE_MARK;
+        who.appendChild(el('span', { class: 'who', text: gauth.email || 'Google account' }));
+        var out = el('button', { type: 'button', class: 'link', text: 'Sign out' });
+        out.addEventListener('click', signOutGoogle);
+        top.appendChild(who);
+        top.appendChild(out);
+        return;
+      }
+      var b = googleButton('Sign in with Google');
+      if (GOOGLE_CLIENT_ID && (gauth.failed || !gauth.client)) {
+        b.disabled = true;
+        b.title = gauth.failed ? "Google sign-in couldn't load (blocked by an extension, or offline?)" : 'Loading Google sign-in…';
+      } else {
+        b.title = 'Read private Google Sheets with your Google account';
+      }
+      top.appendChild(b);
+    }
+
     function renderGoogle() {
+      renderGoogleTop();
       var box = clear($('gs-google'));
       if (!GOOGLE_CLIENT_ID) {
         box.appendChild(document.createTextNode('Private sheets: Google sign-in is not set up for this page yet, so share sheets as “Anyone with the link can view”.'));
@@ -1074,7 +1114,7 @@
         box.appendChild(out);
       } else {
         box.appendChild(document.createTextNode('Private sheet?'));
-        box.appendChild(googleButton('Sign in with Google'));
+        box.appendChild(googleButton('Sign in with Google', null, 'gs-result'));
       }
     }
 
@@ -1096,9 +1136,14 @@
             }
             gauth.token = resp.access_token;
             gauth.expires = Date.now() + (Number(resp.expires_in || 3600) - 60) * 1000;
+            clearTimeout(gauth.timer);
+            gauth.timer = setTimeout(renderGoogle, gauth.expires - Date.now() + 500);  // show "signed out" when it lapses
             fetch('https://www.googleapis.com/oauth2/v3/userinfo', { headers: { Authorization: 'Bearer ' + gauth.token } })
               .then(function (r) { return r.ok ? r.json() : {}; })
-              .then(function (info) { gauth.email = info.email || ''; }, function () {})
+              .then(function (info) {
+                gauth.email = info.email || '';
+                write('localStorage', KEY_GEMAIL, gauth.email);
+              }, function () {})
               .then(function () { renderGoogle(); if (pending) pending.resolve(gauth.token); });
           },
           error_callback: function (err) {
@@ -1129,14 +1174,16 @@
       gauth.token = '';
       gauth.expires = 0;
       gauth.email = '';
+      clearTimeout(gauth.timer);
+      write('localStorage', KEY_GEMAIL, '');
       renderGoogle();
     }
 
     // A sheet error, with a way past it when signing in with Google could help.
     function sheetErrorBanner(prefix, err, retry) {
       var b = banner('err', prefix + err.message);
-      if (err.status === 403 && GOOGLE_CLIENT_ID && gauth.client) {
-        b.appendChild(el('div', null, [googleButton(googleToken() ? 'Sign in with another Google account' : 'Sign in with Google and try again', retry)]));
+      if (err.status === 403 && (!GOOGLE_CLIENT_ID || gauth.client)) {
+        b.appendChild(el('div', null, [googleButton(googleToken() ? 'Sign in with another Google account' : 'Sign in with Google and try again', retry, 'gs-result')]));
       }
       return b;
     }
