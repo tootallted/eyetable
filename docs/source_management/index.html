@@ -433,6 +433,7 @@
     <div class="card-body">
       <p class="hint">Put sources that belong together in a group, then reload them all with one click, or on a schedule
         (for example every day at 6:00 AM, or every hour from 8:00 AM to 5:00 PM on weekdays).</p>
+      <div class="gs-google" id="google-conn" aria-live="polite"></div>
       <div id="groups-msg" role="status"></div>
       <form class="editor" id="group-editor" hidden>
         <h3 id="ge-title">New group</h3>
@@ -707,6 +708,7 @@
         renderSheetControls();
         loadSchema();
         loadGroups();
+        loadGoogleConnection();
         if (groupsState.editing) renderEditor();
         if (state.selected) selectSource(state.selected);
       }, function (err) {
@@ -1566,6 +1568,91 @@
     setInterval(function () {  // scheduled runs happen on the server; keep the list current
       if (state.connected && !document.hidden && !groupsState.editing) loadGroups();
     }, 60000);
+
+
+    // -- Google account for scheduled runs ----------------------------------------
+    // Scheduled runs have nobody signed in, so eyetable keeps its own long-lived
+    // Google authorization: Google's code popup hands the page a one-time code,
+    // the API swaps it for a refresh token and stores it encrypted.
+    var gconn = { status: null, busy: false };
+
+    function loadGoogleConnection() {
+      return api('/api/google').then(function (st) { gconn.status = st; renderGoogleConnection(); }, function () {});
+    }
+
+    function renderGoogleConnection() {
+      var box = clear($('google-conn'));
+      var st = gconn.status;
+      if (!st || !state.connected) return;
+      box.appendChild(document.createTextNode('Private Google Sheets in scheduled runs:'));
+      var button = function (label) {
+        var b = el('button', { type: 'button', class: 'btn small google' });
+        b.innerHTML = GOOGLE_MARK;
+        b.appendChild(document.createTextNode(gconn.busy ? 'Connecting…' : label));
+        b.disabled = gconn.busy;
+        b.addEventListener('click', connectGoogleForSchedules);
+        return b;
+      };
+      if (st.connected) {
+        box.appendChild(document.createTextNode('read as'));
+        box.appendChild(el('span', { class: 'who', text: st.email || 'a Google account' }));
+        var off = el('button', { type: 'button', class: 'link', text: 'Disconnect' });
+        off.addEventListener('click', disconnectGoogle);
+        box.appendChild(off);
+      } else if (st.status === 'broken') {
+        box.appendChild(el('span', { class: 'st failed', text: 'stopped working' }));
+        box.appendChild(el('span', { class: 'muted', text: (st.email ? st.email + ': ' : '') + (st.error || '') }));
+        box.appendChild(button('Reconnect'));
+      } else if (!st.configured) {
+        box.appendChild(el('span', { class: 'muted', text: 'not set up on the server yet (needs ' + st.missing.join(', ') + ' in .env).' }));
+      } else {
+        box.appendChild(el('span', { class: 'muted', text: 'none connected, so only link-shared sheets reload on schedule.' }));
+        box.appendChild(button('Connect a Google account'));
+      }
+    }
+
+    // Must run straight from a click, or the browser blocks Google's popup.
+    function connectGoogleForSchedules() {
+      var msg = clear($('groups-msg'));
+      if (!GOOGLE_CLIENT_ID || !window.google || !window.google.accounts) {
+        msg.appendChild(banner('err', 'Google sign-in is still loading (or blocked); try again in a moment.'));
+        return;
+      }
+      var client = window.google.accounts.oauth2.initCodeClient({
+        client_id: GOOGLE_CLIENT_ID,
+        scope: GOOGLE_SCOPES,
+        ux_mode: 'popup',
+        select_account: true,
+        callback: function (resp) {
+          if (resp.error) { msg.appendChild(banner('err', 'Google: ' + (resp.error_description || resp.error))); return; }
+          gconn.busy = true;
+          renderGoogleConnection();
+          api('/api/google/connect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code: resp.code }) })
+            .then(function (st) {
+              gconn.status = st;
+              msg.appendChild(banner('ok', 'Scheduled runs now read Google Sheets as ' + (st.email || 'that account') + '.'));
+            }, function (err) {
+              msg.appendChild(banner('err', 'Not connected: ' + err.message));
+            }).then(function () { gconn.busy = false; renderGoogleConnection(); });
+        },
+        error_callback: function (err) {
+          msg.appendChild(banner('err', err && err.type === 'popup_closed' ? 'Google sign-in was closed before it finished.'
+            : err && err.type === 'popup_failed_to_open' ? 'Your browser blocked the Google popup; allow popups for this page.'
+            : 'Google sign-in failed.'));
+        }
+      });
+      client.requestCode();
+    }
+
+    function disconnectGoogle() {
+      var st = gconn.status || {};
+      if (!confirm('Disconnect ' + (st.email || 'the Google account') + '? Scheduled runs will no longer be able to read private sheets.')) return;
+      api('/api/google', { method: 'DELETE' }).then(function (s2) {
+        gconn.status = s2;
+        renderGoogleConnection();
+        clear($('groups-msg')).appendChild(banner('ok', 'Disconnected; eyetable no longer holds a Google authorization.'));
+      }, function (err) { clear($('groups-msg')).appendChild(banner('err', err.message)); });
+    }
 
     // -- reloading a source ----------------------------------------------------
     var RELOAD_ICON = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 4v5h-5"/></svg>';

@@ -244,6 +244,7 @@ def serve(
     import uvicorn
 
     from eyetable.api import DEFAULT_CORS_ORIGINS, DEFAULT_MAX_UPLOAD_BYTES, create_app
+    from eyetable.google_auth import GoogleConnection
     from eyetable.query import QueryRunner
 
     s = load_settings()
@@ -269,6 +270,12 @@ def serve(
         cors_origins=origins or DEFAULT_CORS_ORIGINS,
         max_upload_bytes=int(max_mb) * 1024 * 1024 if max_mb else DEFAULT_MAX_UPLOAD_BYTES,
         query_runner=QueryRunner(store, query_url, float(os.environ.get("EYETABLE_QUERY_TIMEOUT_S", "30"))),
+        google=GoogleConnection(
+            store,
+            os.environ.get("GOOGLE_CLIENT_ID"),
+            os.environ.get("GOOGLE_CLIENT_SECRET"),
+            os.environ.get("EYETABLE_SECRET_KEY"),
+        ),
     )
     console.print(f"source management: [bold]http://{host}:{port}/source_management/[/bold]")
     import logging

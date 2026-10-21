@@ -29,6 +29,7 @@ from eyetable.engine import SINGLE_TABLE_TYPES, Engine
 from eyetable.gsheets import SheetError, fetch_workbook, fetch_workbook_signed_in
 from eyetable.identifiers import SOURCE_NAME, table_name
 from eyetable.query import MAX_LIMIT, QueryError, QueryRunner
+from eyetable.google_auth import GoogleAuthError, GoogleConnection
 from eyetable.groups import GroupRunner
 from eyetable.ratelimit import SlidingWindow, client_ip
 from eyetable.schedule import ScheduleError, describe, next_runs, normalize
@@ -49,6 +50,10 @@ class GroupIn(BaseModel):
 
 class ScheduleIn(BaseModel):
     schedule: dict[str, Any]
+
+
+class GoogleCodeIn(BaseModel):
+    code: str = Field(min_length=1, max_length=2048)
 
 
 class ReloadIn(BaseModel):
@@ -86,14 +91,24 @@ def create_app(
     auth_failures_per_15_minutes: int = 10,
     query_runner: QueryRunner | None = None,
     group_runner: GroupRunner | None = None,
+    google: GoogleConnection | None = None,
     sheet_fetch: Callable[[str, str | None], Any] | None = None,
 ) -> FastAPI:
     if not token:
         raise ValueError("an API token is required")
     store = engine.store
     queries = query_runner or QueryRunner(store)
+    google = google or GoogleConnection(store, None, None, None)
     if sheet_fetch is None:
         def sheet_fetch(url: str, google_token: str | None = None):
+            # Whose eyes read the sheet: the person using the page (their token), else the
+            # Google account connected for scheduled runs, else nobody (link-shared only).
+            if not google_token and google.is_connected():
+                try:
+                    google_token = google.access_token()
+                except GoogleAuthError as exc:
+                    raise SheetError(f"the Google account connected for scheduled runs can't be used: {exc}",
+                                     needs_sign_in=True) from None
             if google_token:
                 return fetch_workbook_signed_in(url, google_token, max_bytes=max_upload_bytes)
             return fetch_workbook(url, max_bytes=max_upload_bytes)
@@ -315,6 +330,28 @@ def create_app(
     def group_runs(group_id: int, limit: int = 10) -> list[dict[str, Any]]:
         get_group(group_id)
         return jsonable_encoder(store.list_group_runs(group_id, max(1, min(limit, 100))))
+
+    @app.get("/api/google", dependencies=auth)
+    def google_status() -> dict[str, Any]:
+        """The Google account scheduled runs read sheets as, if any."""
+        return jsonable_encoder(google.status())
+
+    @app.post("/api/google/connect", dependencies=auth)
+    def google_connect(body: GoogleCodeIn) -> dict[str, Any]:
+        """Swap the page's one-time authorization code for a stored, long-lived authorization."""
+        if not google.configured:
+            raise HTTPException(503, "Google access for scheduled runs isn't set up on the server: set "
+                                + ", ".join(google.missing_settings()) + " in .env and restart eyetable")
+        try:
+            return jsonable_encoder(google.connect(body.code))
+        except GoogleAuthError as exc:
+            raise HTTPException(400, str(exc)) from None
+
+    @app.delete("/api/google", dependencies=auth)
+    def google_disconnect() -> dict[str, Any]:
+        """Revoke the stored authorization at Google and forget it."""
+        google.disconnect()
+        return jsonable_encoder(google.status())
 
     @app.post("/api/schedule/preview", dependencies=auth)
     def schedule_preview(body: ScheduleIn) -> dict[str, Any]:

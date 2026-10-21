@@ -220,9 +220,23 @@ that are due. If the PC was off at a scheduled time, the group runs once when
 eyetable starts again (a *catch-up* run), not once per missed slot. A group
 never runs twice at the same time.
 
-Scheduled runs have nobody signed in to Google, so Google Sheet sources in a
-scheduled group must be shared by link; a private sheet reloads only from
-**Run now** while you are signed in with Google.
+Scheduled runs have nobody signed in to Google, so for private sheets eyetable
+keeps its own long-lived Google authorization. At the top of the **Groups**
+card, **Connect a Google account** opens Google's popup once (read-only
+Sheets access); the API swaps the one-time code it returns for a refresh
+token, stores that encrypted (`EYETABLE_SECRET_KEY`) in the `eyetable` schema,
+which the query window's role can't read, and mints a fresh one-hour access
+token from it whenever a sheet must be read with nobody signed in. The card
+then shows *read as you@adventag.com*; **Disconnect** revokes the
+authorization at Google and deletes it. If Google stops honoring it (revoked
+at myaccount.google.com, or the password changed), the card says so and offers
+**Reconnect**.
+
+Which Google identity reads a sheet: yours, while you are signed in on the
+page; otherwise the connected account; otherwise none (link-shared sheets
+only). This needs three settings in `.env`: `GOOGLE_CLIENT_ID`,
+`GOOGLE_CLIENT_SECRET` (from the "eyetable page" OAuth client) and
+`EYETABLE_SECRET_KEY`; API: `GET/DELETE /api/google`, `POST /api/google/connect`.
 
 API: `GET/POST /api/groups`, `PUT/DELETE /api/groups/<id>`,
 `POST /api/groups/<id>/run` (returns a run id), `GET /api/group-runs/<id>`,

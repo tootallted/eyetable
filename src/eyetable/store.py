@@ -249,6 +249,20 @@ class CoreStore:
             sa.Column("finished_at", UTCDateTime()),
             sa.Column("results", JSONType, nullable=False),
         )
+        # One row at most: the Google account scheduled runs read sheets as. The
+        # refresh token is stored encrypted (see google_auth.py).
+        self.google_connection = sa.Table(
+            "google_connection",
+            self.metadata,
+            sa.Column("id", sa.Integer, primary_key=True),
+            sa.Column("email", sa.Text, nullable=False),
+            sa.Column("refresh_token", sa.Text, nullable=False),
+            sa.Column("scopes", sa.Text, nullable=False),
+            sa.Column("status", sa.String(16), nullable=False),
+            sa.Column("error", sa.Text),
+            sa.Column("connected_at", UTCDateTime(), nullable=False),
+            sa.Column("last_used_at", UTCDateTime()),
+        )
         self.uploads = sa.Table(
             "uploads",
             self.metadata,
@@ -469,6 +483,33 @@ class CoreStore:
                 .values(status="failed", finished_at=_now())
             )
             return result.rowcount
+
+    # -- Google connection ---------------------------------------------------
+
+    def save_google_connection(self, email: str, refresh_token_encrypted: str, scopes: str) -> None:
+        with self.db.begin() as conn:
+            conn.execute(sa.delete(self.google_connection))
+            conn.execute(sa.insert(self.google_connection).values(
+                id=1, email=email, refresh_token=refresh_token_encrypted, scopes=scopes,
+                status="ok", error=None, connected_at=_now(),
+            ))
+
+    def get_google_connection(self) -> dict[str, Any] | None:
+        with self.db.connect() as conn:
+            row = conn.execute(sa.select(self.google_connection)).first()
+        return dict(row._mapping) if row else None
+
+    def set_google_connection_status(self, status: str, error: str | None = None) -> None:
+        with self.db.begin() as conn:
+            conn.execute(sa.update(self.google_connection).values(status=status, error=error))
+
+    def touch_google_connection(self) -> None:
+        with self.db.begin() as conn:
+            conn.execute(sa.update(self.google_connection).values(last_used_at=_now()))
+
+    def delete_google_connection(self) -> None:
+        with self.db.begin() as conn:
+            conn.execute(sa.delete(self.google_connection))
 
     # -- uploads -----------------------------------------------------------
 
