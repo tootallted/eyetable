@@ -194,6 +194,40 @@ again; **Last loaded** shows when data last finished loading.
 Each reload is an ingestion run, so rows get a new `ET_timestamp` and
 `ET_run_id`, and `ET_id` starts again at 1. API: `POST /api/sources/<name>/reload`.
 
+### Groups and schedules
+
+A **group** is a named set of sources that load together. In the **Groups**
+card: **New group**, name it, tick its sources, and optionally give it a
+schedule:
+
+* **Daily at set times**, e.g. 6:00 AM (add more times for several runs a day)
+* **Every few hours** between two times, e.g. every hour from 8:00 AM to
+  5:00 PM (runs at 8:00, 9:00, … 17:00); every 1, 2, 3, 4, 6, 8 or 12 hours
+
+Either kind runs on the weekdays you pick (quick picks: every day, weekdays,
+weekends), in your browser's timezone. The editor shows the schedule in words
+and its next three run times as you change it. Untick *Run on this schedule*
+to pause a group without losing its schedule.
+
+**Run now** reloads every source in the group, one after another (each the
+same way as its own **Reload** button), in the background: the row shows
+progress, then the result per source. One failing source doesn't stop the
+rest; the run is marked *Partly failed* and lists what went wrong.
+
+Scheduled runs happen inside `eyetable serve` (so on this PC, via the
+`EyetablePublicApi` logon task), which checks every 30 seconds for groups
+that are due. If the PC was off at a scheduled time, the group runs once when
+eyetable starts again (a *catch-up* run), not once per missed slot. A group
+never runs twice at the same time.
+
+Scheduled runs have nobody signed in to Google, so Google Sheet sources in a
+scheduled group must be shared by link; a private sheet reloads only from
+**Run now** while you are signed in with Google.
+
+API: `GET/POST /api/groups`, `PUT/DELETE /api/groups/<id>`,
+`POST /api/groups/<id>/run` (returns a run id), `GET /api/group-runs/<id>`,
+`POST /api/schedule/preview`.
+
 ### Query window
 
 The panel docked at the bottom of the page runs your own SQL over everything

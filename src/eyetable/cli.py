@@ -271,6 +271,11 @@ def serve(
         query_runner=QueryRunner(store, query_url, float(os.environ.get("EYETABLE_QUERY_TIMEOUT_S", "30"))),
     )
     console.print(f"source management: [bold]http://{host}:{port}/source_management/[/bold]")
+    import logging
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    app_.state.group_runner.start()  # scheduled group runs happen inside this process
+    console.print("scheduler: running (checks for due groups every 30 s)")
     uvicorn.run(app_, host=host, port=port)
 
 

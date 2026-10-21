@@ -151,6 +151,39 @@
   .reload.busy svg { animation: spin 1s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
   @media (prefers-reduced-motion: reduce) { .reload.busy svg { animation: none; } }
+  .groups-table td { white-space: normal; }
+  .groups-table td.nowrap { white-space: nowrap; }
+  .groups-table .members { display: flex; flex-wrap: wrap; gap: 4px; max-width: 360px; }
+  .groups-table .members .tag { font-family: var(--mono); }
+  .groups-table .actions { display: flex; gap: 6px; justify-content: flex-end; }
+  .groups-table details { margin-top: 4px; font-size: 12px; color: var(--muted); }
+  .groups-table details li { margin: 2px 0; }
+  .st { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; white-space: nowrap; }
+  .st.succeeded { background: var(--ok-soft); color: var(--ok); }
+  .st.partial { background: var(--warn-soft); color: var(--warn); }
+  .st.failed { background: var(--err-soft); color: var(--err); }
+  .st.running { background: var(--accent-soft); color: var(--accent); }
+  .muted { color: var(--muted); }
+  .editor { border: 1px solid var(--accent); border-radius: 12px; padding: 16px; display: grid; gap: 16px; }
+  .editor h3 { margin: 0; font-size: 15px; }
+  .editor fieldset { border: 0; margin: 0; padding: 0; display: grid; gap: 8px; min-width: 0; }
+  .editor legend { font-size: 13px; font-weight: 600; padding: 0; margin-bottom: 6px; }
+  .pick-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 4px 16px; max-height: 220px; overflow: auto;
+    border: 1px solid var(--border); border-radius: 10px; padding: 8px 12px; }
+  .pick-list label { display: flex; align-items: center; gap: 8px; font-size: 13px; min-width: 0; }
+  .pick-list label span.n { font-family: var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .row-inline { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 14px; }
+  .row-inline input[type=time], .row-inline select { width: auto; }
+  input[type=time] { padding: 6px 8px; border-radius: 8px; border: 1px solid var(--border); background: var(--surface); }
+  .days { display: flex; gap: 4px; flex-wrap: wrap; }
+  .days button { min-width: 44px; padding: 5px 8px; border-radius: 8px; border: 1px solid var(--border); background: var(--surface); cursor: pointer; font-size: 13px; }
+  .days button[aria-pressed=true] { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+  .preview { font-size: 13px; padding: 10px 12px; border-radius: 10px; background: var(--surface-2); }
+  .preview strong { display: block; color: var(--text); margin-bottom: 2px; }
+  .preview.bad { background: var(--err-soft); color: var(--err); }
+  .editor .actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .editor .actions .spacer { margin-left: auto; }
+  .btn.danger { color: var(--err); }
   .file-chip { display: flex; gap: 12px; align-items: center; padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px; }
   .file-chip .meta { min-width: 0; margin-right: auto; }
   .file-chip .name { font-weight: 600; overflow-wrap: anywhere; }
@@ -392,6 +425,66 @@
     </section>
   </div>
 
+  <section class="card" aria-labelledby="groups-title">
+    <div class="card-head">
+      <h2 id="groups-title">Groups</h2>
+      <button class="btn small" id="group-new" type="button" disabled>New group</button>
+    </div>
+    <div class="card-body">
+      <p class="hint">Put sources that belong together in a group, then reload them all with one click, or on a schedule
+        (for example every day at 6:00 AM, or every hour from 8:00 AM to 5:00 PM on weekdays).</p>
+      <div id="groups-msg" role="status"></div>
+      <form class="editor" id="group-editor" hidden>
+        <h3 id="ge-title">New group</h3>
+        <label class="field">Group name
+          <input type="text" id="ge-name" maxlength="80" autocomplete="off" placeholder="e.g. Finance morning load">
+        </label>
+        <fieldset>
+          <legend>Sources in this group <button type="button" class="link" id="ge-all">all</button> · <button type="button" class="link" id="ge-none">none</button></legend>
+          <div class="pick-list" id="ge-sources"></div>
+        </fieldset>
+        <fieldset>
+          <legend>Schedule</legend>
+          <div class="segmented" role="group" aria-label="Schedule type">
+            <button type="button" data-kind="none" aria-pressed="true">Not scheduled</button>
+            <button type="button" data-kind="daily" aria-pressed="false">Daily at set times</button>
+            <button type="button" data-kind="hourly" aria-pressed="false">Every few hours</button>
+          </div>
+          <div id="ge-daily" hidden style="display:grid; gap:8px">
+            <div class="row-inline" id="ge-times"></div>
+            <div><button type="button" class="btn small" id="ge-add-time">Add a time</button></div>
+          </div>
+          <div id="ge-hourly" hidden class="row-inline">
+            Every
+            <select id="ge-every" aria-label="Every how many hours">
+              <option value="1">hour</option><option value="2">2 hours</option><option value="3">3 hours</option>
+              <option value="4">4 hours</option><option value="6">6 hours</option><option value="8">8 hours</option>
+              <option value="12">12 hours</option>
+            </select>
+            from <input type="time" id="ge-start" value="08:00" aria-label="First run of the day">
+            to <input type="time" id="ge-end" value="17:00" aria-label="Last run of the day">
+          </div>
+          <div id="ge-days-wrap" hidden style="display:grid; gap:6px">
+            <div class="days" id="ge-days" role="group" aria-label="Days"></div>
+            <div class="hint">Quick pick: <button type="button" class="link" data-days="0,1,2,3,4,5,6">every day</button> ·
+              <button type="button" class="link" data-days="0,1,2,3,4">weekdays</button> ·
+              <button type="button" class="link" data-days="5,6">weekends</button></div>
+            <label class="check"><input type="checkbox" id="ge-enabled" checked> Run on this schedule (untick to pause it)</label>
+            <div class="preview" id="ge-preview" aria-live="polite"></div>
+          </div>
+        </fieldset>
+        <div class="actions">
+          <button class="btn primary" type="submit" id="ge-save">Save group</button>
+          <button class="btn" type="button" id="ge-cancel">Cancel</button>
+          <span class="spacer"></span>
+          <button class="btn danger" type="button" id="ge-delete" hidden>Delete group</button>
+        </div>
+        <div id="ge-msg" role="status"></div>
+      </form>
+      <div class="table-wrap" id="groups-list"><div class="empty">Connect to see your groups.</div></div>
+    </div>
+  </section>
+
   <section class="card" id="detail" hidden aria-live="polite">
     <div class="card-body">
       <div class="detail-head">
@@ -613,6 +706,8 @@
         updateQueryControls();
         renderSheetControls();
         loadSchema();
+        loadGroups();
+        if (groupsState.editing) renderEditor();
         if (state.selected) selectSource(state.selected);
       }, function (err) {
         state.connected = false;
@@ -1195,6 +1290,282 @@
       return b;
     }
 
+
+
+    // -- groups ---------------------------------------------------------------
+    var DAY_SHORT = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+    var BROWSER_TZ = (function () { try { return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'; } catch (e) { return 'UTC'; } })();
+    var groupsState = { list: [], editing: null, polling: {}, previewTimer: null };
+
+    function statusPill(status, text) { return el('span', { class: 'st ' + status, text: text || status }); }
+
+    function loadGroups() {
+      return api('/api/groups').then(function (list) {
+        groupsState.list = list;
+        renderGroups();
+        list.forEach(function (g) { if (g.running && g.last_run && !groupsState.polling[g.id]) pollRun(g, g.last_run.id); });
+      }, function (err) {
+        clear($('groups-list')).appendChild(el('div', { class: 'empty', text: err.message }));
+      });
+    }
+
+    function runSummary(run) {
+      var ok = run.results.filter(function (r) { return r.status === 'succeeded'; }).length;
+      return ok + ' of ' + run.results.length + ' reloaded';
+    }
+
+    function renderGroups() {
+      $('group-new').disabled = !state.connected;
+      var wrap = clear($('groups-list'));
+      if (!groupsState.list.length) {
+        wrap.appendChild(el('div', { class: 'empty', text: state.sources.length ? 'No groups yet. Use New group to make one.' : 'Load some sources first, then group them here.' }));
+        return;
+      }
+      var head = el('tr', null, ['Group', 'Sources', 'Schedule', 'Next run', 'Last run', ''].map(function (h) { return el('th', { text: h, scope: 'col' }); }));
+      var body = groupsState.list.map(function (g) {
+        var last = el('td');
+        var run = g.last_run;
+        if (g.running || (run && run.status === 'running')) {
+          var progress = run ? run.results.filter(function (r) { return r.status !== 'running'; }).length : 0;
+          last.appendChild(statusPill('running', 'Running ' + progress + ' of ' + g.members.length + '…'));
+        } else if (run) {
+          last.appendChild(statusPill(run.status, run.status === 'succeeded' ? 'Succeeded' : run.status === 'partial' ? 'Partly failed' : 'Failed'));
+          last.appendChild(el('div', { class: 'muted', text: fmtTime(run.finished_at || run.started_at) + (run.trigger !== 'manual' ? ' · ' + (run.trigger === 'catch-up' ? 'catch-up' : 'scheduled') : '') }));
+          var det = el('details', null, [el('summary', { text: runSummary(run) }), el('ul', null, run.results.map(function (r) {
+            return el('li', { text: r.source + ': ' + (r.status === 'succeeded' ? plural(r.rows, 'row') : r.status + (r.error ? ' (' + r.error + ')' : '')) });
+          }))]);
+          if (run.status !== 'succeeded') det.open = true;
+          last.appendChild(det);
+        } else {
+          last.appendChild(el('span', { class: 'muted', text: 'Never run' }));
+        }
+        var runBtn = el('button', { type: 'button', class: 'btn small primary', text: 'Run now' });
+        runBtn.disabled = !!g.running || !state.connected;
+        runBtn.addEventListener('click', function () { runGroup(g); });
+        var editBtn = el('button', { type: 'button', class: 'btn small', text: 'Edit' });
+        editBtn.addEventListener('click', function () { openEditor(g); });
+        return el('tr', null, [
+          el('td', null, [el('strong', { text: g.name })]),
+          el('td', null, [el('div', { class: 'members' }, g.members.map(function (m) { return el('span', { class: 'tag', text: m }); }))]),
+          el('td', { text: g.schedule_text + (g.schedule && !g.enabled ? ' (paused)' : '') }),
+          el('td', { class: 'nowrap', text: g.next_run_at ? fmtTime(g.next_run_at) : '—' }),
+          last,
+          el('td', null, [el('div', { class: 'actions' }, [runBtn, editBtn])])
+        ]);
+      });
+      wrap.appendChild(el('table', { class: 'groups-table' }, [el('thead', null, [head]), el('tbody', null, body)]));
+    }
+
+    function runGroup(g) {
+      var msg = clear($('groups-msg'));
+      var hasSheets = g.members.some(function (m) { return state.sources.some(function (s) { return s.name === m && s.type === 'gsheet'; }); });
+      var body = hasSheets && googleToken() ? JSON.stringify({ google_token: googleToken() }) : '{}';
+      g.running = true;
+      renderGroups();
+      api('/api/groups/' + g.id + '/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: body })
+        .then(function (r) { pollRun(g, r.run_id); }, function (err) {
+          g.running = false;
+          renderGroups();
+          msg.appendChild(banner('err', g.name + ' did not start: ' + err.message));
+        });
+    }
+
+    function pollRun(g, runId) {
+      groupsState.polling[g.id] = true;
+      var tick = function () {
+        api('/api/group-runs/' + runId).then(function (run) {
+          g.last_run = run;
+          g.running = run.status === 'running';
+          renderGroups();
+          if (g.running) { setTimeout(tick, 1500); return; }
+          delete groupsState.polling[g.id];
+          var failed = run.results.filter(function (r) { return r.status !== 'succeeded'; });
+          var text = g.name + ': ' + runSummary(run) + '.';
+          if (failed.length) text += ' ' + failed.map(function (r) { return r.source + ' (' + (r.error || r.status) + ')'; }).join('; ');
+          var b = banner(run.status === 'succeeded' ? 'ok' : run.status === 'partial' ? 'warn' : 'err', text);
+          var needsGoogle = failed.some(function (r) { return /private|sign in/i.test(r.error || ''); });
+          if (needsGoogle && GOOGLE_CLIENT_ID && gauth.client && !googleToken()) {
+            b.appendChild(el('div', null, [googleButton('Sign in with Google and run again', function () { runGroup(g); }, 'groups-msg')]));
+          }
+          clear($('groups-msg')).appendChild(b);
+          refresh().catch(function () {});
+        }, function () { delete groupsState.polling[g.id]; });
+      };
+      tick();
+    }
+
+    // The editor --------------------------------------------------------------
+    function defaultEditing() {
+      return { id: null, name: '', members: [], kind: 'none', times: ['06:00'], every: 1, start: '08:00', end: '17:00',
+               days: [0, 1, 2, 3, 4, 5, 6], enabled: true, timezone: BROWSER_TZ };
+    }
+
+    function openEditor(g) {
+      var e = defaultEditing();
+      if (g) {
+        e.id = g.id; e.name = g.name; e.members = g.members.slice(); e.enabled = g.enabled;
+        var sc = g.schedule;
+        if (sc) {
+          e.kind = sc.type; e.days = sc.days.slice(); e.timezone = sc.timezone;
+          if (sc.type === 'daily') e.times = sc.times.slice();
+          else { e.every = sc.every; e.start = sc.start; e.end = sc.end; }
+        }
+      } else if (state.selected) {
+        e.members = [state.selected];
+      }
+      if (e.kind === 'hourly' && !g) e.days = [0, 1, 2, 3, 4];
+      groupsState.editing = e;
+      $('ge-title').textContent = g ? 'Edit ' + g.name : 'New group';
+      $('ge-name').value = e.name;
+      $('ge-delete').hidden = !g;
+      $('ge-every').value = String(e.every);
+      $('ge-start').value = e.start;
+      $('ge-end').value = e.end;
+      $('ge-enabled').checked = e.enabled;
+      clear($('ge-msg'));
+      renderEditor();
+      $('group-editor').hidden = false;
+      $('ge-name').focus();
+    }
+
+    function closeEditor() {
+      groupsState.editing = null;
+      $('group-editor').hidden = true;
+    }
+
+    function renderEditor() {
+      var e = groupsState.editing;
+      if (!e) return;
+      var list = clear($('ge-sources'));
+      if (!state.sources.length) list.appendChild(el('div', { class: 'muted', text: 'No sources yet.' }));
+      state.sources.forEach(function (s) {
+        var box = el('input', { type: 'checkbox', value: s.name });
+        box.checked = e.members.indexOf(s.name) >= 0;
+        box.addEventListener('change', function () {
+          if (box.checked) { if (e.members.indexOf(s.name) < 0) e.members.push(s.name); }
+          else e.members = e.members.filter(function (m) { return m !== s.name; });
+        });
+        list.appendChild(el('label', null, [box, el('span', { class: 'n', text: s.name, title: s.name }), el('span', { class: 'tag', text: typeLabel(s.type) })]));
+      });
+      document.querySelectorAll('#group-editor .segmented button').forEach(function (b) {
+        b.setAttribute('aria-pressed', String(b.getAttribute('data-kind') === e.kind));
+      });
+      $('ge-daily').hidden = e.kind !== 'daily';
+      $('ge-hourly').hidden = e.kind !== 'hourly';
+      $('ge-days-wrap').hidden = e.kind === 'none';
+      var times = clear($('ge-times'));
+      e.times.forEach(function (t, i) {
+        var input = el('input', { type: 'time', value: t, 'aria-label': 'Run time ' + (i + 1) });
+        input.addEventListener('change', function () { e.times[i] = input.value; schedulePreview(); });
+        times.appendChild(input);
+        if (e.times.length > 1) {
+          var x = el('button', { type: 'button', class: 'link', text: 'remove', 'aria-label': 'Remove time ' + t });
+          x.addEventListener('click', function () { e.times.splice(i, 1); renderEditor(); });
+          times.appendChild(x);
+        }
+      });
+      var days = clear($('ge-days'));
+      DAY_SHORT.forEach(function (d, i) {
+        var b = el('button', { type: 'button', text: d, 'aria-pressed': String(e.days.indexOf(i) >= 0) });
+        b.addEventListener('click', function () {
+          e.days = e.days.indexOf(i) >= 0 ? e.days.filter(function (x) { return x !== i; }) : e.days.concat([i]).sort();
+          renderEditor();
+        });
+        days.appendChild(b);
+      });
+      schedulePreview();
+    }
+
+    function editorSchedule() {
+      var e = groupsState.editing;
+      if (!e || e.kind === 'none') return null;
+      if (e.kind === 'daily') return { type: 'daily', times: e.times.filter(Boolean), days: e.days, timezone: e.timezone };
+      return { type: 'hourly', every: Number($('ge-every').value), start: $('ge-start').value, end: $('ge-end').value, days: e.days, timezone: e.timezone };
+    }
+
+    function schedulePreview() {
+      clearTimeout(groupsState.previewTimer);
+      var box = $('ge-preview');
+      var sc = editorSchedule();
+      if (!sc) { clear(box); return; }
+      var seq = groupsState.previewSeq = (groupsState.previewSeq || 0) + 1;
+      box.className = 'preview';
+      clear(box).appendChild(document.createTextNode('Working out the next runs…'));
+      groupsState.previewTimer = setTimeout(function () {
+        api('/api/schedule/preview', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ schedule: sc }) })
+          .then(function (p) {
+            if (seq !== groupsState.previewSeq) return;  // a newer change is on its way
+            box.className = 'preview';
+            clear(box).appendChild(el('strong', { text: p.text }));
+            box.appendChild(document.createTextNode('Next: ' + p.next_runs.map(fmtTime).join(' · ') + ' (times in ' + sc.timezone + ')'));
+          }, function (err) {
+            if (seq !== groupsState.previewSeq) return;
+            box.className = 'preview bad';
+            clear(box).appendChild(document.createTextNode(err.message));
+          });
+      }, 250);
+    }
+
+    function saveGroup(ev) {
+      ev.preventDefault();
+      var e = groupsState.editing;
+      var msg = clear($('ge-msg'));
+      var body = { name: $('ge-name').value.trim(), members: e.members, schedule: editorSchedule(), enabled: $('ge-enabled').checked };
+      if (!body.name) { msg.appendChild(banner('err', 'Give the group a name.')); return; }
+      if (!body.members.length) { msg.appendChild(banner('err', 'Tick at least one source.')); return; }
+      $('ge-save').disabled = true;
+      api(e.id ? '/api/groups/' + e.id : '/api/groups', {
+        method: e.id ? 'PUT' : 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+      }).then(function (g) {
+        closeEditor();
+        clear($('groups-msg')).appendChild(banner('ok', 'Saved ' + g.name + '. ' + g.schedule_text + (g.next_run_at ? '; next run ' + fmtTime(g.next_run_at) + '.' : '.')));
+        return loadGroups();
+      }, function (err) {
+        msg.appendChild(banner('err', err.message));
+      }).then(function () { $('ge-save').disabled = false; });
+    }
+
+    function deleteGroup() {
+      var e = groupsState.editing;
+      if (!e || !e.id || !confirm('Delete the group "' + $('ge-name').value + '"? Its sources and their data are not touched.')) return;
+      api('/api/groups/' + e.id, { method: 'DELETE' }).then(function () {
+        closeEditor();
+        return loadGroups();
+      }, function (err) { clear($('ge-msg')).appendChild(banner('err', err.message)); });
+    }
+
+    $('group-new').addEventListener('click', function () { openEditor(null); });
+    $('group-editor').addEventListener('submit', saveGroup);
+    $('ge-cancel').addEventListener('click', closeEditor);
+    $('ge-delete').addEventListener('click', deleteGroup);
+    $('ge-all').addEventListener('click', function () { groupsState.editing.members = state.sources.map(function (s) { return s.name; }); renderEditor(); });
+    $('ge-none').addEventListener('click', function () { groupsState.editing.members = []; renderEditor(); });
+    $('ge-add-time').addEventListener('click', function () {
+      var e = groupsState.editing;
+      var last = e.times[e.times.length - 1] || '06:00';
+      var h = (Number(last.slice(0, 2)) + 6) % 24;
+      e.times.push((h < 10 ? '0' : '') + h + ':' + last.slice(3, 5));
+      renderEditor();
+    });
+    document.querySelectorAll('#group-editor .segmented button').forEach(function (b) {
+      b.addEventListener('click', function () {
+        var e = groupsState.editing;
+        var kind = b.getAttribute('data-kind');
+        if (kind === 'hourly' && e.kind !== 'hourly' && e.days.length === 7) e.days = [0, 1, 2, 3, 4];
+        e.kind = kind;
+        renderEditor();
+      });
+    });
+    document.querySelectorAll('#ge-days-wrap [data-days]').forEach(function (b) {
+      b.addEventListener('click', function () {
+        groupsState.editing.days = b.getAttribute('data-days').split(',').map(Number);
+        renderEditor();
+      });
+    });
+    ['ge-every', 'ge-start', 'ge-end'].forEach(function (id) { $(id).addEventListener('change', schedulePreview); });
+    setInterval(function () {  // scheduled runs happen on the server; keep the list current
+      if (state.connected && !document.hidden && !groupsState.editing) loadGroups();
+    }, 60000);
 
     // -- reloading a source ----------------------------------------------------
     var RELOAD_ICON = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 4v5h-5"/></svg>';

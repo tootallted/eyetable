@@ -10,6 +10,7 @@ each client IP is rate limited, and an IP that keeps sending wrong tokens is
 locked out for a while.
 """
 
+import datetime as dt
 import secrets
 from collections.abc import Callable
 from pathlib import Path
@@ -28,12 +29,26 @@ from eyetable.engine import SINGLE_TABLE_TYPES, Engine
 from eyetable.gsheets import SheetError, fetch_workbook, fetch_workbook_signed_in
 from eyetable.identifiers import SOURCE_NAME, table_name
 from eyetable.query import MAX_LIMIT, QueryError, QueryRunner
+from eyetable.groups import GroupRunner
 from eyetable.ratelimit import SlidingWindow, client_ip
+from eyetable.schedule import ScheduleError, describe, next_runs, normalize
+from eyetable.store import GroupNotFound
 from eyetable.store import SourceNotFound
 
 DEFAULT_CORS_ORIGINS = ["https://tootallted.github.io"]
 DEFAULT_MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 PAGES_DIR = Path(__file__).resolve().parents[2] / "docs"  # the GitHub Pages site, in a source checkout
+
+
+class GroupIn(BaseModel):
+    name: str = Field(max_length=80)
+    members: list[str] = Field(max_length=200)
+    schedule: dict[str, Any] | None = None
+    enabled: bool = True
+
+
+class ScheduleIn(BaseModel):
+    schedule: dict[str, Any]
 
 
 class ReloadIn(BaseModel):
@@ -70,6 +85,7 @@ def create_app(
     uploads_per_hour: int = 120,
     auth_failures_per_15_minutes: int = 10,
     query_runner: QueryRunner | None = None,
+    group_runner: GroupRunner | None = None,
     sheet_fetch: Callable[[str, str | None], Any] | None = None,
 ) -> FastAPI:
     if not token:
@@ -106,7 +122,7 @@ def create_app(
             wait = requests_limit.hit(ip)
             if wait:
                 return too_many(wait, "requests")
-            loads = request.url.path.endswith(("/uploads", "/reload")) or request.url.path == "/api/gsheets"
+            loads = request.url.path.endswith(("/uploads", "/reload", "/run")) or request.url.path == "/api/gsheets"
             if request.method == "POST" and loads:
                 wait = uploads_limit.hit(ip)
                 if wait:
@@ -121,7 +137,7 @@ def create_app(
     app.add_middleware(
         CORSMiddleware,
         allow_origins=cors_origins if cors_origins is not None else DEFAULT_CORS_ORIGINS,
-        allow_methods=["GET", "POST"],
+        allow_methods=["GET", "POST", "PUT", "DELETE"],
         allow_headers=["Authorization", "Content-Type"],
         allow_private_network=True,  # Chrome asks before a public https page may call http://localhost
     )
@@ -241,6 +257,78 @@ def create_app(
             raise sheet_error(exc) from None
         return jsonable_encoder(load)
 
+    groups = group_runner or GroupRunner(engine, sheet_fetch=lambda url, google_token=None: sheet_fetch(url, google_token))
+
+    def get_group(group_id: int):
+        try:
+            return store.get_group(group_id)
+        except GroupNotFound:
+            raise HTTPException(404, f"no group {group_id}") from None
+
+    @app.get("/api/groups", dependencies=auth)
+    def list_groups() -> list[dict[str, Any]]:
+        return jsonable_encoder([groups.summary(g) for g in store.list_groups()])
+
+    @app.post("/api/groups", dependencies=auth)
+    def create_group(body: GroupIn) -> dict[str, Any]:
+        try:
+            group = groups.create(body.name, body.members, body.schedule, body.enabled)
+        except ValueError as exc:  # includes ScheduleError
+            raise HTTPException(400, str(exc).strip("'\"")) from None
+        return jsonable_encoder(groups.summary(group))
+
+    @app.put("/api/groups/{group_id}", dependencies=auth)
+    def update_group(group_id: int, body: GroupIn) -> dict[str, Any]:
+        get_group(group_id)
+        try:
+            group = groups.update(group_id, body.name, body.members, body.schedule, body.enabled)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc).strip("'\"")) from None
+        return jsonable_encoder(groups.summary(group))
+
+    @app.delete("/api/groups/{group_id}", dependencies=auth)
+    def delete_group(group_id: int) -> dict[str, Any]:
+        get_group(group_id)
+        if groups.is_running(group_id):
+            raise HTTPException(409, "the group is running; delete it when the run finishes")
+        store.delete_group(group_id)
+        return {"deleted": group_id}
+
+    @app.post("/api/groups/{group_id}/run", dependencies=auth, status_code=202)
+    def run_group(group_id: int, body: ReloadIn | None = None) -> dict[str, Any]:
+        """Start reloading every source in the group; poll /api/group-runs/{run_id} for progress."""
+        get_group(group_id)
+        try:
+            run_id = groups.run(group_id, "manual", google_token=body.google_token if body else None)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from None
+        return {"run_id": run_id}
+
+    @app.get("/api/group-runs/{run_id}", dependencies=auth)
+    def group_run(run_id: int) -> dict[str, Any]:
+        try:
+            return jsonable_encoder(store.get_group_run(run_id))
+        except LookupError:
+            raise HTTPException(404, f"no group run {run_id}") from None
+
+    @app.get("/api/groups/{group_id}/runs", dependencies=auth)
+    def group_runs(group_id: int, limit: int = 10) -> list[dict[str, Any]]:
+        get_group(group_id)
+        return jsonable_encoder(store.list_group_runs(group_id, max(1, min(limit, 100))))
+
+    @app.post("/api/schedule/preview", dependencies=auth)
+    def schedule_preview(body: ScheduleIn) -> dict[str, Any]:
+        """How a schedule reads, and its next few run times (the editor shows these as you type)."""
+        try:
+            schedule = normalize(body.schedule)
+        except ScheduleError as exc:
+            raise HTTPException(400, str(exc)) from None
+        return jsonable_encoder({
+            "schedule": schedule,
+            "text": describe(schedule),
+            "next_runs": next_runs(schedule, dt.datetime.now(dt.timezone.utc), 3),
+        })
+
     @app.post("/api/sources/{name}/reload", dependencies=auth)
     def reload(name: str, body: ReloadIn | None = None) -> dict[str, Any]:
         """Load a source's data again: replay stored files, re-fetch a sheet tab, or re-pull."""
@@ -313,4 +401,5 @@ def create_app(
         def source_management() -> FileResponse:
             return FileResponse(page)
 
+    app.state.group_runner = groups
     return app

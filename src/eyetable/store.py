@@ -147,6 +147,33 @@ class Upload:
 
 
 @dataclass
+class Group:
+    id: int
+    name: str
+    members: list[str]
+    schedule: dict[str, Any] | None
+    enabled: bool
+    next_run_at: dt.datetime | None
+    created_at: dt.datetime
+    updated_at: dt.datetime
+
+
+@dataclass
+class GroupRun:
+    id: int
+    group_id: int
+    trigger: str  # "manual" | "schedule" | "catch-up"
+    status: str  # "running" | "succeeded" | "partial" | "failed"
+    started_at: dt.datetime
+    finished_at: dt.datetime | None
+    results: list[dict[str, Any]]
+
+
+class GroupNotFound(LookupError):
+    pass
+
+
+@dataclass
 class Run:
     id: int
     source: str
@@ -198,6 +225,29 @@ class CoreStore:
             sa.Column("started_at", UTCDateTime(), nullable=False),
             sa.Column("finished_at", UTCDateTime()),
             sa.Column("error", sa.Text),
+        )
+        self.groups = sa.Table(
+            "groups",
+            self.metadata,
+            sa.Column("id", sa.Integer, primary_key=True, autoincrement=True),
+            sa.Column("name", sa.String(80), nullable=False, unique=True),
+            sa.Column("members", JSONType, nullable=False),
+            sa.Column("schedule", JSONType),
+            sa.Column("enabled", sa.Boolean, nullable=False, default=True),
+            sa.Column("next_run_at", UTCDateTime()),
+            sa.Column("created_at", UTCDateTime(), nullable=False),
+            sa.Column("updated_at", UTCDateTime(), nullable=False),
+        )
+        self.group_runs = sa.Table(
+            "group_runs",
+            self.metadata,
+            sa.Column("id", sa.Integer, primary_key=True, autoincrement=True),
+            sa.Column("group_id", sa.Integer, nullable=False, index=True),
+            sa.Column("trigger", sa.String(16), nullable=False),
+            sa.Column("status", sa.String(16), nullable=False),
+            sa.Column("started_at", UTCDateTime(), nullable=False),
+            sa.Column("finished_at", UTCDateTime()),
+            sa.Column("results", JSONType, nullable=False),
         )
         self.uploads = sa.Table(
             "uploads",
@@ -319,6 +369,106 @@ class CoreStore:
             query = query.where(self.runs.c.source == source)
         with self.db.connect() as conn:
             return [Run(**r._mapping) for r in conn.execute(query).all()]
+
+    # -- groups ------------------------------------------------------------
+
+    def create_group(self, name: str, members: list[str], schedule: dict | None, enabled: bool,
+                     next_run_at: dt.datetime | None) -> Group:
+        now = _now()
+        with self.db.begin() as conn:
+            if conn.execute(sa.select(self.groups.c.id).where(self.groups.c.name == name)).first():
+                raise ValueError(f"a group named {name!r} already exists")
+            result = conn.execute(sa.insert(self.groups).values(
+                name=name, members=members, schedule=schedule, enabled=enabled,
+                next_run_at=next_run_at, created_at=now, updated_at=now,
+            ))
+            group_id = result.inserted_primary_key[0]
+        return self.get_group(group_id)
+
+    def update_group(self, group_id: int, **values: Any) -> Group:
+        self.get_group(group_id)
+        if "name" in values:
+            with self.db.connect() as conn:
+                clash = conn.execute(sa.select(self.groups.c.id).where(
+                    self.groups.c.name == values["name"], self.groups.c.id != group_id)).first()
+            if clash:
+                raise ValueError(f"a group named {values['name']!r} already exists")
+        with self.db.begin() as conn:
+            conn.execute(sa.update(self.groups).where(self.groups.c.id == group_id).values(**values, updated_at=_now()))
+        return self.get_group(group_id)
+
+    def delete_group(self, group_id: int) -> None:
+        self.get_group(group_id)
+        with self.db.begin() as conn:
+            conn.execute(sa.delete(self.group_runs).where(self.group_runs.c.group_id == group_id))
+            conn.execute(sa.delete(self.groups).where(self.groups.c.id == group_id))
+
+    def get_group(self, group_id: int) -> Group:
+        with self.db.connect() as conn:
+            row = conn.execute(sa.select(self.groups).where(self.groups.c.id == group_id)).first()
+        if row is None:
+            raise GroupNotFound(f"no group with id {group_id}")
+        return Group(**row._mapping)
+
+    def list_groups(self) -> list[Group]:
+        with self.db.connect() as conn:
+            rows = conn.execute(sa.select(self.groups).order_by(self.groups.c.name)).all()
+        return [Group(**r._mapping) for r in rows]
+
+    def due_groups(self, now: dt.datetime) -> list[Group]:
+        query = sa.select(self.groups).where(
+            self.groups.c.enabled.is_(True),
+            self.groups.c.next_run_at.is_not(None),
+            self.groups.c.next_run_at <= now,
+        ).order_by(self.groups.c.next_run_at)
+        with self.db.connect() as conn:
+            return [Group(**r._mapping) for r in conn.execute(query).all()]
+
+    def claim_group(self, group_id: int, expected: dt.datetime, next_run_at: dt.datetime | None) -> bool:
+        """Move a due group to its next slot; False if someone else already did (no double runs)."""
+        with self.db.begin() as conn:
+            result = conn.execute(
+                sa.update(self.groups)
+                .where(self.groups.c.id == group_id, self.groups.c.next_run_at == expected)
+                .values(next_run_at=next_run_at)
+            )
+            return result.rowcount == 1
+
+    def start_group_run(self, group_id: int, trigger: str) -> int:
+        with self.db.begin() as conn:
+            result = conn.execute(sa.insert(self.group_runs).values(
+                group_id=group_id, trigger=trigger, status="running", started_at=_now(), results=[],
+            ))
+            return result.inserted_primary_key[0]
+
+    def update_group_run(self, run_id: int, results: list[dict[str, Any]], status: str | None = None) -> None:
+        values: dict[str, Any] = {"results": results}
+        if status is not None:
+            values.update(status=status, finished_at=_now())
+        with self.db.begin() as conn:
+            conn.execute(sa.update(self.group_runs).where(self.group_runs.c.id == run_id).values(**values))
+
+    def get_group_run(self, run_id: int) -> GroupRun:
+        with self.db.connect() as conn:
+            row = conn.execute(sa.select(self.group_runs).where(self.group_runs.c.id == run_id)).first()
+        if row is None:
+            raise LookupError(f"no group run {run_id}")
+        return GroupRun(**row._mapping)
+
+    def list_group_runs(self, group_id: int, limit: int = 20) -> list[GroupRun]:
+        query = (sa.select(self.group_runs).where(self.group_runs.c.group_id == group_id)
+                 .order_by(self.group_runs.c.id.desc()).limit(limit))
+        with self.db.connect() as conn:
+            return [GroupRun(**r._mapping) for r in conn.execute(query).all()]
+
+    def fail_stale_group_runs(self) -> int:
+        """Runs left "running" by a process that stopped mid-run (call at startup)."""
+        with self.db.begin() as conn:
+            result = conn.execute(
+                sa.update(self.group_runs).where(self.group_runs.c.status == "running")
+                .values(status="failed", finished_at=_now())
+            )
+            return result.rowcount
 
     # -- uploads -----------------------------------------------------------
 

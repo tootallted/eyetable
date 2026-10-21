@@ -18,6 +18,7 @@ dependencies = [
     "uvicorn>=0.30",
     "python-multipart>=0.0.9",
     "openpyxl>=3.1",
+    "tzdata>=2024.1",  # timezone database for schedules (Windows has none built in)
 ]
 
 [project.optional-dependencies]
