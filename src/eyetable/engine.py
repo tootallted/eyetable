@@ -3,6 +3,7 @@
 import csv
 import datetime as dt
 import io
+import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
@@ -10,7 +11,7 @@ from typing import Any
 from eyetable import gsheets
 from eyetable.connectors import Connector, build_connector
 from eyetable.connectors.file import DATASET_KEY, FileConnector
-from eyetable.credentials import resolve_env
+from eyetable.credentials import decrypt_secrets, resolve_env
 from eyetable.identifiers import SOURCE_NAME, table_name
 from eyetable.models import ColumnInfo, DatasetInfo
 from eyetable.store import CoreStore, SourceNotFound
@@ -18,7 +19,7 @@ from eyetable.types import infer_columns
 
 # Source types whose data is one table, <source>__data, loaded by pushing data in
 # (a dropped file, a Google Sheet tab) rather than by a connector pulling it.
-SINGLE_TABLE_TYPES = ("file", "gsheet")
+SINGLE_TABLE_TYPES = ("file", "gsheet", "curl")
 
 ConnectorFactory = Callable[[str, dict[str, Any]], Connector]
 
@@ -79,8 +80,13 @@ class Engine:
         self._factory = connector_factory
         self._environ = environ
 
+    @property
+    def secret_key(self) -> str | None:
+        """EYETABLE_SECRET_KEY: encrypts secrets kept in source configs."""
+        return (self._environ if self._environ is not None else os.environ).get("EYETABLE_SECRET_KEY")
+
     def _open(self, type_: str, config: dict[str, Any]) -> Connector:
-        return self._factory(type_, resolve_env(config, self._environ))
+        return self._factory(type_, decrypt_secrets(resolve_env(config, self._environ), self.secret_key))
 
     def connector(self, source: str) -> Connector:
         src = self.store.get_source(source)
@@ -232,6 +238,39 @@ class Engine:
                     "url": book.url, "upload_id": upload_id},
         )])
         return RunResult(run_id, tab.title, table, "succeeded", rows, upload_id=upload_id)
+
+    def load_curl(
+        self,
+        text: str,
+        name: str,
+        mode: str = "replace",
+        all_pages: bool = True,
+        client: Any = None,
+    ) -> list[RunResult]:
+        """Make (or update) source `name` from a curl command and load it.
+
+        The request is sent once to learn its paging (unless `all_pages` is off),
+        the source is saved with its secrets encrypted, and every page is loaded.
+        A source loaded before keeps its name and is replaced or appended to.
+        """
+        from eyetable import curl
+
+        if mode not in ("replace", "append"):
+            raise ValueError(f"mode must be replace or append, got {mode!r}")
+        if not SOURCE_NAME.match(name or ""):
+            raise ValueError("source names are lowercase letters, digits and _, starting with a letter")
+        existing = self.store.get_source(name) if self.store.source_exists(name) else None
+        if existing and existing.type != "curl":
+            raise ValueError(f"{name!r} is already a {existing.type} source; pick another name")
+        req, config, secrets = curl.prepare(text, self.secret_key)
+        response, payload, _ = curl.probe(req, config, secrets, client)
+        if all_pages:
+            paging, _ = curl.infer_paging(req.url, response, payload)
+            if paging:
+                config["pagination"] = {curl.REQUEST_NAME: paging}
+        self.store.save_source(name, "curl", config)
+        self.discover(name)
+        return self.ingest(name, mode=mode if existing else "replace")
 
     def reload_source(
         self,

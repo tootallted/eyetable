@@ -12,6 +12,8 @@ locked out for a while.
 
 import datetime as dt
 import secrets
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable
 from pathlib import Path
 from typing import Annotated, Any
@@ -29,6 +31,8 @@ from eyetable.engine import SINGLE_TABLE_TYPES, Engine
 from eyetable.gsheets import SheetError, fetch_workbook, fetch_workbook_signed_in
 from eyetable.identifiers import SOURCE_NAME, table_name
 from eyetable.query import MAX_LIMIT, QueryError, QueryRunner
+from eyetable.curl import parse_curl
+from eyetable.curl import plan as curl_plan
 from eyetable.google_auth import GoogleAuthError, GoogleConnection
 from eyetable.groups import GroupRunner
 from eyetable.ratelimit import SlidingWindow, client_ip
@@ -50,6 +54,16 @@ class GroupIn(BaseModel):
 
 class ScheduleIn(BaseModel):
     schedule: dict[str, Any]
+
+
+class CurlIn(BaseModel):
+    curl: str = Field(min_length=1, max_length=100_000)
+
+
+class CurlLoadIn(CurlIn):
+    name: str = Field(max_length=63)
+    mode: str = "replace"
+    all_pages: bool = True
 
 
 class GoogleCodeIn(BaseModel):
@@ -92,6 +106,7 @@ def create_app(
     query_runner: QueryRunner | None = None,
     group_runner: GroupRunner | None = None,
     google: GoogleConnection | None = None,
+    curl_client: Any = None,
     sheet_fetch: Callable[[str, str | None], Any] | None = None,
 ) -> FastAPI:
     if not token:
@@ -137,7 +152,7 @@ def create_app(
             wait = requests_limit.hit(ip)
             if wait:
                 return too_many(wait, "requests")
-            loads = request.url.path.endswith(("/uploads", "/reload", "/run")) or request.url.path == "/api/gsheets"
+            loads = request.url.path.endswith(("/uploads", "/reload", "/run")) or request.url.path in ("/api/gsheets", "/api/curl")
             if request.method == "POST" and loads:
                 wait = uploads_limit.hit(ip)
                 if wait:
@@ -330,6 +345,73 @@ def create_app(
     def group_runs(group_id: int, limit: int = 10) -> list[dict[str, Any]]:
         get_group(group_id)
         return jsonable_encoder(store.list_group_runs(group_id, max(1, min(limit, 100))))
+
+    # -- background jobs (loads that can outlast a web request) ------------------
+    jobs: dict[str, dict[str, Any]] = {}
+    jobs_lock = threading.Lock()
+    job_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="eyetable-job")
+
+    def start_job(kind: str, work: Callable[[], Any]) -> str:
+        job_id = secrets.token_hex(8)
+        with jobs_lock:
+            for old in [k for k, j in jobs.items() if j["status"] != "running"][:-50]:  # keep the latest 50
+                del jobs[old]
+            jobs[job_id] = {"id": job_id, "kind": kind, "status": "running", "started_at": dt.datetime.now(dt.timezone.utc),
+                            "finished_at": None, "result": None, "error": None}
+
+        def run() -> None:
+            try:
+                result, status, error = work(), "succeeded", None
+            except Exception as exc:
+                result, status, error = None, "failed", str(exc).strip("'\"") or type(exc).__name__
+            with jobs_lock:
+                jobs[job_id].update(status=status, result=result, error=error, finished_at=dt.datetime.now(dt.timezone.utc))
+
+        job_pool.submit(run)
+        return job_id
+
+    @app.get("/api/jobs/{job_id}", dependencies=auth)
+    def job(job_id: str) -> dict[str, Any]:
+        with jobs_lock:
+            found = jobs.get(job_id)
+            if found is None:
+                raise HTTPException(404, "no such job (eyetable may have restarted)")
+            return jsonable_encoder(dict(found))
+
+    # -- curl commands -----------------------------------------------------------
+    @app.post("/api/curl/inspect", dependencies=auth)
+    def inspect_curl(body: CurlIn) -> dict[str, Any]:
+        """Check a curl command: send it once, show its first page and how it pages. Saves nothing."""
+        try:
+            result, _ = curl_plan(body.curl, engine.secret_key, client=curl_client)
+        except (ValueError, KeyError) as exc:
+            raise HTTPException(400, str(exc).strip("'\"")) from None
+        out = jsonable_encoder(result)
+        out["sample"] = [{k: _json_safe(v) for k, v in row.items()} for row in out["sample"]]
+        return out
+
+    @app.post("/api/curl", dependencies=auth, status_code=202)
+    def load_curl(body: CurlLoadIn) -> dict[str, Any]:
+        """Make a source from a curl command and load every page, in the background."""
+        if body.mode not in ("replace", "append"):
+            raise HTTPException(400, "mode must be replace or append")
+        if not SOURCE_NAME.match(body.name):
+            raise HTTPException(400, "source names are lowercase letters, digits and _, starting with a letter")
+        if store.source_exists(body.name) and store.get_source(body.name).type != "curl":
+            raise HTTPException(409, f"{body.name!r} is already a {store.get_source(body.name).type} source; pick another name")
+        try:
+            parse_curl(body.curl)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from None
+
+        def work() -> dict[str, Any]:
+            results = engine.load_curl(body.curl, body.name, body.mode, body.all_pages, client=curl_client)
+            failed = [r for r in results if r.status != "succeeded"]
+            if failed:
+                raise RuntimeError("; ".join(r.error or r.status for r in failed))
+            return {"source": source_summary(store.get_source(body.name)), "rows": sum(r.rows for r in results)}
+
+        return {"job_id": start_job("curl", work)}
 
     @app.get("/api/google", dependencies=auth)
     def google_status() -> dict[str, Any]:

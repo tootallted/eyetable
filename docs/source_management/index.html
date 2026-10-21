@@ -184,6 +184,13 @@
   .editor .actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
   .editor .actions .spacer { margin-left: auto; }
   .btn.danger { color: var(--err); }
+  #curl-text { width: 100%; min-height: 96px; resize: vertical; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--border);
+    background: var(--surface); color: var(--text); font: 12.5px/1.5 var(--mono); }
+  .curl-line { font-family: var(--mono); font-size: 12.5px; overflow-wrap: anywhere; }
+  .curl-line .m { display: inline-block; padding: 0 6px; margin-right: 6px; border-radius: 4px; background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+  .kv { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 2px 12px; font-size: 13px; }
+  .kv dt { color: var(--muted); }
+  .kv dd { margin: 0; font-family: var(--mono); font-size: 12.5px; overflow-wrap: anywhere; }
   .file-chip { display: flex; gap: 12px; align-items: center; padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px; }
   .file-chip .meta { min-width: 0; margin-right: auto; }
   .file-chip .name { font-weight: 600; overflow-wrap: anywhere; }
@@ -409,6 +416,41 @@
             <button class="btn primary" id="gs-load" type="button" disabled>Load tabs</button>
           </div>
           <div id="gs-result" role="status"></div>
+        </div>
+
+        <div class="or"><span>or an API request</span></div>
+        <div class="gs">
+          <label class="field" for="curl-text">curl command</label>
+          <textarea id="curl-text" spellcheck="false" autocomplete="off"
+            placeholder="curl 'https://api.example.com/v1/orders?page=1&amp;per_page=100' -H 'Authorization: Bearer …'"></textarea>
+          <div><button class="btn" id="curl-check" type="button" disabled>Check request</button></div>
+          <p class="hint">Paste a curl command from your browser's dev tools (Copy as cURL), API docs or Postman.
+            To load <strong>every page</strong>, include where to start and the page size, e.g.
+            <code>page=1&amp;per_page=100</code> or <code>offset=0&amp;limit=100</code>. Tokens, keys and passwords in the
+            command are stored encrypted.</p>
+          <div id="curl-plan" hidden style="display:grid; gap:12px">
+            <div class="curl-line" id="curl-request"></div>
+            <dl class="kv" id="curl-details"></dl>
+            <label class="check" id="curl-pages-row"><input type="checkbox" id="curl-all-pages" checked> <span id="curl-paging"></span></label>
+            <div id="curl-first"></div>
+            <div class="table-wrap" id="curl-sample"></div>
+            <label class="field">Source name
+              <input type="text" id="curl-name" autocomplete="off" spellcheck="false">
+              <span class="note" id="curl-name-note"></span>
+            </label>
+            <div class="modes" id="curl-modes" role="radiogroup" aria-label="What to do with the data loaded before" hidden>
+              <label class="mode">
+                <span class="t"><input type="radio" name="curl-mode" value="replace" checked> Replace contents</span>
+                <span class="d">The table is rebuilt from this request. ET_id starts again at 1.</span>
+              </label>
+              <label class="mode">
+                <span class="t"><input type="radio" name="curl-mode" value="append"> Append rows</span>
+                <span class="d">Rows are added after what is there. ET_id continues.</span>
+              </label>
+            </div>
+            <button class="btn primary" id="curl-load" type="button" disabled>Load</button>
+          </div>
+          <div id="curl-result" role="status"></div>
         </div>
       </div>
     </section>
@@ -706,6 +748,7 @@
         renderDestination();
         updateQueryControls();
         renderSheetControls();
+        renderCurlControls();
         loadSchema();
         loadGroups();
         loadGoogleConnection();
@@ -718,6 +761,7 @@
         renderDestination();
         updateQueryControls();
         renderSheetControls();
+        renderCurlControls();
         throw err;
       });
     }
@@ -864,7 +908,7 @@
       clear($('local-preview'));
     }
 
-    function typeLabel(type) { return type === 'gsheet' ? 'google sheet' : type; }
+    function typeLabel(type) { return type === 'gsheet' ? 'google sheet' : type === 'curl' ? 'api (curl)' : type; }
 
     function fileSources() { return state.sources.filter(function (s) { return s.type === 'file'; }); }
 
@@ -1660,6 +1704,7 @@
 
     function reloadPrompt(s) {
       if (s.type === 'file') return null;  // replays the stored files: the table comes back as it was
+      if (s.type === 'curl') return 'Reload ' + s.name + '? The API is called again (every page) and the table is replaced.';
       if (s.type === 'gsheet') return 'Reload ' + s.name + ' from Google Sheets? Its table is replaced with the tab’s current contents.';
       return 'Reload ' + s.name + '? Every table it feeds is pulled again from the source and replaced.';
     }
@@ -1700,6 +1745,120 @@
         return refresh().catch(function () {});
       });
     }
+
+
+    // -- curl commands ------------------------------------------------------------
+    var curlState = { plan: null, text: '', busy: false };
+
+    function curlName() { return $('curl-name').value.trim(); }
+
+    function renderCurlControls() {
+      var hasText = !!$('curl-text').value.trim();
+      $('curl-check').disabled = curlState.busy || !state.connected || !hasText;
+      if (!curlState.plan) { $('curl-load').disabled = true; return; }
+      var name = curlName(), note = $('curl-name-note');
+      var existing = state.sources.filter(function (s) { return s.name === name; })[0];
+      var valid = SOURCE_NAME.test(name) && !(existing && existing.type !== 'curl');
+      note.className = 'note' + (name && !valid ? ' bad' : '');
+      note.textContent = existing && existing.type !== 'curl' ? name + ' is already a ' + typeLabel(existing.type) + ' source; pick another name.'
+        : existing ? 'Loaded before (' + plural(existing.rows || 0, 'row') + '): choose replace or append below.'
+        : name && !SOURCE_NAME.test(name) ? 'Use lowercase letters, digits and _, starting with a letter.'
+        : 'Creates table eyetable_raw.' + (name || '…') + '__data, queryable as ' + (name || '…') + '.';
+      $('curl-modes').hidden = !(existing && existing.type === 'curl');
+      $('curl-load').disabled = curlState.busy || !state.connected || !valid;
+      if (!curlState.busy) $('curl-load').textContent = $('curl-all-pages').checked && curlState.plan.pagination ? 'Load every page' : 'Load';
+    }
+
+    function checkCurl() {
+      var text = $('curl-text').value.trim();
+      var out = clear($('curl-result'));
+      if (!text || curlState.busy) return;
+      curlState.busy = true;
+      curlState.plan = null;
+      $('curl-plan').hidden = true;
+      $('curl-check').textContent = 'Checking…';
+      renderCurlControls();
+      api('/api/curl/inspect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ curl: text }) })
+        .then(function (plan) {
+          curlState.plan = plan;
+          curlState.text = text;
+          renderCurlPlan();
+        }, function (err) { out.appendChild(banner('err', err.message)); })
+        .then(function () { curlState.busy = false; $('curl-check').textContent = 'Check request'; renderCurlControls(); });
+    }
+
+    function renderCurlPlan() {
+      var p = curlState.plan;
+      $('curl-plan').hidden = false;
+      var line = clear($('curl-request'));
+      line.appendChild(el('span', { class: 'm', text: p.method }));
+      line.appendChild(document.createTextNode(p.url));
+      var dl = clear($('curl-details'));
+      var row = function (k, v) { dl.appendChild(el('dt', { text: k })); dl.appendChild(el('dd', { text: v })); };
+      p.headers.forEach(function (h) { row(h.name, h.value); });
+      if (p.secrets) row('Secrets', p.secrets + ' value' + (p.secrets === 1 ? '' : 's') + ' (shown as ••••••) will be stored encrypted');
+      $('curl-all-pages').checked = !!p.pagination;
+      $('curl-all-pages').disabled = !p.pagination;
+      $('curl-paging').textContent = p.paging_text;
+      var first = clear($('curl-first'));
+      first.appendChild(el('div', { class: 'muted', text: 'First response: ' + plural(p.rows, 'row') + ' × ' + plural(p.columns.length, 'column') + (p.sample.length ? '; the first ' + p.sample.length + ':' : '.') }));
+      p.warnings.forEach(function (w) { first.appendChild(banner('warn', w)); });
+      var cols = p.columns.map(function (c) { return c.name; });
+      clear($('curl-sample')).appendChild(dataTable(cols, p.sample.map(function (r) { return cols.map(function (c) { return r[c]; }); }), { empty: 'The response had no rows.' }));
+      if (!curlName() || curlState.lastSuggested === curlName()) $('curl-name').value = p.suggested_name;
+      curlState.lastSuggested = p.suggested_name;
+      renderCurlControls();
+    }
+
+    function loadCurl() {
+      var p = curlState.plan;
+      if (!p || curlState.busy) return;
+      var name = curlName();
+      var existing = state.sources.filter(function (s) { return s.name === name; })[0];
+      var checked = document.querySelector('input[name=curl-mode]:checked');
+      var mode = existing && checked ? checked.value : 'replace';
+      if (existing && mode === 'replace' && !confirm('Replace the ' + plural(existing.rows || 0, 'row') + ' in ' + name + '?')) return;
+      curlState.busy = true;
+      $('curl-load').textContent = 'Loading…';
+      renderCurlControls();
+      var out = clear($('curl-result'));
+      api('/api/curl', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ curl: curlState.text, name: name, mode: mode, all_pages: $('curl-all-pages').checked }) })
+        .then(function (r) { return pollJob(r.job_id, function (job) {
+          $('curl-load').textContent = 'Loading… (' + Math.round((Date.now() - Date.parse(job.started_at)) / 1000) + ' s)';
+        }); })
+        .then(function (job) {
+          if (job.status !== 'succeeded') throw new Error(job.error || 'the load failed');
+          out.appendChild(banner('ok', plural(job.result.rows, 'row') + ' loaded into ' + name + ' (eyetable_raw.' + job.result.source.table + ').'));
+          curlState.plan = null;
+          $('curl-plan').hidden = true;
+          state.selected = name;
+          return refresh();
+        })
+        .catch(function (err) { out.appendChild(banner('err', 'Not loaded: ' + err.message)); })
+        .then(function () { curlState.busy = false; renderCurlControls(); });
+    }
+
+    // Long loads run in the background on the server; ask how they're doing.
+    function pollJob(jobId, onTick) {
+      return new Promise(function (resolve, reject) {
+        var tick = function () {
+          api('/api/jobs/' + jobId).then(function (job) {
+            if (job.status === 'running') { if (onTick) onTick(job); setTimeout(tick, 1500); }
+            else resolve(job);
+          }, reject);
+        };
+        tick();
+      });
+    }
+
+    $('curl-text').addEventListener('input', function () { curlState.plan = null; $('curl-plan').hidden = true; renderCurlControls(); });
+    $('curl-text').addEventListener('paste', function () { setTimeout(checkCurl, 0); });
+    $('curl-text').addEventListener('keydown', function (e) { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); checkCurl(); } });
+    $('curl-check').addEventListener('click', checkCurl);
+    $('curl-load').addEventListener('click', loadCurl);
+    $('curl-name').addEventListener('input', renderCurlControls);
+    $('curl-all-pages').addEventListener('change', renderCurlControls);
 
     // -- Google Sheets -----------------------------------------------------
     var SHEET_LINK = /docs\.google\.com\/spreadsheets\//;

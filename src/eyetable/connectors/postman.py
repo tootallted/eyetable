@@ -236,10 +236,15 @@ def _find_records(obj: dict) -> Any:
 
 
 def dig(payload: Any, path: str) -> Any:
-    """Follow a dotted path like "data.items" or "results.0.id" into a JSON payload."""
-    for part in path.split("."):
-        payload = payload[int(part)] if isinstance(payload, list) else payload[part]
-    return payload
+    """Follow a dotted path like "data.items" or "results.0.id" into a JSON payload.
+
+    A key that itself contains dots (OData's "@odata.nextLink") is matched whole first.
+    """
+    if isinstance(payload, dict) and path in payload:
+        return payload[path]
+    head, sep, rest = path.partition(".")
+    value = payload[int(head)] if isinstance(payload, list) else payload[head]
+    return dig(value, rest) if sep else value
 
 
 def extract_records(payload: Any, path: str | None = None) -> list[Record]:

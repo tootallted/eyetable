@@ -180,6 +180,39 @@ the adventag.com organization with the Google Sheets API enabled, an
 review), and a *Web application* client whose authorized JavaScript origins
 are `https://tootallted.github.io` and `http://localhost:8765`.
 
+### API requests from a curl command
+
+Paste a curl command into **curl command** (copied from your browser's dev
+tools with *Copy as cURL* in bash or cmd form, from API docs, Postman's code
+view, or PowerShell) and **Check request**. eyetable sends it once and shows
+the request (secrets masked), how it will page, the first response's columns
+and rows, and a suggested source name. **Load every page** saves the source
+and loads it in the background; the result appears when it's done.
+
+* **Paging is learned from the command.** A page number (`page=1`, `_page=`,
+  `pageNumber=`…) means every page from there; with a page size (`per_page=`,
+  `limit=`, `pageSize=`, `$top=`…) it stops at the first short page.
+  `offset=` + `limit=` (or `skip=`/`start=`) does the same in rows. A cursor
+  parameter (`cursor=`, `after=`, `pageToken=`…) is followed using the cursor
+  the first response returns, and a next-page link in the response
+  (`next`, `@odata.nextLink`, `links.next`…) or a `Link: rel="next"` header is
+  followed too. At most 1,000 pages. Untick the paging box to load only the
+  first response.
+* **Secrets are encrypted.** Authorization and Cookie headers, key/token-like
+  headers and query parameters, and `-u` passwords become `{{secret_N}}`
+  values stored encrypted with `EYETABLE_SECRET_KEY`; only the masked form is
+  ever shown.
+* Understood: `-X`, `-H`, `-d`/`--data*`, `--data-urlencode`, `--json`, `-G`,
+  `-u`, `-b`, `-A`, `-e`, `--url`, `--oauth2-bearer`; flags like `-s -L -k
+  --compressed` are ignored. Not loadable: `-F` uploads, `-d @file`, `-I`.
+* A curl source is one table, `<name>__data`, queryable by its name, with
+  **Reload** (calls the API again, every page) and group membership like any
+  other source. Loading the same name again replaces or appends.
+* A request that isn't a GET is sent again on every load; the check step says so.
+
+API: `POST /api/curl/inspect`, `POST /api/curl` (returns a job id),
+`GET /api/jobs/<id>`.
+
 ### Reloading a source
 
 Every row in **Sources** has a **Reload** button that loads that source's data
