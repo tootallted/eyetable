@@ -350,6 +350,32 @@ class CoreStore:
         with self.db.connect() as conn:
             return [Upload(**r._mapping) for r in conn.execute(query).all()]
 
+    def load_history(self, source: str) -> list[tuple[Upload, str | None]]:
+        """Every stored upload for a source, oldest first, with its run's status."""
+        cols = [c for c in self.uploads.c if c.name != "content"]
+        query = (
+            sa.select(*cols, self.runs.c.status)
+            .select_from(self.uploads.outerjoin(self.runs, self.uploads.c.run_id == self.runs.c.id))
+            .where(self.uploads.c.source == source)
+            .order_by(self.uploads.c.id)
+        )
+        with self.db.connect() as conn:
+            rows = conn.execute(query).all()
+        out = []
+        for r in rows:
+            data = dict(r._mapping)
+            status = data.pop("status")
+            out.append((Upload(**data), status))
+        return out
+
+    def last_loaded(self, source: str) -> dt.datetime | None:
+        """When data last finished loading into this source successfully."""
+        query = sa.select(sa.func.max(self.runs.c.finished_at)).where(
+            self.runs.c.source == source, self.runs.c.status == "succeeded"
+        )
+        with self.db.connect() as conn:
+            return conn.execute(query).scalar()
+
     def upload_content(self, upload_id: int) -> bytes:
         with self.db.connect() as conn:
             content = conn.execute(

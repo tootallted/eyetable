@@ -180,6 +180,20 @@ the adventag.com organization with the Google Sheets API enabled, an
 review), and a *Web application* client whose authorized JavaScript origins
 are `https://tootallted.github.io` and `http://localhost:8765`.
 
+### Reloading a source
+
+Every row in **Sources** has a **Reload** button that loads that source's data
+again; **Last loaded** shows when data last finished loading.
+
+* File sources replay their stored files, from the most recent *replace*
+  onward (then its appends), so the table comes back exactly as built.
+* Google Sheet sources fetch their tab again and replace the table with its
+  current contents (a private sheet uses your Google sign-in).
+* Database and API sources pull every dataset again and replace the tables.
+
+Each reload is an ingestion run, so rows get a new `ET_timestamp` and
+`ET_run_id`, and `ET_id` starts again at 1. API: `POST /api/sources/<name>/reload`.
+
 ### Query window
 
 The panel docked at the bottom of the page runs your own SQL over everything

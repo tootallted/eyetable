@@ -36,6 +36,11 @@ DEFAULT_MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 PAGES_DIR = Path(__file__).resolve().parents[2] / "docs"  # the GitHub Pages site, in a source checkout
 
 
+class ReloadIn(BaseModel):
+    # For a Google Sheet source whose sheet is private (see SheetIn.google_token).
+    google_token: str | None = Field(default=None, max_length=4096)
+
+
 class SheetIn(BaseModel):
     url: str = Field(max_length=2000)
     mode: str = "replace"
@@ -101,7 +106,8 @@ def create_app(
             wait = requests_limit.hit(ip)
             if wait:
                 return too_many(wait, "requests")
-            if request.method == "POST" and (request.url.path.endswith("/uploads") or request.url.path == "/api/gsheets"):
+            loads = request.url.path.endswith(("/uploads", "/reload")) or request.url.path == "/api/gsheets"
+            if request.method == "POST" and loads:
                 wait = uploads_limit.hit(ip)
                 if wait:
                     return too_many(wait, "uploads")
@@ -138,6 +144,7 @@ def create_app(
             "type": src.type,
             "created_at": src.created_at,
             "updated_at": src.updated_at,
+            "last_loaded_at": store.last_loaded(src.name),
             "datasets": len(datasets),
         }
         if src.type in SINGLE_TABLE_TYPES:
@@ -233,6 +240,26 @@ def create_app(
         except SheetError as exc:
             raise sheet_error(exc) from None
         return jsonable_encoder(load)
+
+    @app.post("/api/sources/{name}/reload", dependencies=auth)
+    def reload(name: str, body: ReloadIn | None = None) -> dict[str, Any]:
+        """Load a source's data again: replay stored files, re-fetch a sheet tab, or re-pull."""
+        get_source(name)
+        token_ = body.google_token if body else None
+        try:
+            results = engine.reload_source(name, sheet_fetch=lambda url: sheet_fetch(url, token_))
+        except SheetError as exc:
+            raise sheet_error(exc) from None
+        except (ValueError, KeyError) as exc:
+            raise HTTPException(400, str(exc).strip("'\"")) from None
+        failed = [r for r in results if r.status != "succeeded"]
+        if failed:
+            raise HTTPException(500, "; ".join(f"{r.dataset_key}: {r.error}" for r in failed))
+        return jsonable_encoder({
+            "source": source_summary(store.get_source(name)),
+            "results": [r.__dict__ for r in results],
+            "rows": sum(r.rows for r in results),
+        })
 
     @app.post("/api/gsheets", dependencies=auth)
     def load_gsheet(body: SheetIn) -> dict[str, Any]:

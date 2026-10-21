@@ -100,7 +100,13 @@ class Engine:
         self.store.save_source(name, type_, config)
 
     def ingest_upload(
-        self, source: str, filename: str, content: bytes, mode: str = "replace", create: bool = False
+        self,
+        source: str,
+        filename: str,
+        content: bytes,
+        mode: str = "replace",
+        create: bool = False,
+        keep_file: bool = True,
     ) -> RunResult:
         """Load an uploaded file into a file source's table.
 
@@ -108,7 +114,8 @@ class Engine:
         already exist, and `mode` says whether this version of the file
         replaces the table's contents or is appended to them. The file is
         parsed before anything is registered or written, so a bad file
-        changes nothing except being rejected.
+        changes nothing except being rejected. `keep_file=False` is for
+        replaying a file that is already stored (a reload).
         """
         if mode not in ("replace", "append"):
             raise ValueError(f"mode must be replace or append, got {mode!r}")
@@ -123,11 +130,12 @@ class Engine:
         if create:
             self.add_source(source, "file", config)
 
-        upload_id = self.store.save_upload(source, filename, content, mode)
+        upload_id = self.store.save_upload(source, filename, content, mode) if keep_file else None
         dataset.detail["upload_id"] = upload_id
         table = table_name(source, dataset.name)
         run_id = self.store.start_run(source, DATASET_KEY, table, mode)
-        self.store.link_upload(upload_id, run_id)
+        if upload_id is not None:
+            self.store.link_upload(upload_id, run_id)
         try:
             rows = self.store.write(
                 table, conn.read(DATASET_KEY), mode, run_id, origin=f"{source} - {conn.origin(DATASET_KEY)}"
@@ -199,29 +207,70 @@ class Engine:
                     "spreadsheet_id": book.spreadsheet_id, "published": book.published, "url": book.url,
                     "file_title": book.title, "tab_title": tab.title,
                 })
-            label = f"{book.title} / {tab.title}"
-            upload_id = self.store.save_upload(plan.source, f"{label}.csv", _csv_snapshot(tab.headers, tab.records), tab_mode)
-            run_id = self.store.start_run(plan.source, DATASET_KEY, plan.table, tab_mode)
-            self.store.link_upload(upload_id, run_id)
-            batches = (tab.records[i : i + 1000] for i in range(0, len(tab.records), 1000))
-            try:
-                rows = self.store.write(plan.table, batches, tab_mode, run_id, origin=f"{plan.source} - {label}")
-            except Exception as exc:
-                error = f"{type(exc).__name__}: {exc}"
-                self.store.finish_run(run_id, "failed", 0, error)
-                load.results.append(RunResult(run_id, plan.tab, plan.table, "failed", 0, error, upload_id))
-                continue
-            self.store.finish_run(run_id, "succeeded", rows)
-            kinds = infer_columns(tab.records)
-            self.store.save_catalog(plan.source, [DatasetInfo(
-                key=DATASET_KEY, name=DATASET_KEY, kind="sheet",
-                columns=[ColumnInfo(h, kinds.get(h) or "text") for h in tab.headers],
-                row_count=len(tab.records),
-                detail={"spreadsheet_id": book.spreadsheet_id, "file_title": book.title, "tab_title": tab.title,
-                        "url": book.url, "upload_id": upload_id},
-            )])
-            load.results.append(RunResult(run_id, plan.tab, plan.table, "succeeded", rows, upload_id=upload_id))
+            load.results.append(self._load_sheet_tab(book, tab, plan.source, plan.table, tab_mode))
         return load
+
+    def _load_sheet_tab(self, book: gsheets.Workbook, tab: gsheets.Tab, source: str, table: str, mode: str) -> RunResult:
+        label = f"{book.title} / {tab.title}"
+        upload_id = self.store.save_upload(source, f"{label}.csv", _csv_snapshot(tab.headers, tab.records), mode)
+        run_id = self.store.start_run(source, DATASET_KEY, table, mode)
+        self.store.link_upload(upload_id, run_id)
+        batches = (tab.records[i : i + 1000] for i in range(0, len(tab.records), 1000))
+        try:
+            rows = self.store.write(table, batches, mode, run_id, origin=f"{source} - {label}")
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            self.store.finish_run(run_id, "failed", 0, error)
+            return RunResult(run_id, tab.title, table, "failed", 0, error, upload_id)
+        self.store.finish_run(run_id, "succeeded", rows)
+        kinds = infer_columns(tab.records)
+        self.store.save_catalog(source, [DatasetInfo(
+            key=DATASET_KEY, name=DATASET_KEY, kind="sheet",
+            columns=[ColumnInfo(h, kinds.get(h) or "text") for h in tab.headers],
+            row_count=len(tab.records),
+            detail={"spreadsheet_id": book.spreadsheet_id, "file_title": book.title, "tab_title": tab.title,
+                    "url": book.url, "upload_id": upload_id},
+        )])
+        return RunResult(run_id, tab.title, table, "succeeded", rows, upload_id=upload_id)
+
+    def reload_source(
+        self,
+        source: str,
+        sheet_fetch: Callable[[str], gsheets.Workbook] = gsheets.fetch_workbook,
+    ) -> list[RunResult]:
+        """Load a source's data again, so its table (and last-loaded time) is fresh.
+
+        * file: the stored files are replayed from the last replace onward, so a
+          table built from a replace plus appends comes back exactly as it was.
+        * gsheet: the tab is fetched again and replaces the table.
+        * database / postman: every readable dataset is pulled again (replace).
+        """
+        src = self.store.get_source(source)
+        if src.type == "file":
+            history = [u for u, status in self.store.load_history(source) if status == "succeeded"]
+            if not history:
+                raise ValueError(f"no file has been loaded into {source!r} yet")
+            start = max((i for i, u in enumerate(history) if u.mode == "replace"), default=0)
+            results = []
+            for i, upload in enumerate(history[start:]):
+                result = self.ingest_upload(
+                    source, upload.filename, self.store.upload_content(upload.id),
+                    mode="replace" if i == 0 else "append", keep_file=False,
+                )
+                results.append(result)
+                if result.status != "succeeded":
+                    break
+            return results
+        if src.type == "gsheet":
+            book = sheet_fetch(src.config["url"])
+            wanted = src.config.get("tab_title")
+            tab = next((t for t in book.tabs if t.title == wanted), None)
+            if tab is None:
+                raise ValueError(f'the tab "{wanted}" is no longer in "{book.title}"; it may have been renamed or deleted')
+            if not tab.headers:
+                raise ValueError(f'the tab "{wanted}" is empty now; nothing was reloaded')
+            return [self._load_sheet_tab(book, tab, source, table_name(source, DATASET_KEY), "replace")]
+        return self.ingest(source)
 
     def discover(self, source: str) -> list[DatasetInfo]:
         """Walk the source's metadata, record every dataset found in the catalog."""
