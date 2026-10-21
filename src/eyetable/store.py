@@ -251,6 +251,12 @@ class CoreStore:
         )
         # One row at most: the Google account scheduled runs read sheets as. The
         # refresh token is stored encrypted (see google_auth.py).
+        self.source_tags = sa.Table(
+            "source_tags",
+            self.metadata,
+            sa.Column("source", sa.String(64), primary_key=True),
+            sa.Column("tag", sa.String(40), primary_key=True),
+        )
         self.google_connection = sa.Table(
             "google_connection",
             self.metadata,
@@ -325,7 +331,41 @@ class CoreStore:
         self.get_source(name)
         with self.db.begin() as conn:
             conn.execute(sa.delete(self.datasets).where(self.datasets.c.source == name))
+            conn.execute(sa.delete(self.source_tags).where(self.source_tags.c.source == name))
             conn.execute(sa.delete(self.sources).where(self.sources.c.name == name))
+
+    # -- tags --------------------------------------------------------------
+
+    def set_source_tags(self, name: str, tags: list[str]) -> list[str]:
+        """Replace a source's tags (already normalized: no '#', lowercase)."""
+        self.get_source(name)
+        tags = sorted(set(tags))
+        with self.db.begin() as conn:
+            conn.execute(sa.delete(self.source_tags).where(self.source_tags.c.source == name))
+            if tags:
+                conn.execute(sa.insert(self.source_tags), [{"source": name, "tag": t} for t in tags])
+        return tags
+
+    def tags_by_source(self) -> dict[str, list[str]]:
+        with self.db.connect() as conn:
+            rows = conn.execute(sa.select(self.source_tags).order_by(self.source_tags.c.tag)).all()
+        out: dict[str, list[str]] = {}
+        for r in rows:
+            out.setdefault(r.source, []).append(r.tag)
+        return out
+
+    def sources_with_tag(self, tag: str) -> list[str]:
+        with self.db.connect() as conn:
+            rows = conn.execute(
+                sa.select(self.source_tags.c.source).where(self.source_tags.c.tag == tag).order_by(self.source_tags.c.source)
+            ).all()
+        return [r.source for r in rows]
+
+    def all_tags(self) -> list[tuple[str, int]]:
+        query = (sa.select(self.source_tags.c.tag, sa.func.count())
+                 .group_by(self.source_tags.c.tag).order_by(self.source_tags.c.tag))
+        with self.db.connect() as conn:
+            return [(r[0], r[1]) for r in conn.execute(query).all()]
 
     # -- catalog -----------------------------------------------------------
 

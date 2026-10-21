@@ -227,11 +227,24 @@ again; **Last loaded** shows when data last finished loading.
 Each reload is an ingestion run, so rows get a new `ET_timestamp` and
 `ET_run_id`, and `ET_id` starts again at 1. API: `POST /api/sources/<name>/reload`.
 
+### Tags
+
+Give any source tags such as `#base` or `#finance`: in **Sources**, click
+**+ tag** (or the ✎ next to existing tags), type them separated by spaces or
+commas, and press Enter. Tags are lowercase letters, digits, `_` and `-`
+(`#Base`, `base` and ` base ` all mean `#base`). Click a tag on any row to
+show only the sources that have it; from there, **Make a group from #base**
+creates a group for it in one click. API: `PUT /api/sources/<name>/tags`,
+`GET /api/tags`.
+
 ### Groups and schedules
 
 A **group** is a named set of sources that load together. In the **Groups**
-card: **New group**, name it, tick its sources, and optionally give it a
-schedule:
+card: **New group**, name it, tick its tags and/or sources, and optionally
+give it a schedule. A tag in a group stands for every source that has it
+*when the group runs*, so a source tagged `#base` later is picked up by a
+`#base` group automatically (each source still runs once, however it got in;
+a tag with no sources is reported in the run). Schedules:
 
 * **Daily at set times**, e.g. 6:00 AM (add more times for several runs a day)
 * **Every few hours** between two times, e.g. every hour from 8:00 AM to

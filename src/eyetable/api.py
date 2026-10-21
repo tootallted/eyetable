@@ -29,7 +29,7 @@ from eyetable import __version__
 from eyetable.connectors.file import DATASET_KEY
 from eyetable.engine import SINGLE_TABLE_TYPES, Engine
 from eyetable.gsheets import SheetError, fetch_workbook, fetch_workbook_signed_in
-from eyetable.identifiers import SOURCE_NAME, table_name
+from eyetable.identifiers import SOURCE_NAME, normalize_tag, table_name
 from eyetable.query import MAX_LIMIT, QueryError, QueryRunner
 from eyetable.curl import parse_curl
 from eyetable.curl import plan as curl_plan
@@ -54,6 +54,10 @@ class GroupIn(BaseModel):
 
 class ScheduleIn(BaseModel):
     schedule: dict[str, Any]
+
+
+class TagsIn(BaseModel):
+    tags: list[str] = Field(max_length=30)
 
 
 class CurlIn(BaseModel):
@@ -183,11 +187,12 @@ def create_app(
 
     auth = [Depends(authorized)]
 
-    def source_summary(src) -> dict[str, Any]:
+    def source_summary(src, tags: dict[str, list[str]] | None = None) -> dict[str, Any]:
         datasets = [d for _, d in store.list_datasets(src.name)]
         summary: dict[str, Any] = {
             "name": src.name,
             "type": src.type,
+            "tags": (tags if tags is not None else store.tags_by_source()).get(src.name, []),
             "created_at": src.created_at,
             "updated_at": src.updated_at,
             "last_loaded_at": store.last_loaded(src.name),
@@ -216,7 +221,28 @@ def create_app(
 
     @app.get("/api/sources", dependencies=auth)
     def list_sources() -> list[dict[str, Any]]:
-        return jsonable_encoder([source_summary(s) for s in store.list_sources()])
+        tags = store.tags_by_source()
+        return jsonable_encoder([source_summary(s, tags) for s in store.list_sources()])
+
+    @app.put("/api/sources/{name}/tags", dependencies=auth)
+    def set_tags(name: str, body: TagsIn) -> dict[str, Any]:
+        """Replace a source's tags. "#Base", "base" and " base " all mean #base."""
+        get_source(name)
+        try:
+            tags = [normalize_tag(t) for t in body.tags]
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from None
+        store.set_source_tags(name, tags)
+        return jsonable_encoder(source_summary(store.get_source(name)))
+
+    @app.get("/api/tags", dependencies=auth)
+    def list_tags() -> list[dict[str, Any]]:
+        """Every tag in use, with its sources."""
+        by_tag: dict[str, list[str]] = {}
+        for source, tags in store.tags_by_source().items():
+            for tag in tags:
+                by_tag.setdefault(tag, []).append(source)
+        return [{"tag": t, "sources": sorted(by_tag.get(t, []))} for t, _ in store.all_tags()]
 
     @app.get("/api/sources/{name}", dependencies=auth)
     def source_detail(name: str) -> dict[str, Any]:

@@ -191,6 +191,20 @@
   .kv { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 2px 12px; font-size: 13px; }
   .kv dt { color: var(--muted); }
   .kv dd { margin: 0; font-family: var(--mono); font-size: 12.5px; overflow-wrap: anywhere; }
+  .hash { display: inline-flex; align-items: center; padding: 1px 8px; border-radius: 999px; font-size: 12px; white-space: nowrap;
+    background: var(--accent-soft); color: var(--accent); border: 1px solid transparent; cursor: pointer; font-family: var(--mono); }
+  .hash:hover, .hash[aria-pressed=true] { border-color: var(--accent); }
+  .tags-cell { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; min-width: 120px; }
+  .tags-cell .add { border: 1px dashed var(--border); background: none; color: var(--muted); border-radius: 999px; padding: 0 8px;
+    font-size: 12px; cursor: pointer; line-height: 20px; }
+  .tags-cell .add:hover { border-color: var(--accent); color: var(--accent); }
+  .tags-edit { display: flex; gap: 6px; align-items: center; min-width: 220px; }
+  .tags-edit input { width: 100%; min-width: 140px; padding: 3px 8px; font-size: 13px; font-family: var(--mono); }
+  .tag-filter { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; font-size: 13px; padding: 8px 12px;
+    border-radius: 10px; background: var(--accent-soft); }
+  .members .hash { cursor: default; }
+  .pick-tags { display: flex; flex-wrap: wrap; gap: 6px 14px; }
+  .pick-tags label { display: inline-flex; gap: 6px; align-items: center; font-size: 13px; }
   .file-chip { display: flex; gap: 12px; align-items: center; padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px; }
   .file-chip .meta { min-width: 0; margin-right: auto; }
   .file-chip .name { font-weight: 600; overflow-wrap: anywhere; }
@@ -462,6 +476,7 @@
       </div>
       <div class="card-body">
         <div id="sources-msg" role="status"></div>
+        <div class="tag-filter" id="tag-filter" hidden></div>
         <div class="table-wrap" id="sources"><div class="empty">Connect to see your sources.</div></div>
       </div>
     </section>
@@ -482,6 +497,11 @@
         <label class="field">Group name
           <input type="text" id="ge-name" maxlength="80" autocomplete="off" placeholder="e.g. Finance morning load">
         </label>
+        <fieldset id="ge-tags-wrap">
+          <legend>Tags in this group</legend>
+          <div class="pick-tags" id="ge-tags"></div>
+          <div class="hint">A tag stands for every source that has it <em>when the group runs</em>, so sources you tag later are included automatically.</div>
+        </fieldset>
         <fieldset>
           <legend>Sources in this group <button type="button" class="link" id="ge-all">all</button> · <button type="button" class="link" id="ge-none">none</button></legend>
           <div class="pick-list" id="ge-sources"></div>
@@ -766,6 +786,110 @@
       });
     }
 
+
+    // -- tags ---------------------------------------------------------------------
+    var TAG_RE = /^[a-z0-9][a-z0-9_-]{0,39}$/;
+    state.tagFilter = null;
+    state.editingTags = null;
+
+    function parseTags(text) {
+      var tags = [], bad = [];
+      text.split(/[\s,]+/).forEach(function (t) {
+        t = t.replace(/^#+/, '').toLowerCase();
+        if (!t) return;
+        if (!TAG_RE.test(t)) bad.push('#' + t);
+        else if (tags.indexOf(t) < 0) tags.push(t);
+      });
+      return { tags: tags, bad: bad };
+    }
+
+    function allTags() {
+      var counts = {};
+      state.sources.forEach(function (s) { (s.tags || []).forEach(function (t) { counts[t] = (counts[t] || 0) + 1; }); });
+      return Object.keys(counts).sort().map(function (t) { return { tag: t, count: counts[t] }; });
+    }
+
+    function hashChip(tag, onClick, pressed) {
+      var b = el('button', { type: 'button', class: 'hash', text: '#' + tag, 'aria-pressed': String(!!pressed),
+        title: onClick ? 'Show only sources tagged #' + tag : '' });
+      if (onClick) b.addEventListener('click', function (e) { e.stopPropagation(); onClick(tag); });
+      return b;
+    }
+
+    function setTagFilter(tag) {
+      state.tagFilter = state.tagFilter === tag ? null : tag;
+      renderSources();
+    }
+
+    function tagsCell(s) {
+      var cell = el('div', { class: 'tags-cell' });
+      cell.addEventListener('click', function (e) { e.stopPropagation(); });  // the row opens details
+      cell.addEventListener('keydown', function (e) { e.stopPropagation(); });
+      if (state.editingTags === s.name) {
+        var input = el('input', { type: 'text', value: (s.tags || []).map(function (t) { return '#' + t; }).join(' '),
+          'aria-label': 'Tags for ' + s.name, placeholder: '#base #finance' });
+        var save = el('button', { type: 'button', class: 'btn small primary', text: 'Save' });
+        var cancel = el('button', { type: 'button', class: 'link', text: 'Cancel' });
+        var done = function () { state.editingTags = null; renderSources(); };
+        var commit = function () {
+          var parsed = parseTags(input.value);
+          if (parsed.bad.length) {
+            clear($('sources-msg')).appendChild(banner('err', parsed.bad.join(', ') + ' isn’t a valid tag: use letters, digits, _ or -, starting with a letter or digit.'));
+            input.focus();
+            return;
+          }
+          save.disabled = true;
+          api('/api/sources/' + encodeURIComponent(s.name) + '/tags', {
+            method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ tags: parsed.tags })
+          }).then(function (r) {
+            s.tags = r.tags;
+            clear($('sources-msg'));
+            done();
+            if (groupsState.list.length) loadGroups();
+          }, function (err) {
+            save.disabled = false;
+            clear($('sources-msg')).appendChild(banner('err', err.message));
+          });
+        };
+        input.addEventListener('keydown', function (e) {
+          if (e.key === 'Enter') { e.preventDefault(); commit(); }
+          if (e.key === 'Escape') { e.preventDefault(); done(); }
+        });
+        save.addEventListener('click', commit);
+        cancel.addEventListener('click', done);
+        cell.appendChild(el('div', { class: 'tags-edit' }, [input, save, cancel]));
+        setTimeout(function () { input.focus(); input.setSelectionRange(input.value.length, input.value.length); }, 0);
+        return cell;
+      }
+      (s.tags || []).forEach(function (t) { cell.appendChild(hashChip(t, setTagFilter, state.tagFilter === t)); });
+      var add = el('button', { type: 'button', class: 'add', text: (s.tags || []).length ? '✎' : '+ tag',
+        title: 'Edit tags for ' + s.name, 'aria-label': 'Edit tags for ' + s.name });
+      add.addEventListener('click', function () { state.editingTags = s.name; renderSources(); });
+      cell.appendChild(add);
+      return cell;
+    }
+
+    function renderTagFilter() {
+      var bar = clear($('tag-filter'));
+      var tag = state.tagFilter;
+      if (tag && !allTags().some(function (t) { return t.tag === tag; })) tag = state.tagFilter = null;
+      bar.hidden = !tag;
+      if (!tag) return;
+      var count = state.sources.filter(function (s) { return (s.tags || []).indexOf(tag) >= 0; }).length;
+      bar.appendChild(el('span', null, ['Showing ', el('strong', { text: '#' + tag }), ' (' + plural(count, 'source') + ')']));
+      var all = el('button', { type: 'button', class: 'link', text: 'Show all' });
+      all.addEventListener('click', function () { setTagFilter(tag); });
+      bar.appendChild(all);
+      var existing = groupsState.list.filter(function (g) { return g.members.length === 1 && g.members[0] === '#' + tag; })[0];
+      var make = el('button', { type: 'button', class: 'btn small', text: existing ? 'Edit group “' + existing.name + '”' : 'Make a group from #' + tag });
+      make.addEventListener('click', function () {
+        if (existing) openEditor(existing);
+        else { openEditor(null); groupsState.editing.name = '#' + tag; $('ge-name').value = '#' + tag; groupsState.editing.members = ['#' + tag]; renderEditor(); }
+        $('group-editor').scrollIntoView({ block: 'start', behavior: 'smooth' });
+      });
+      bar.appendChild(make);
+    }
+
     // -- sources list ------------------------------------------------------
     function renderSources() {
       var wrap = clear($('sources'));
@@ -773,12 +897,17 @@
         wrap.appendChild(el('div', { class: 'empty', text: 'No sources yet. Drop a CSV to create your first one.' }));
         return;
       }
-      var head = el('tr', null, ['Source', 'Type', 'Table', 'Rows', 'Last file', 'Last loaded', ''].map(function (h, i) {
-        return el('th', { class: i === 3 ? 'num' : '', text: h, scope: 'col' });
+      renderTagFilter();
+      var head = el('tr', null, ['Source', 'Tags', 'Type', 'Table', 'Rows', 'Last file', 'Last loaded', ''].map(function (h, i) {
+        return el('th', { class: i === 4 ? 'num' : '', text: h, scope: 'col' });
       }));
-      var rows = state.sources.map(function (s) {
+      var shown = state.tagFilter
+        ? state.sources.filter(function (s) { return (s.tags || []).indexOf(state.tagFilter) >= 0; })
+        : state.sources;
+      var rows = shown.map(function (s) {
         var tr = el('tr', { class: 'clickable' + (s.name === state.selected ? ' selected' : ''), tabindex: '0' }, [
           el('td', null, [el('strong', { text: s.name })]),
+          el('td', null, [tagsCell(s)]),
           el('td', null, [el('span', { class: 'tag', text: typeLabel(s.type) })]),
           el('td', { class: 'mono', text: s.table ? 'eyetable_raw.' + s.table : s.datasets + ' dataset(s)' }),
           el('td', { class: 'num', text: s.table ? fmtInt(s.rows) : '—' }),
@@ -1373,7 +1502,7 @@
         var run = g.last_run;
         if (g.running || (run && run.status === 'running')) {
           var progress = run ? run.results.filter(function (r) { return r.status !== 'running'; }).length : 0;
-          last.appendChild(statusPill('running', 'Running ' + progress + ' of ' + g.members.length + '…'));
+          last.appendChild(statusPill('running', 'Running ' + progress + ' of ' + ((g.sources || g.members).length + (g.empty_tags || []).length) + '…'));
         } else if (run) {
           last.appendChild(statusPill(run.status, run.status === 'succeeded' ? 'Succeeded' : run.status === 'partial' ? 'Partly failed' : 'Failed'));
           last.appendChild(el('div', { class: 'muted', text: fmtTime(run.finished_at || run.started_at) + (run.trigger !== 'manual' ? ' · ' + (run.trigger === 'catch-up' ? 'catch-up' : 'scheduled') : '') }));
@@ -1392,7 +1521,12 @@
         editBtn.addEventListener('click', function () { openEditor(g); });
         return el('tr', null, [
           el('td', null, [el('strong', { text: g.name })]),
-          el('td', null, [el('div', { class: 'members' }, g.members.map(function (m) { return el('span', { class: 'tag', text: m }); }))]),
+          el('td', null, [el('div', { class: 'members' }, g.members.map(function (m) {
+            if (m.charAt(0) !== '#') return el('span', { class: 'tag', text: m });
+            var tagged = state.sources.filter(function (s) { return (s.tags || []).indexOf(m.slice(1)) >= 0; }).map(function (s) { return s.name; });
+            return el('span', { class: 'hash', text: m + ' · ' + tagged.length,
+              title: tagged.length ? m + ' now means: ' + tagged.join(', ') : 'No source is tagged ' + m + ' yet' });
+          }))]),
           el('td', { text: g.schedule_text + (g.schedule && !g.enabled ? ' (paused)' : '') }),
           el('td', { class: 'nowrap', text: g.next_run_at ? fmtTime(g.next_run_at) : '—' }),
           last,
@@ -1482,6 +1616,21 @@
     function renderEditor() {
       var e = groupsState.editing;
       if (!e) return;
+      var tagBox = clear($('ge-tags'));
+      var tagList = allTags();
+      e.members.filter(function (m) { return m.charAt(0) === '#'; }).forEach(function (m) {  // a tag nobody uses (yet)
+        if (!tagList.some(function (t) { return '#' + t.tag === m; })) tagList.push({ tag: m.slice(1), count: 0 });
+      });
+      if (!tagList.length) tagBox.appendChild(el('span', { class: 'muted', text: 'No tags yet: use + tag on a source in the Sources list.' }));
+      tagList.forEach(function (t) {
+        var box = el('input', { type: 'checkbox', value: '#' + t.tag });
+        box.checked = e.members.indexOf('#' + t.tag) >= 0;
+        box.addEventListener('change', function () {
+          if (box.checked) { if (e.members.indexOf('#' + t.tag) < 0) e.members.push('#' + t.tag); }
+          else e.members = e.members.filter(function (m) { return m !== '#' + t.tag; });
+        });
+        tagBox.appendChild(el('label', null, [box, el('span', { class: 'hash', text: '#' + t.tag }), el('span', { class: 'muted', text: plural(t.count, 'source') })]));
+      });
       var list = clear($('ge-sources'));
       if (!state.sources.length) list.appendChild(el('div', { class: 'muted', text: 'No sources yet.' }));
       state.sources.forEach(function (s) {
@@ -1558,7 +1707,7 @@
       var msg = clear($('ge-msg'));
       var body = { name: $('ge-name').value.trim(), members: e.members, schedule: editorSchedule(), enabled: $('ge-enabled').checked };
       if (!body.name) { msg.appendChild(banner('err', 'Give the group a name.')); return; }
-      if (!body.members.length) { msg.appendChild(banner('err', 'Tick at least one source.')); return; }
+      if (!body.members.length) { msg.appendChild(banner('err', 'Tick at least one tag or source.')); return; }
       $('ge-save').disabled = true;
       api(e.id ? '/api/groups/' + e.id : '/api/groups', {
         method: e.id ? 'PUT' : 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
@@ -1584,8 +1733,15 @@
     $('group-editor').addEventListener('submit', saveGroup);
     $('ge-cancel').addEventListener('click', closeEditor);
     $('ge-delete').addEventListener('click', deleteGroup);
-    $('ge-all').addEventListener('click', function () { groupsState.editing.members = state.sources.map(function (s) { return s.name; }); renderEditor(); });
-    $('ge-none').addEventListener('click', function () { groupsState.editing.members = []; renderEditor(); });
+    $('ge-all').addEventListener('click', function () {
+      var tags = groupsState.editing.members.filter(function (m) { return m.charAt(0) === '#'; });
+      groupsState.editing.members = tags.concat(state.sources.map(function (s) { return s.name; }));
+      renderEditor();
+    });
+    $('ge-none').addEventListener('click', function () {
+      groupsState.editing.members = groupsState.editing.members.filter(function (m) { return m.charAt(0) === '#'; });
+      renderEditor();
+    });
     $('ge-add-time').addEventListener('click', function () {
       var e = groupsState.editing;
       var last = e.times[e.times.length - 1] || '06:00';

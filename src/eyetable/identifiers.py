@@ -37,6 +37,20 @@ def source_name(text: str) -> str:
     return shorten(name, MAX_SOURCE_NAME)
 
 
+# Tags label sources (#base, #finance) and let a group pick them up by label.
+TAG = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
+
+
+def normalize_tag(text: str) -> str:
+    """'#Base ' -> 'base'; raises ValueError for anything that isn't a valid tag."""
+    tag = (text or "").strip().lstrip("#").strip().lower()
+    if not TAG.match(tag):
+        raise ValueError(
+            f"#{tag or '…'} isn't a valid tag: use letters, digits, _ or -, starting with a letter or digit (max 40)"
+        )
+    return tag
+
+
 def table_name(source: str, dataset_name: str) -> str:
     return shorten(f"{source}__{sanitize(dataset_name)}", MAX_TABLE_NAME)
 

@@ -25,6 +25,7 @@ from typing import Any
 
 from eyetable import gsheets
 from eyetable.engine import Engine
+from eyetable.identifiers import normalize_tag
 from eyetable.schedule import describe, next_runs, normalize
 from eyetable.store import Group, SourceNotFound
 
@@ -64,14 +65,31 @@ class GroupRunner:
             raise ValueError("a group needs a name of 1 to 80 characters")
         seen: list[str] = []
         for member in members or []:
-            if member not in seen:
+            member = (member or "").strip()
+            if member.startswith("#"):  # a tag: every source with it, decided when the group runs
+                member = "#" + normalize_tag(member)
+            if member and member not in seen:
                 seen.append(member)
         if not seen:
-            raise ValueError("pick at least one source for the group")
-        missing = [m for m in seen if not self.store.source_exists(m)]
+            raise ValueError("pick at least one source or #tag for the group")
+        missing = [m for m in seen if not m.startswith("#") and not self.store.source_exists(m)]
         if missing:
             raise ValueError(f"no source named {', '.join(missing)}")
         return name, seen, normalize(schedule) if schedule else None
+
+    def resolve(self, members: list[str]) -> tuple[list[str], list[str]]:
+        """(sources to run, in order, each once; #tags that currently match no source)."""
+        sources: list[str] = []
+        empty: list[str] = []
+        for member in members:
+            if member.startswith("#"):
+                tagged = self.store.sources_with_tag(member[1:])
+                if not tagged:
+                    empty.append(member)
+                sources.extend(s for s in tagged if s not in sources)
+            elif member not in sources:
+                sources.append(member)
+        return sources, empty
 
     def _next(self, schedule: dict | None, enabled: bool) -> dt.datetime | None:
         if not schedule or not enabled:
@@ -90,10 +108,13 @@ class GroupRunner:
 
     def summary(self, group: Group) -> dict[str, Any]:
         runs = self.store.list_group_runs(group.id, limit=1)
+        sources, empty_tags = self.resolve(group.members)
         return {
             "id": group.id,
             "name": group.name,
             "members": group.members,
+            "sources": sources,  # what a run would load right now (tags expanded)
+            "empty_tags": empty_tags,
             "schedule": group.schedule,
             "schedule_text": describe(group.schedule),
             "enabled": group.enabled,
@@ -130,7 +151,10 @@ class GroupRunner:
     def _execute(self, group: Group, run_id: int, google_token: str | None) -> None:
         results: list[dict[str, Any]] = []
         try:
-            for source in group.members:
+            sources, empty_tags = self.resolve(group.members)
+            for tag in empty_tags:
+                results.append({"source": tag, "status": "failed", "rows": 0, "error": f"no source is tagged {tag}"})
+            for source in sources:
                 entry: dict[str, Any] = {"source": source, "status": "running", "rows": 0, "error": None}
                 results.append(entry)
                 self.store.update_group_run(run_id, results)
