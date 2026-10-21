@@ -180,6 +180,37 @@ the adventag.com organization with the Google Sheets API enabled, an
 review), and a *Web application* client whose authorized JavaScript origins
 are `https://tootallted.github.io` and `http://localhost:8765`.
 
+### Databases from a connection string
+
+Paste a connection string into **Connection string** and **Connect**:
+
+* ODBC, as SQL Server / Azure SQL give it to you:
+  `Driver={ODBC Driver 18 for SQL Server};Server=tcp:x.database.windows.net,1433;Database=db;Uid=user;Pwd={secret};Encrypt=yes;`
+* or a URL: `postgresql://user:secret@host:5432/db`, `mysql+pymysql://…`
+
+eyetable lists every table and view the login can see (schema, name, type and
+the database's estimated row count), with a filter and a table/view switch.
+Tick the ones to bring in; each gets a source name (`<database>_<table>`, or
+`<database>_<schema>_<table>` outside `dbo`/`public`), which you can change.
+**Load selected** creates one source per pick and loads them in the
+background; one failing doesn't stop the rest. Each is an ordinary
+single-table source (type *database table*): queryable by name, with
+**Reload** (reads the table or view again), tags and groups. Connecting again
+shows what's *loaded as* what; picking those again replaces or appends.
+
+* The password (`Pwd=`/`Password=`, or the URL's) is removed from the stored
+  string and kept encrypted with `EYETABLE_SECRET_KEY`. A placeholder such as
+  `{your_password_here}` is refused before connecting.
+* The ODBC driver must be installed on the PC running eyetable. If the string
+  names one that isn't (e.g. *ODBC Driver 18*), the nearest installed version
+  of it is used (e.g. 17) and the page says so.
+* Azure SQL only accepts connections from IP addresses in its firewall rules;
+  if the PC running eyetable isn't allowed, the error says which IP to add
+  (Azure portal → the SQL server → Networking).
+
+API: `POST /api/db/inspect` (lists, saves nothing), `POST /api/db/load`
+(returns a job id).
+
 ### API requests from a curl command
 
 Paste a curl command into **curl command** (copied from your browser's dev

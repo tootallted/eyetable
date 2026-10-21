@@ -31,6 +31,7 @@ from eyetable.engine import SINGLE_TABLE_TYPES, Engine
 from eyetable.gsheets import SheetError, fetch_workbook, fetch_workbook_signed_in
 from eyetable.identifiers import SOURCE_NAME, normalize_tag, table_name
 from eyetable.query import MAX_LIMIT, QueryError, QueryRunner
+from eyetable import dbconnect
 from eyetable.curl import parse_curl
 from eyetable.curl import plan as curl_plan
 from eyetable.google_auth import GoogleAuthError, GoogleConnection
@@ -54,6 +55,22 @@ class GroupIn(BaseModel):
 
 class ScheduleIn(BaseModel):
     schedule: dict[str, Any]
+
+
+class DbIn(BaseModel):
+    connection: str = Field(min_length=1, max_length=4000)
+
+
+class DbItem(BaseModel):
+    schema_: str = Field(alias="schema", max_length=256)
+    name: str = Field(max_length=256)
+    kind: str = "table"
+    source: str = Field(max_length=63)
+
+
+class DbLoadIn(DbIn):
+    items: list[DbItem] = Field(min_length=1, max_length=500)
+    mode: str = "replace"
 
 
 class TagsIn(BaseModel):
@@ -156,7 +173,7 @@ def create_app(
             wait = requests_limit.hit(ip)
             if wait:
                 return too_many(wait, "requests")
-            loads = request.url.path.endswith(("/uploads", "/reload", "/run")) or request.url.path in ("/api/gsheets", "/api/curl")
+            loads = request.url.path.endswith(("/uploads", "/reload", "/run")) or request.url.path in ("/api/gsheets", "/api/curl", "/api/db/load")
             if request.method == "POST" and loads:
                 wait = uploads_limit.hit(ip)
                 if wait:
@@ -438,6 +455,52 @@ def create_app(
             return {"source": source_summary(store.get_source(body.name)), "rows": sum(r.rows for r in results)}
 
         return {"job_id": start_job("curl", work)}
+
+    # -- database connection strings ---------------------------------------------
+    @app.post("/api/db/inspect", dependencies=auth)
+    def inspect_db(body: DbIn) -> dict[str, Any]:
+        """Connect and list every table and view. Saves nothing; the password is never sent back."""
+        try:
+            prepared = dbconnect.prepare(body.connection, engine.secret_key)
+            db_engine, warnings = dbconnect.make_engine(prepared.config, prepared.password)
+            try:
+                objects = dbconnect.list_objects(db_engine)
+            finally:
+                db_engine.dispose()
+        except (ValueError, KeyError) as exc:
+            raise HTTPException(400, str(exc).strip("'\"")) from None
+        loaded = {
+            (s.config.get("label"), s.config.get("schema"), s.config.get("table")): s.name
+            for s in store.list_sources() if s.type == "dbtable"
+        }
+        for obj in objects:
+            obj["suggested_name"] = dbconnect.suggested_name(prepared.database, obj["schema"], obj["name"])
+            obj["loaded_as"] = loaded.get((prepared.label, obj["schema"], obj["name"]))
+        return jsonable_encoder({
+            "label": prepared.label, "server": prepared.server, "database": prepared.database,
+            "warnings": prepared.warnings + warnings, "objects": objects,
+        })
+
+    @app.post("/api/db/load", dependencies=auth, status_code=202)
+    def load_db(body: DbLoadIn) -> dict[str, Any]:
+        """Make a source for each chosen table/view and load them, in the background."""
+        if body.mode not in ("replace", "append"):
+            raise HTTPException(400, "mode must be replace or append")
+        try:
+            dbconnect.prepare(body.connection, engine.secret_key)  # fail fast on an unusable string
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from None
+        names = [i.source for i in body.items]
+        if len(set(names)) != len(names):
+            raise HTTPException(400, "two of the chosen tables have the same source name")
+        items = [{"schema": i.schema_, "name": i.name, "kind": i.kind, "source": i.source} for i in body.items]
+
+        def work() -> dict[str, Any]:
+            results = engine.load_db_objects(body.connection, items, body.mode)
+            return {"items": results, "loaded": sum(1 for r in results if r["status"] == "succeeded"),
+                    "rows": sum(r["rows"] for r in results)}
+
+        return {"job_id": start_job("db", work)}
 
     @app.get("/api/google", dependencies=auth)
     def google_status() -> dict[str, Any]:

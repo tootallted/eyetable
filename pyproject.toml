@@ -19,11 +19,11 @@ dependencies = [
     "python-multipart>=0.0.9",
     "openpyxl>=3.1",
     "tzdata>=2024.1",  # timezone database for schedules (Windows has none built in)
-    "cryptography>=42",  # encrypts the stored Google authorization
+    "cryptography>=42",  # encrypts stored secrets (Google authorization, passwords, API keys)
+    "pyodbc>=5.1",  # SQL Server / Azure SQL and other ODBC connection strings
 ]
 
 [project.optional-dependencies]
-mssql = ["pyodbc>=5.1"]
 mysql = ["pymysql>=1.1"]
 dev = ["pytest>=8.0"]
 

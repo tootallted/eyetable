@@ -19,7 +19,7 @@ from eyetable.types import infer_columns
 
 # Source types whose data is one table, <source>__data, loaded by pushing data in
 # (a dropped file, a Google Sheet tab) rather than by a connector pulling it.
-SINGLE_TABLE_TYPES = ("file", "gsheet", "curl")
+SINGLE_TABLE_TYPES = ("file", "gsheet", "curl", "dbtable")
 
 ConnectorFactory = Callable[[str, dict[str, Any]], Connector]
 
@@ -271,6 +271,50 @@ class Engine:
         self.store.save_source(name, "curl", config)
         self.discover(name)
         return self.ingest(name, mode=mode if existing else "replace")
+
+    def load_db_objects(
+        self,
+        connection: str,
+        items: list[dict[str, str]],
+        mode: str = "replace",
+    ) -> list[dict[str, Any]]:
+        """Make one source per chosen table/view of a database and load each.
+
+        `items` are {"schema", "name", "kind", "source"}. A source loaded before
+        (same name, database table type) is replaced or appended to; one name
+        clashing with another kind of source is reported and skipped. Each item
+        is loaded on its own, so one failing doesn't stop the rest.
+        """
+        from eyetable import dbconnect
+
+        if mode not in ("replace", "append"):
+            raise ValueError(f"mode must be replace or append, got {mode!r}")
+        prepared = dbconnect.prepare(connection, self.secret_key)
+        out = []
+        for item in items:
+            name = item.get("source", "")
+            entry: dict[str, Any] = {"schema": item["schema"], "name": item["name"], "source": name,
+                                     "status": "failed", "rows": 0, "error": None}
+            out.append(entry)
+            if not SOURCE_NAME.match(name):
+                entry["error"] = "source names are lowercase letters, digits and _, starting with a letter"
+                continue
+            existing = self.store.get_source(name) if self.store.source_exists(name) else None
+            if existing and existing.type != "dbtable":
+                entry["error"] = f"{name} is already a {existing.type} source; pick another name"
+                continue
+            config = dbconnect.source_config(prepared, item["schema"], item["name"], item.get("kind", "table"))
+            try:
+                self.store.save_source(name, "dbtable", config)
+                self.discover(name)
+                results = self.ingest(name, mode=mode if existing else "replace")
+            except Exception as exc:
+                entry["error"] = str(exc).strip("'\"") or type(exc).__name__
+                continue
+            failed = [r for r in results if r.status != "succeeded"]
+            entry.update(status="failed" if failed else "succeeded", rows=sum(r.rows for r in results),
+                         error="; ".join(r.error or "" for r in failed) or None)
+        return out
 
     def reload_source(
         self,

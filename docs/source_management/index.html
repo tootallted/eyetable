@@ -205,6 +205,18 @@
   .members .hash { cursor: default; }
   .pick-tags { display: flex; flex-wrap: wrap; gap: 6px 14px; }
   .pick-tags label { display: inline-flex; gap: 6px; align-items: center; font-size: 13px; }
+  #db-conn { width: 100%; min-height: 72px; resize: vertical; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--border);
+    background: var(--surface); color: var(--text); font: 12.5px/1.5 var(--mono); }
+  .db-head { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: baseline; }
+  .db-head strong { font-family: var(--mono); overflow-wrap: anywhere; }
+  .db-tools { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .db-tools input[type=search] { flex: 1 1 180px; width: auto; }
+  .db-tools select { width: auto; }
+  .db-list { max-height: 380px; overflow: auto; }
+  .db-list td { vertical-align: middle; }
+  .db-list input[type=text] { padding: 3px 6px; font-size: 12.5px; font-family: var(--mono); min-width: 180px; }
+  .db-list input[type=text].bad { border-color: var(--err); }
+  .db-list tr.picked td { background: var(--accent-soft); }
   .file-chip { display: flex; gap: 12px; align-items: center; padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px; }
   .file-chip .meta { min-width: 0; margin-right: auto; }
   .file-chip .name { font-weight: 600; overflow-wrap: anywhere; }
@@ -465,6 +477,39 @@
             <button class="btn primary" id="curl-load" type="button" disabled>Load</button>
           </div>
           <div id="curl-result" role="status"></div>
+        </div>
+
+        <div class="or"><span>or a database</span></div>
+        <div class="gs">
+          <label class="field" for="db-conn">Connection string</label>
+          <textarea id="db-conn" spellcheck="false" autocomplete="off"
+            placeholder="Driver={ODBC Driver 18 for SQL Server};Server=tcp:yourserver.database.windows.net,1433;Database=yourdb;Uid=…;Pwd={…};Encrypt=yes;"></textarea>
+          <div><button class="btn" id="db-connect" type="button" disabled>Connect</button></div>
+          <p class="hint">An ODBC connection string (SQL Server, Azure SQL) or a URL such as
+            <code>postgresql://user:password@host:5432/db</code>. eyetable lists the tables and views; pick the ones to bring
+            in, each as its own source. The password goes only to your eyetable API and is stored encrypted.</p>
+          <div id="db-pick" hidden style="display:grid; gap:10px">
+            <div class="db-head" id="db-head"></div>
+            <div class="db-tools">
+              <input type="search" id="db-filter" placeholder="Filter by name or schema…" aria-label="Filter tables and views">
+              <select id="db-kind" aria-label="Show">
+                <option value="">Tables and views</option><option value="table">Tables</option><option value="view">Views</option>
+              </select>
+            </div>
+            <div class="table-wrap db-list" id="db-list"></div>
+            <div class="modes" id="db-modes" role="radiogroup" aria-label="What to do with tables loaded before" hidden>
+              <label class="mode">
+                <span class="t"><input type="radio" name="db-mode" value="replace" checked> Replace contents</span>
+                <span class="d">Ones loaded before are rebuilt from the database. ET_id starts again at 1.</span>
+              </label>
+              <label class="mode">
+                <span class="t"><input type="radio" name="db-mode" value="append"> Append rows</span>
+                <span class="d">Their rows are added after what is there. ET_id continues.</span>
+              </label>
+            </div>
+            <button class="btn primary" id="db-load" type="button" disabled>Load selected</button>
+          </div>
+          <div id="db-result" role="status"></div>
         </div>
       </div>
     </section>
@@ -769,6 +814,7 @@
         updateQueryControls();
         renderSheetControls();
         renderCurlControls();
+        renderDbControls();
         loadSchema();
         loadGroups();
         loadGoogleConnection();
@@ -782,6 +828,7 @@
         updateQueryControls();
         renderSheetControls();
         renderCurlControls();
+        renderDbControls();
         throw err;
       });
     }
@@ -1037,7 +1084,9 @@
       clear($('local-preview'));
     }
 
-    function typeLabel(type) { return type === 'gsheet' ? 'google sheet' : type === 'curl' ? 'api (curl)' : type; }
+    function typeLabel(type) {
+      return type === 'gsheet' ? 'google sheet' : type === 'curl' ? 'api (curl)' : type === 'dbtable' ? 'database table' : type;
+    }
 
     function fileSources() { return state.sources.filter(function (s) { return s.type === 'file'; }); }
 
@@ -1861,6 +1910,7 @@
     function reloadPrompt(s) {
       if (s.type === 'file') return null;  // replays the stored files: the table comes back as it was
       if (s.type === 'curl') return 'Reload ' + s.name + '? The API is called again (every page) and the table is replaced.';
+      if (s.type === 'dbtable') return 'Reload ' + s.name + '? Its table or view is read again from the database and replaces what is here.';
       if (s.type === 'gsheet') return 'Reload ' + s.name + ' from Google Sheets? Its table is replaced with the tab’s current contents.';
       return 'Reload ' + s.name + '? Every table it feeds is pulled again from the source and replaced.';
     }
@@ -2015,6 +2065,173 @@
     $('curl-load').addEventListener('click', loadCurl);
     $('curl-name').addEventListener('input', renderCurlControls);
     $('curl-all-pages').addEventListener('change', renderCurlControls);
+
+
+    // -- database connection strings ---------------------------------------------------
+    // The connection string stays in this page's memory only; the API stores it with the
+    // password encrypted, once per chosen table.
+    var dbState = { listing: null, conn: '', picked: {}, busy: false };
+    var DB_SHOW_MAX = 500;
+
+    function dbKey(o) { return o.schema + '.' + o.name; }
+
+    function renderDbControls() {
+      $('db-connect').disabled = dbState.busy || !state.connected || !$('db-conn').value.trim();
+      if (!dbState.listing) { $('db-load').disabled = true; return; }
+      var picked = Object.keys(dbState.picked);
+      var names = picked.map(function (k) { return dbState.picked[k].source; });
+      var problems = picked.filter(function (k) { return dbNameProblem(dbState.picked[k].source, k, names); });
+      var again = picked.some(function (k) {
+        var p = dbState.picked[k];
+        return state.sources.some(function (s) { return s.name === p.source && s.type === 'dbtable'; });
+      });
+      $('db-modes').hidden = !again;
+      $('db-load').disabled = dbState.busy || !state.connected || !picked.length || problems.length > 0;
+      if (!dbState.busy) $('db-load').textContent = picked.length ? 'Load ' + picked.length + ' selected' : 'Load selected';
+    }
+
+    function dbNameProblem(name, key, allNames) {
+      if (!SOURCE_NAME.test(name)) return 'Use lowercase letters, digits and _, starting with a letter.';
+      if (allNames.filter(function (n) { return n === name; }).length > 1) return 'Two picks have this name.';
+      var existing = state.sources.filter(function (s) { return s.name === name; })[0];
+      if (existing && existing.type !== 'dbtable') return name + ' is already a ' + typeLabel(existing.type) + ' source.';
+      return null;
+    }
+
+    function connectDb() {
+      var text = $('db-conn').value.trim();
+      var out = clear($('db-result'));
+      if (!text || dbState.busy) return;
+      dbState.busy = true;
+      dbState.listing = null;
+      dbState.picked = {};
+      $('db-pick').hidden = true;
+      $('db-connect').textContent = 'Connecting…';
+      renderDbControls();
+      api('/api/db/inspect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ connection: text }) })
+        .then(function (listing) {
+          dbState.listing = listing;
+          dbState.conn = text;
+          $('db-filter').value = '';
+          $('db-kind').value = '';
+          renderDbListing();
+        }, function (err) { out.appendChild(banner('err', err.message)); })
+        .then(function () { dbState.busy = false; $('db-connect').textContent = 'Connect'; renderDbControls(); });
+    }
+
+    function renderDbListing() {
+      var l = dbState.listing;
+      $('db-pick').hidden = false;
+      var head = clear($('db-head'));
+      var tables = l.objects.filter(function (o) { return o.kind === 'table'; }).length;
+      head.appendChild(el('strong', { text: l.label }));
+      head.appendChild(el('span', { class: 'muted', text: plural(tables, 'table') + ', ' + plural(l.objects.length - tables, 'view') }));
+      l.warnings.forEach(function (w) { head.appendChild(el('div', { class: 'muted', text: '⚠ ' + w })); });
+      renderDbList();
+    }
+
+    function renderDbList() {
+      var l = dbState.listing;
+      var q = $('db-filter').value.trim().toLowerCase();
+      var kind = $('db-kind').value;
+      var shown = l.objects.filter(function (o) {
+        return (!kind || o.kind === kind) && (!q || (o.schema + '.' + o.name).toLowerCase().indexOf(q) >= 0);
+      });
+      var wrap = clear($('db-list'));
+      if (!l.objects.length) { wrap.appendChild(el('div', { class: 'empty', text: 'No tables or views are visible to this login.' })); return; }
+      if (!shown.length) { wrap.appendChild(el('div', { class: 'empty', text: 'Nothing matches the filter.' })); return; }
+      var visible = shown.slice(0, DB_SHOW_MAX);
+      var all = el('input', { type: 'checkbox', 'aria-label': 'Select all shown' });
+      all.checked = visible.every(function (o) { return dbState.picked[dbKey(o)]; });
+      all.addEventListener('change', function () {
+        visible.forEach(function (o) {
+          if (all.checked && !dbState.picked[dbKey(o)]) dbState.picked[dbKey(o)] = { obj: o, source: o.loaded_as || o.suggested_name };
+          if (!all.checked) delete dbState.picked[dbKey(o)];
+        });
+        renderDbList();
+      });
+      var head = el('tr', null, [el('th', null, [all]), el('th', { text: 'Schema' }), el('th', { text: 'Name' }), el('th', { text: 'Type' }),
+        el('th', { class: 'num', text: 'Rows (est.)' }), el('th', { text: 'Source name' })]);
+      var names = Object.keys(dbState.picked).map(function (k) { return dbState.picked[k].source; });
+      var body = visible.map(function (o) {
+        var key = dbKey(o), pick = dbState.picked[key];
+        var box = el('input', { type: 'checkbox', 'aria-label': 'Bring in ' + key });
+        box.checked = !!pick;
+        box.addEventListener('change', function () {
+          if (box.checked) dbState.picked[key] = { obj: o, source: o.loaded_as || o.suggested_name };
+          else delete dbState.picked[key];
+          renderDbList();
+        });
+        var nameCell = el('td');
+        if (pick) {
+          var input = el('input', { type: 'text', value: pick.source, 'aria-label': 'Source name for ' + key, spellcheck: 'false' });
+          var problem = dbNameProblem(pick.source, key, names);
+          if (problem) { input.className = 'bad'; input.title = problem; }
+          input.addEventListener('change', function () { pick.source = input.value.trim(); renderDbList(); });
+          nameCell.appendChild(input);
+          if (problem) nameCell.appendChild(el('div', { class: 'note bad', text: problem }));
+          else if (o.loaded_as === pick.source) nameCell.appendChild(el('div', { class: 'muted', text: 'loaded before' }));
+        } else if (o.loaded_as) {
+          nameCell.appendChild(el('span', { class: 'muted', text: 'loaded as ' + o.loaded_as }));
+        }
+        return el('tr', { class: pick ? 'picked' : '' }, [
+          el('td', null, [box]), el('td', { class: 'mono', text: o.schema }), el('td', { class: 'mono', text: o.name }),
+          el('td', null, [el('span', { class: 'tag', text: o.kind })]),
+          el('td', { class: 'num', text: o.rows === null || o.rows === undefined ? '—' : fmtInt(o.rows) }), nameCell
+        ]);
+      });
+      wrap.appendChild(el('table', null, [el('thead', null, [head]), el('tbody', null, body)]));
+      if (shown.length > DB_SHOW_MAX) wrap.appendChild(el('div', { class: 'empty', text: 'Showing the first ' + DB_SHOW_MAX + ' of ' + fmtInt(shown.length) + '; filter to narrow the list.' }));
+      renderDbControls();
+    }
+
+    function loadDb() {
+      var keys = Object.keys(dbState.picked);
+      if (!keys.length || dbState.busy) return;
+      var items = keys.map(function (k) { var p = dbState.picked[k]; return { schema: p.obj.schema, name: p.obj.name, kind: p.obj.kind, source: p.source }; });
+      var again = items.filter(function (i) { return state.sources.some(function (s) { return s.name === i.source && s.type === 'dbtable'; }); });
+      var checked = document.querySelector('input[name=db-mode]:checked');
+      var mode = again.length && checked ? checked.value : 'replace';
+      if (again.length && mode === 'replace' && !confirm('Replace what is in ' + plural(again.length, 'source') + ' loaded before?')) return;
+      dbState.busy = true;
+      $('db-load').textContent = 'Loading…';
+      renderDbControls();
+      var out = clear($('db-result'));
+      api('/api/db/load', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ connection: dbState.conn, items: items, mode: mode }) })
+        .then(function (r) { return pollJob(r.job_id, function (job) {
+          $('db-load').textContent = 'Loading… (' + Math.round((Date.now() - Date.parse(job.started_at)) / 1000) + ' s)';
+        }); })
+        .then(function (job) {
+          if (job.status !== 'succeeded') throw new Error(job.error || 'the load failed');
+          var res = job.result.items;
+          var ok = res.filter(function (r) { return r.status === 'succeeded'; });
+          var bad = res.filter(function (r) { return r.status !== 'succeeded'; });
+          var text = plural(ok.length, 'source') + ' loaded, ' + plural(job.result.rows, 'row') + (ok.length ? ': ' + ok.map(function (r) { return r.source + ' (' + fmtInt(r.rows) + ')'; }).join(', ') : '') + '.';
+          if (bad.length) text += ' Not loaded: ' + bad.map(function (r) { return r.schema + '.' + r.name + ' (' + r.error + ')'; }).join('; ') + '.';
+          out.appendChild(banner(bad.length ? (ok.length ? 'warn' : 'err') : 'ok', text));
+          if (ok.length) {
+            dbState.picked = {};
+            state.selected = ok[0].source;
+          }
+          return refresh().then(function () { if (dbState.listing) return connectDbQuiet(); });
+        })
+        .catch(function (err) { out.appendChild(banner('err', 'Not loaded: ' + err.message)); })
+        .then(function () { dbState.busy = false; renderDbControls(); });
+    }
+
+    // After a load, refresh "loaded as" marks without clearing the result message.
+    function connectDbQuiet() {
+      return api('/api/db/inspect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ connection: dbState.conn }) })
+        .then(function (listing) { dbState.listing = listing; renderDbListing(); }, function () {});
+    }
+
+    $('db-conn').addEventListener('input', function () { dbState.listing = null; $('db-pick').hidden = true; renderDbControls(); });
+    $('db-conn').addEventListener('keydown', function (e) { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); connectDb(); } });
+    $('db-connect').addEventListener('click', connectDb);
+    $('db-load').addEventListener('click', loadDb);
+    $('db-filter').addEventListener('input', renderDbList);
+    $('db-kind').addEventListener('change', renderDbList);
 
     // -- Google Sheets -----------------------------------------------------
     var SHEET_LINK = /docs\.google\.com\/spreadsheets\//;

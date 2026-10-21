@@ -3,12 +3,14 @@ from typing import Any
 from eyetable.connectors.base import Connector
 from eyetable.connectors.curl_source import CurlConnector
 from eyetable.connectors.database import DatabaseConnector
+from eyetable.connectors.dbtable import DbTableConnector
 from eyetable.connectors.file import FileConnector
 from eyetable.connectors.postman import PostmanConnector
 
 CONNECTORS: dict[str, type[Connector]] = {
     CurlConnector.type: CurlConnector,
     DatabaseConnector.type: DatabaseConnector,
+    DbTableConnector.type: DbTableConnector,
     FileConnector.type: FileConnector,
     PostmanConnector.type: PostmanConnector,
 }
