@@ -173,7 +173,8 @@ size, and whether it is new or was loaded before; **Load** loads them all.
   sheets only).
 
 Google sign-in needs an OAuth client ID, set as `GOOGLE_CLIENT_ID` in
-`docs/source_management/index.html`. It comes from a Google Cloud project in
+`docs/source_management/index.html` (currently the "eyetable page" client of
+Google Cloud project `eyetable`). It comes from a Google Cloud project in
 the adventag.com organization with the Google Sheets API enabled, an
 **Internal** OAuth consent screen (adventag.com accounts only, no Google
 review), and a *Web application* client whose authorized JavaScript origins
