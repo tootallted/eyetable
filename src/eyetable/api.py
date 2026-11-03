@@ -79,12 +79,19 @@ class TagsIn(BaseModel):
 
 class CurlIn(BaseModel):
     curl: str = Field(min_length=1, max_length=100_000)
+    all_pages: bool = True
+    page_size: int | None = Field(default=None, ge=1, le=1_000_000)  # the API's fixed rows per page
+    next_field: str | None = Field(default=None, max_length=200)  # where the next-page link is
+    records_field: str | None = Field(default=None, max_length=200)  # where the rows are
+
+    def paging(self) -> dict[str, Any]:
+        return {"all_pages": self.all_pages, "page_size": self.page_size,
+                "next_field": self.next_field, "records_field": self.records_field}
 
 
 class CurlLoadIn(CurlIn):
     name: str = Field(max_length=63)
     mode: str = "replace"
-    all_pages: bool = True
 
 
 class GoogleCodeIn(BaseModel):
@@ -426,7 +433,7 @@ def create_app(
     def inspect_curl(body: CurlIn) -> dict[str, Any]:
         """Check a curl command: send it once, show its first page and how it pages. Saves nothing."""
         try:
-            result, _ = curl_plan(body.curl, engine.secret_key, client=curl_client)
+            result, _ = curl_plan(body.curl, engine.secret_key, client=curl_client, **body.paging())
         except (ValueError, KeyError) as exc:
             raise HTTPException(400, str(exc).strip("'\"")) from None
         out = jsonable_encoder(result)
@@ -448,7 +455,7 @@ def create_app(
             raise HTTPException(400, str(exc)) from None
 
         def work() -> dict[str, Any]:
-            results = engine.load_curl(body.curl, body.name, body.mode, body.all_pages, client=curl_client)
+            results = engine.load_curl(body.curl, body.name, body.mode, client=curl_client, **body.paging())
             failed = [r for r in results if r.status != "succeeded"]
             if failed:
                 raise RuntimeError("; ".join(r.error or r.status for r in failed))

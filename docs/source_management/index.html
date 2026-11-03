@@ -188,6 +188,9 @@
     background: var(--surface); color: var(--text); font: 12.5px/1.5 var(--mono); }
   .curl-line { font-family: var(--mono); font-size: 12.5px; overflow-wrap: anywhere; }
   .curl-line .m { display: inline-block; padding: 0 6px; margin-right: 6px; border-radius: 4px; background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+  .curl-settings { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; }
+  .curl-settings input { font-family: var(--mono); font-size: 12.5px; }
+  .curl-settings .note { font-weight: 400; }
   .kv { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 2px 12px; font-size: 13px; }
   .kv dt { color: var(--muted); }
   .kv dd { margin: 0; font-family: var(--mono); font-size: 12.5px; overflow-wrap: anywhere; }
@@ -452,12 +455,29 @@
           <div><button class="btn" id="curl-check" type="button" disabled>Check request</button></div>
           <p class="hint">Paste a curl command from your browser's dev tools (Copy as cURL), API docs or Postman.
             To load <strong>every page</strong>, include where to start and the page size, e.g.
-            <code>page=1&amp;per_page=100</code> or <code>offset=0&amp;limit=100</code>. Tokens, keys and passwords in the
+            <code>page=1&amp;per_page=100</code> or <code>offset=0&amp;limit=100</code>; an API that returns a next-page
+            link (like <code>nextLink</code>) is followed on its own. Tokens, keys and passwords in the
             command are stored encrypted.</p>
           <div id="curl-plan" hidden style="display:grid; gap:12px">
             <div class="curl-line" id="curl-request"></div>
             <dl class="kv" id="curl-details"></dl>
             <label class="check" id="curl-pages-row"><input type="checkbox" id="curl-all-pages" checked> <span id="curl-paging"></span></label>
+            <div class="curl-settings" id="curl-settings">
+              <label class="field">API page size
+                <input type="number" id="curl-page-size" min="1" max="1000000" step="1" inputmode="numeric" placeholder="e.g. 1000">
+                <span class="note">Rows per page when the API's page size is fixed. A page with fewer is the last.</span>
+              </label>
+              <label class="field">Next-page link field
+                <input type="text" id="curl-next-field" list="curl-next-fields" autocomplete="off" spellcheck="false" placeholder="e.g. nextLink">
+                <datalist id="curl-next-fields"></datalist>
+                <span class="note" id="curl-next-note"></span>
+              </label>
+              <label class="field">Rows field
+                <input type="text" id="curl-records-field" list="curl-records-fields" autocomplete="off" spellcheck="false" placeholder="e.g. value">
+                <datalist id="curl-records-fields"></datalist>
+                <span class="note" id="curl-records-note"></span>
+              </label>
+            </div>
             <div id="curl-first"></div>
             <div class="table-wrap" id="curl-sample"></div>
             <label class="field">Source name
@@ -1975,22 +1995,39 @@
       if (!curlState.busy) $('curl-load').textContent = $('curl-all-pages').checked && curlState.plan.pagination ? 'Load every page' : 'Load';
     }
 
-    function checkCurl() {
+    // The paging settings typed under the plan (blank ones are left to eyetable to work out).
+    function curlSettings() {
+      var size = parseInt($('curl-page-size').value, 10);
+      return {
+        page_size: size > 0 ? size : null,
+        next_field: $('curl-next-field').value.trim() || null,
+        records_field: $('curl-records-field').value.trim() || null
+      };
+    }
+
+    // again: re-check the same command with changed settings, keeping the plan on screen.
+    function checkCurl(again) {
       var text = $('curl-text').value.trim();
       var out = clear($('curl-result'));
       if (!text || curlState.busy) return;
+      var settings = again === true || curlState.plan ? curlSettings() : {};
       curlState.busy = true;
-      curlState.plan = null;
-      $('curl-plan').hidden = true;
+      if (again !== true) { curlState.plan = null; $('curl-plan').hidden = true; }
       $('curl-check').textContent = 'Checking…';
       renderCurlControls();
-      api('/api/curl/inspect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ curl: text }) })
+      api('/api/curl/inspect', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(Object.assign({ curl: text }, settings)) })
         .then(function (plan) {
           curlState.plan = plan;
           curlState.text = text;
           renderCurlPlan();
         }, function (err) { out.appendChild(banner('err', err.message)); })
         .then(function () { curlState.busy = false; $('curl-check').textContent = 'Check request'; renderCurlControls(); });
+    }
+
+    function fillOptions(list, items) {
+      clear(list);
+      items.forEach(function (it) { list.appendChild(el('option', { value: it[0], label: it[1] })); });
     }
 
     function renderCurlPlan() {
@@ -2006,6 +2043,17 @@
       $('curl-all-pages').checked = !!p.pagination;
       $('curl-all-pages').disabled = !p.pagination;
       $('curl-paging').textContent = p.paging_text;
+      // show what was found (or given), so it is what gets saved
+      $('curl-page-size').value = p.page_size || '';
+      $('curl-next-field').value = p.next_field || '';
+      $('curl-records-field').value = p.records_field || '';
+      fillOptions($('curl-next-fields'), p.link_fields.map(function (f) { return [f.field, f.value]; }));
+      fillOptions($('curl-records-fields'), p.list_fields.map(function (f) { return [f.field, plural(f.rows, 'row')]; }));
+      $('curl-next-note').textContent = p.next_field
+        ? 'Each page\'s ' + p.next_field + ' is followed until there is none.'
+        : p.link_fields.length ? 'None picked; links in the response: ' + p.link_fields.map(function (f) { return f.field; }).join(', ') + '.'
+        : 'The first response has no link fields.';
+      $('curl-records-note').textContent = p.records_field ? 'Rows are read from ' + p.records_field + '.' : 'The whole response is the rows.';
       var first = clear($('curl-first'));
       first.appendChild(el('div', { class: 'muted', text: 'First response: ' + plural(p.rows, 'row') + ' × ' + plural(p.columns.length, 'column') + (p.sample.length ? '; the first ' + p.sample.length + ':' : '.') }));
       p.warnings.forEach(function (w) { first.appendChild(banner('warn', w)); });
@@ -2029,7 +2077,7 @@
       renderCurlControls();
       var out = clear($('curl-result'));
       api('/api/curl', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ curl: curlState.text, name: name, mode: mode, all_pages: $('curl-all-pages').checked }) })
+        body: JSON.stringify(Object.assign({ curl: curlState.text, name: name, mode: mode, all_pages: $('curl-all-pages').checked }, curlSettings())) })
         .then(function (r) { return pollJob(r.job_id, function (job) {
           $('curl-load').textContent = 'Loading… (' + Math.round((Date.now() - Date.parse(job.started_at)) / 1000) + ' s)';
         }); })
@@ -2059,6 +2107,10 @@
     }
 
     $('curl-text').addEventListener('input', function () { curlState.plan = null; $('curl-plan').hidden = true; renderCurlControls(); });
+    ['curl-page-size', 'curl-next-field', 'curl-records-field'].forEach(function (id) {
+      $(id).addEventListener('change', function () { if (curlState.plan) checkCurl(true); });
+      $(id).addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); $(id).blur(); } });
+    });
     $('curl-text').addEventListener('paste', function () { setTimeout(checkCurl, 0); });
     $('curl-text').addEventListener('keydown', function (e) { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); checkCurl(); } });
     $('curl-check').addEventListener('click', checkCurl);

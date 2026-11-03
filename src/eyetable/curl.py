@@ -13,9 +13,17 @@ EYETABLE_SECRET_KEY, and are shown masked.
 Paging is learned from the command: a page-number parameter (page=1), with
 or without a page size (per_page=100), means "every page, that many per
 page, starting there"; offset + limit means the same in rows. A cursor
-parameter, or a next-page link in the response, is found by looking at the
-first response. Paging stops on a short or empty page, a missing cursor or
-link, or after 1,000 pages.
+parameter, or a next-page link in the response (nextLink, @odata.nextLink,
+links.next, _links.next.href, ...), is found by looking at the first response.
+Paging stops on a short or empty page, a missing cursor or link, or after
+1,000 pages.
+
+Three settings can be given where guessing isn't enough, and are saved with
+the source so reloads and schedules page the same way:
+  * page_size: the API's fixed rows per page (one it doesn't let you change).
+    A page with fewer rows is the last, even if it still carries a link.
+  * next_field: where in the response the next page's link is.
+  * records_field: where in the response the rows are.
 """
 
 import re
@@ -29,9 +37,11 @@ import httpx
 from eyetable.connectors.curl_source import CurlConnector
 from eyetable.connectors.postman import (
     DEFAULT_MAX_PAGES,
+    dig,
     extract_records,
     pagination_settings,
     parse_response,
+    records_path,
 )
 from eyetable.credentials import encrypt_secret
 from eyetable.identifiers import sanitize, source_name
@@ -287,10 +297,11 @@ _SIZE = {"perpage", "pagesize", "limit", "size", "count", "maxresults", "rows", 
 _OFFSET = {"offset", "skip", "start", "startindex", "from", "startat"}
 _CURSOR = {"cursor", "after", "pagetoken", "nexttoken", "continuation", "continuationtoken", "startingafter",
            "nextpagetoken", "scrollid", "marker"}
-_CURSOR_KEYS = ("next_cursor", "nextcursor", "next_page_token", "nextpagetoken", "next_token", "nexttoken",
-                "endcursor", "continuation", "continuationtoken", "cursor", "after", "nextmarker", "next_marker")
-_NEXT_KEYS = ("@odata.nextlink", "odata.nextlink", "nextlink", "next_page_url", "nextpageurl", "next_url",
-              "nexturl", "next", "next_page", "nextpage")
+# response keys, compared without case or punctuation (next_link = nextLink; @odata.nextLink is odatanextlink)
+_CURSOR_KEYS = ("nextcursor", "nextpagetoken", "nexttoken", "endcursor", "continuation", "continuationtoken",
+                "cursor", "after", "nextmarker")
+_NEXT_KEYS = ("odatanextlink", "nextlink", "nextpagelink", "nextpageurl", "nexturl", "nexturi", "nexthref",
+              "nextpage", "next")
 
 
 def _canon(name: str) -> str:
@@ -304,11 +315,18 @@ def _int(value: str) -> int | None:
         return None
 
 
+def _linkish(value: Any) -> bool:
+    """A next-page link: absolute, root-relative or query-only, or a HAL {"href": ...} object."""
+    if isinstance(value, dict):
+        value = value.get("href")
+    return isinstance(value, str) and value.startswith(("http://", "https://", "/", "?"))
+
+
 def _find_key(payload: Any, wanted: tuple[str, ...], accept, depth: int = 3, prefix: str = "") -> str | None:
     """Dotted path of the first key (by preference order) whose value `accept`s."""
     if not isinstance(payload, dict) or depth < 0:
         return None
-    lowered = {k.lower(): k for k in payload}
+    lowered = {_canon(k): k for k in payload}
     for name in wanted:
         key = lowered.get(name)
         if key is not None and accept(payload[key]):
@@ -356,7 +374,7 @@ def infer_paging(url: str, response: httpx.Response | None, payload: Any) -> tup
                 f"(at most {DEFAULT_MAX_PAGES:,} pages)."
             )
     if isinstance(payload, dict):
-        path = _find_key(payload, _NEXT_KEYS, lambda v: isinstance(v, str) and (v.startswith("http") or v.startswith("/")))
+        path = _find_key(payload, _NEXT_KEYS, _linkish)
         if path:
             return pagination_settings({"type": "next_link", "next_path": path}), (
                 f"Every page, following the response's {path} link until there is none "
@@ -383,6 +401,113 @@ def suggested_name(url: str) -> str:
     return source_name(f"{site}_{tail}" if tail and sanitize(site) != sanitize(tail) else site)
 
 
+def link_fields(payload: Any, depth: int = 3, prefix: str = "") -> list[dict[str, str]]:
+    """Every field of a response that holds a link (outside the rows), to pick the next-page one from."""
+    out: list[dict[str, str]] = []
+    if not isinstance(payload, dict) or depth < 0:
+        return out
+    for key, value in payload.items():
+        path = f"{prefix}{key}"
+        if _linkish(value):
+            link = value["href"] if isinstance(value, dict) else value
+            out.append({"field": path, "value": link if len(link) <= 160 else link[:157] + "..."})
+        elif isinstance(value, dict):
+            out += link_fields(value, depth - 1, path + ".")
+    return out
+
+
+def list_fields(payload: Any, depth: int = 3, prefix: str = "") -> list[dict[str, Any]]:
+    """Every field of a response that holds a list, to pick the rows from."""
+    out: list[dict[str, Any]] = []
+    if not isinstance(payload, dict) or depth < 0:
+        return out
+    for key, value in payload.items():
+        path = f"{prefix}{key}"
+        if isinstance(value, list):
+            out.append({"field": path, "rows": len(value)})
+        elif isinstance(value, dict):
+            out += list_fields(value, depth - 1, path + ".")
+    return out
+
+
+def _clean_field(value: str | None) -> str | None:
+    value = (value or "").strip()
+    return value.removeprefix("$.").strip(".") or None
+
+
+@dataclass
+class Paging:
+    """How a curl source pages, after the first response and any settings given."""
+    spec: dict[str, Any] | None
+    text: str
+    records: list[dict[str, Any]]
+    records_field: str | None  # where the rows are (given, or as found)
+    next_field: str | None  # where the next-page link is (given, or as found)
+    warnings: list[str]
+
+
+def settle(req: CurlRequest, config: dict[str, Any], response: httpx.Response | None, payload: Any, *,
+           all_pages: bool = True, page_size: int | None = None, next_field: str | None = None,
+           records_field: str | None = None) -> Paging:
+    """Work out paging and rows from the first response, and put them in `config` (the stored source)."""
+    next_field, records_field = _clean_field(next_field), _clean_field(records_field)
+    if page_size is not None and not 1 <= page_size <= 1_000_000:
+        raise CurlError("the API page size must be between 1 and 1,000,000")
+    warnings: list[str] = []
+
+    if records_field:
+        try:
+            dig(payload, records_field)
+        except (KeyError, IndexError, TypeError, ValueError):
+            raise CurlError(f"the response has no {records_field} field for the rows") from None
+        config["records_path"] = {REQUEST_NAME: records_field}
+    else:
+        config.pop("records_path", None)
+    records = extract_records(payload, records_field)
+    found_records = records_field or records_path(payload)
+
+    config.pop("pagination", None)
+    if not all_pages:
+        return Paging(None, "Only this request's response (every page is off).", records, found_records, None, warnings)
+
+    if next_field:
+        try:
+            value = dig(payload, next_field)
+        except (KeyError, IndexError, TypeError, ValueError):
+            value = None
+        if value is None or value == "":
+            warnings.append(f"The first response has no {next_field} value, so it looks like the only page.")
+        elif not _linkish(value):
+            raise CurlError(f"{next_field} in the response isn't a link ({str(value)[:80]!r})")
+        spec: dict[str, Any] | None = pagination_settings({"type": "next_link", "next_path": next_field})
+        text = (f"Every page, following the response's {next_field} link until there is none "
+                f"(at most {DEFAULT_MAX_PAGES:,} pages).")
+    else:
+        spec, text = infer_paging(req.url, response, payload)
+
+    if page_size:
+        if spec is None:
+            if len(records) >= page_size:
+                warnings.append(
+                    f"The first page has {len(records):,} rows, the API's page size, but no next-page link was found; "
+                    "pick the field that holds it so the other pages load too."
+                )
+        elif spec["type"] in ("next_link", "cursor"):
+            spec = pagination_settings({**{k: v for k, v in spec.items() if k != "max_pages"}, "page_size": page_size})
+            text = text.rstrip(".") + f"; a page with fewer than {page_size:,} rows (the API's page size) is the last."
+        elif spec["type"] == "page" and "size" not in spec:
+            spec = {**spec, "size": page_size}
+            text = text.replace("Stops at the first empty page",
+                                f"{page_size:,} per page (the API's page size). Stops at the first page with fewer rows")
+        if len(records) > page_size:
+            warnings.append(f"The first page has {len(records):,} rows, more than the {page_size:,} page size given.")
+
+    if spec:
+        config["pagination"] = {REQUEST_NAME: spec}
+    found_next = next_field or (spec.get("next_path") if spec and spec["type"] == "next_link" else None)
+    return Paging(spec, text, records, found_records, found_next, warnings)
+
+
 @dataclass
 class CurlPlan:
     method: str
@@ -396,6 +521,11 @@ class CurlPlan:
     sample: list[dict[str, Any]]
     suggested_name: str
     warnings: list[str]
+    page_size: int | None = None
+    next_field: str | None = None  # the next-page link's field, given or found
+    records_field: str | None = None  # the rows' field, given or found
+    link_fields: list[dict[str, str]] = field(default_factory=list)  # fields holding links, to pick from
+    list_fields: list[dict[str, Any]] = field(default_factory=list)  # fields holding lists, to pick from
 
 
 def prepare(text: str, secret_key: str | None) -> tuple[CurlRequest, dict[str, Any], dict[str, str]]:
@@ -430,14 +560,16 @@ def probe(req: CurlRequest, config: dict[str, Any], secrets: dict[str, str],
     return response, payload, extract_records(payload)
 
 
-def plan(text: str, secret_key: str | None, client: httpx.Client | None = None) -> tuple[CurlPlan, dict[str, Any]]:
+def plan(text: str, secret_key: str | None, client: httpx.Client | None = None, *, all_pages: bool = True,
+         page_size: int | None = None, next_field: str | None = None,
+         records_field: str | None = None) -> tuple[CurlPlan, dict[str, Any]]:
     """Check a command: what it requests, how it pages, and what its first page holds."""
     req, config, secrets = prepare(text, secret_key)
-    response, payload, records = probe(req, config, secrets, client)
-    paging, paging_text = infer_paging(req.url, response, payload)
-    if paging:
-        config["pagination"] = {REQUEST_NAME: paging}
-    warnings = list(req.warnings)
+    response, payload, _ = probe(req, config, secrets, client)
+    paging = settle(req, config, response, payload, all_pages=all_pages, page_size=page_size,
+                    next_field=next_field, records_field=records_field)
+    records = paging.records
+    warnings = list(req.warnings) + paging.warnings
     if req.method != "GET":
         warnings.append(f"This is a {req.method} request; eyetable sends it again every time the source loads.")
     kinds = infer_columns(records)
@@ -447,12 +579,17 @@ def plan(text: str, secret_key: str | None, client: httpx.Client | None = None) 
         url=mask(stored["url"], secrets),
         headers=[{"name": h["key"], "value": mask(h["value"], secrets)} for h in stored["header"]],
         secrets=len(secrets),
-        pagination=paging,
-        paging_text=paging_text,
+        pagination=paging.spec,
+        paging_text=paging.text,
         columns=[{"name": k, "type": v or "text"} for k, v in kinds.items()],
         rows=len(records),
         sample=records[:5],
         suggested_name=suggested_name(req.url),
         warnings=warnings,
+        page_size=page_size,
+        next_field=paging.next_field,
+        records_field=paging.records_field,
+        link_fields=link_fields(payload),
+        list_fields=list_fields(payload),
     )
     return result, config

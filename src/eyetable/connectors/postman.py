@@ -219,20 +219,26 @@ def flatten(record: dict, sep: str = "__", prefix: str = "", depth: int = 3) -> 
     return out
 
 
-def _find_records(obj: dict) -> Any:
+def records_path(obj: Any) -> str | None:
+    """Dotted path of the list of rows in a response, when it isn't the whole response."""
+    if not isinstance(obj, dict):
+        return None
     for key in _RECORD_KEYS:
         if isinstance(obj.get(key), list):
-            return obj[key]
-    lists = [v for v in obj.values() if isinstance(v, list) and v and all(isinstance(x, dict) for x in v)]
+            return key
+    lists = [k for k, v in obj.items() if isinstance(v, list) and v and all(isinstance(x, dict) for x in v)]
     if len(lists) == 1:
         return lists[0]
-    for key in _RECORD_KEYS:  # one level down, e.g. {"data": {"items": [...]}}
-        inner = obj.get(key)
-        if isinstance(inner, dict):
-            found = _find_records(inner)
-            if found is not inner:
-                return found
-    return obj
+    for key in _RECORD_KEYS + ("_embedded",):  # one level down, e.g. {"data": {"items": [...]}}, or HAL's
+        found = records_path(obj.get(key))
+        if found:
+            return f"{key}.{found}"
+    return None
+
+
+def _find_records(obj: dict) -> Any:
+    path = records_path(obj)
+    return dig(obj, path) if path else obj
 
 
 def dig(payload: Any, path: str) -> Any:
@@ -277,8 +283,8 @@ DEFAULT_MAX_PAGES = 1000
 _PAGINATION_OPTIONS: dict[str, dict[str, type]] = {
     "page": {"param": str, "start": int, "size_param": str, "size": int},
     "offset": {"offset_param": str, "limit_param": str, "limit": int, "start": int},
-    "cursor": {"cursor_path": str, "param": str},
-    "next_link": {"next_path": str},
+    "cursor": {"cursor_path": str, "param": str, "page_size": int},
+    "next_link": {"next_path": str, "page_size": int},  # page_size: the API's fixed rows per page, if known
 }
 _PAGINATION_DEFAULTS: dict[str, dict[str, Any]] = {
     "page": {"param": "page", "start": 1},
@@ -298,8 +304,11 @@ def pagination_settings(spec: dict) -> dict:
                start=0. Advances by the rows received; stops on a short page.
     cursor:    cursor_path (required, dotted path to the next cursor in the
                response), param="cursor". Stops when the cursor is empty.
-    next_link: next_path (optional dotted path to the next page's URL); an
-               RFC 5988 `Link: <...>; rel="next"` header is always honored.
+    next_link: next_path (optional dotted path to the next page's URL, or to a
+               {"href": ...} object); an RFC 5988 `Link: <...>; rel="next"`
+               header is always honored. Relative links are resolved.
+    cursor and next_link also take page_size, the API's fixed rows per page:
+    a page with fewer rows is the last, whatever cursor or link it carries.
     All take max_pages (default 1000). Parameters are sent in the query string.
     """
     kind = spec.get("type")
@@ -322,8 +331,8 @@ def pagination_settings(spec: dict) -> dict:
         raise ValueError(f"{kind} pagination needs {', '.join(missing)}")
     if "size_param" in out and "size" not in out:
         raise ValueError("page pagination with size_param also needs size")
-    if out["max_pages"] < 1 or out.get("size", 1) < 1 or out.get("limit", 1) < 1:
-        raise ValueError("max_pages, size and limit must be at least 1")
+    if out["max_pages"] < 1 or out.get("size", 1) < 1 or out.get("limit", 1) < 1 or out.get("page_size", 1) < 1:
+        raise ValueError("max_pages, size, limit and page_size must be at least 1")
     return out
 
 
@@ -360,6 +369,8 @@ def _next_link(response: httpx.Response, payload: Any, next_path: str | None) ->
             url = dig(payload, next_path)
         except (KeyError, IndexError, TypeError, ValueError):
             pass
+    if isinstance(url, dict):  # HAL style: "next": {"href": "..."}
+        url = url.get("href")
     if not isinstance(url, str) or not url:
         url = response.links.get("next", {}).get("url")
     return str(response.url.join(url)) if url else None  # next links may be relative
@@ -487,6 +498,8 @@ class PostmanConnector(Connector):
                 position += 1 if kind == "page" else len(records)
                 param = paging["param"] if kind == "page" else paging["offset_param"]
                 built = _with_params(built, {param: position})
+            elif not records or (paging.get("page_size") and len(records) < paging["page_size"]):
+                return  # a short (or empty) page is the last one, whatever links it carries
             elif kind == "cursor":
                 try:
                     cursor = dig(payload, paging["cursor_path"])

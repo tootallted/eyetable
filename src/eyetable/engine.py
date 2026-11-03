@@ -246,11 +246,17 @@ class Engine:
         mode: str = "replace",
         all_pages: bool = True,
         client: Any = None,
+        page_size: int | None = None,
+        next_field: str | None = None,
+        records_field: str | None = None,
     ) -> list[RunResult]:
         """Make (or update) source `name` from a curl command and load it.
 
         The request is sent once to learn its paging (unless `all_pages` is off),
         the source is saved with its secrets encrypted, and every page is loaded.
+        `page_size` (the API's fixed rows per page), `next_field` (where the
+        next-page link is) and `records_field` (where the rows are) override
+        what the first response suggests, and are kept for reloads.
         A source loaded before keeps its name and is replaced or appended to.
         """
         from eyetable import curl
@@ -264,10 +270,8 @@ class Engine:
             raise ValueError(f"{name!r} is already a {existing.type} source; pick another name")
         req, config, secrets = curl.prepare(text, self.secret_key)
         response, payload, _ = curl.probe(req, config, secrets, client)
-        if all_pages:
-            paging, _ = curl.infer_paging(req.url, response, payload)
-            if paging:
-                config["pagination"] = {curl.REQUEST_NAME: paging}
+        curl.settle(req, config, response, payload, all_pages=all_pages, page_size=page_size,
+                    next_field=next_field, records_field=records_field)
         self.store.save_source(name, "curl", config)
         self.discover(name)
         return self.ingest(name, mode=mode if existing else "replace")

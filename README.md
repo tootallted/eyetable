@@ -226,9 +226,19 @@ and loads it in the background; the result appears when it's done.
   `offset=` + `limit=` (or `skip=`/`start=`) does the same in rows. A cursor
   parameter (`cursor=`, `after=`, `pageToken=`…) is followed using the cursor
   the first response returns, and a next-page link in the response
-  (`next`, `@odata.nextLink`, `links.next`…) or a `Link: rel="next"` header is
-  followed too. At most 1,000 pages. Untick the paging box to load only the
-  first response.
+  (`nextLink`, `next_link`, `@odata.nextLink`, `links.next`,
+  `_links.next.href`…; absolute, relative or `?query` only) or a
+  `Link: rel="next"` header is followed too. At most 1,000 pages. Untick the
+  paging box to load only the first response.
+* **Paging settings, when guessing isn't enough.** Under the paging line:
+  * **API page size**: for an API whose page size is fixed (say 1,000 rows),
+    a page with fewer rows is the last, even if it still returns a next link.
+    If the first page is full but no link was found, the check step says so.
+  * **Next-page link field**: where the next page's link is, picked from the
+    link fields of the first response or typed (dotted, e.g. `paging.next`).
+  * **Rows field**: where the rows are (e.g. `value`, `data.items`).
+  Changing one checks the request again. They're saved with the source, so
+  **Reload** and group schedules page the same way.
 * **Secrets are encrypted.** Authorization and Cookie headers, key/token-like
   headers and query parameters, and `-u` passwords become `{{secret_N}}`
   values stored encrypted with `EYETABLE_SECRET_KEY`; only the masked form is
@@ -241,7 +251,8 @@ and loads it in the background; the result appears when it's done.
   other source. Loading the same name again replaces or appends.
 * A request that isn't a GET is sent again on every load; the check step says so.
 
-API: `POST /api/curl/inspect`, `POST /api/curl` (returns a job id),
+API: `POST /api/curl/inspect`, `POST /api/curl` (returns a job id; both take
+optional `page_size`, `next_field`, `records_field` and `all_pages`),
 `GET /api/jobs/<id>`.
 
 ### Reloading a source
