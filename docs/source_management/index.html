@@ -382,36 +382,6 @@
     </div>
   </section>
 
-  <section class="card full" aria-labelledby="sources-title">
-    <div class="card-head">
-      <h2 id="sources-title">Sources</h2>
-      <button class="btn small" id="refresh" type="button">Refresh</button>
-    </div>
-    <div class="card-body">
-      <div id="sources-msg" role="status"></div>
-      <div class="tag-filter" id="tag-filter" hidden></div>
-      <div class="table-wrap" id="sources"><div class="empty">Connect to see your sources.</div></div>
-    </div>
-  </section>
-
-  <section class="card full" id="detail" hidden aria-live="polite">
-    <div class="card-body">
-      <div class="detail-head">
-        <h2 id="detail-name"></h2>
-        <span class="tag" id="detail-type"></span>
-      </div>
-      <div class="stats" id="detail-stats"></div>
-      <div>
-        <h3 style="font-size:14px; margin:0 0 8px">First rows</h3>
-        <div class="table-wrap" id="detail-preview"></div>
-      </div>
-      <div>
-        <h3 style="font-size:14px; margin:0 0 8px">File history</h3>
-        <div class="table-wrap" id="detail-history"></div>
-      </div>
-    </div>
-  </section>
-
   <section class="card" aria-labelledby="load-title">
     <h2 id="load-title">Load data</h2>
     <div class="card-body">
@@ -581,6 +551,36 @@
           <button class="btn primary" id="db-load" type="button" disabled>Load selected</button>
         </div>
         <div id="db-result" role="status"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="card full" aria-labelledby="sources-title">
+    <div class="card-head">
+      <h2 id="sources-title">Sources</h2>
+      <button class="btn small" id="refresh" type="button">Refresh</button>
+    </div>
+    <div class="card-body">
+      <div id="sources-msg" role="status"></div>
+      <div class="tag-filter" id="tag-filter" hidden></div>
+      <div class="table-wrap" id="sources"><div class="empty">Connect to see your sources.</div></div>
+    </div>
+  </section>
+
+  <section class="card full" id="detail" hidden aria-live="polite">
+    <div class="card-body">
+      <div class="detail-head">
+        <h2 id="detail-name"></h2>
+        <span class="tag" id="detail-type"></span>
+      </div>
+      <div class="stats" id="detail-stats"></div>
+      <div>
+        <h3 style="font-size:14px; margin:0 0 8px">First rows</h3>
+        <div class="table-wrap" id="detail-preview"></div>
+      </div>
+      <div>
+        <h3 style="font-size:14px; margin:0 0 8px">File history</h3>
+        <div class="table-wrap" id="detail-history"></div>
       </div>
     </div>
   </section>
