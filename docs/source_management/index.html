@@ -81,9 +81,10 @@
   .google-top .g { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
   #top-msg:empty { display: none; }
 
-  main { max-width: 1240px; margin: 0 auto; padding: 24px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 20px; }
-  .grid { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); gap: 20px; align-items: start; }
-  @media (max-width: 900px) { .grid { grid-template-columns: minmax(0, 1fr); } main { padding: 16px; } header.top { padding: 12px 16px; } }
+  main { padding: 24px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 20px; }
+  main > * { width: 100%; max-width: 1240px; justify-self: center; }
+  main > .full { max-width: none; }  /* tables of records use the whole page */
+  @media (max-width: 900px) { main { padding: 16px; } header.top { padding: 12px 16px; } }
 
   .card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; box-shadow: var(--shadow); min-width: 0; }
   .card > h2, .card-head { margin: 0; padding: 16px 20px 0; }
@@ -255,6 +256,19 @@
   tr.clickable { cursor: pointer; }
   tr.clickable:hover td { background: var(--surface-2); }
   tr.selected td { background: var(--accent-soft); }
+  .sources-table td.wrap { white-space: normal; overflow-wrap: anywhere; }  /* names can be long and have no spaces */
+  @media (max-width: 900px) {  /* too narrow for columns: each source becomes a small block */
+    .sources-table thead { display: none; }
+    .sources-table, .sources-table tbody, .sources-table tr { display: block; }
+    .sources-table tr { padding: 8px 12px; border-bottom: 1px solid var(--border); }
+    .sources-table tbody tr:last-child { border-bottom: 0; }
+    .sources-table td, .sources-table td.num {
+      display: grid; grid-template-columns: 88px minmax(0, 1fr); gap: 8px; align-items: start;
+      padding: 2px 0; border: 0; text-align: left; white-space: normal; background: none;
+    }
+    .sources-table td::before { content: attr(data-label); color: var(--muted); }
+    .sources-table td > * { justify-self: start; }
+  }
   .tag { display: inline-block; padding: 1px 8px; border-radius: 999px; background: var(--surface-2); border: 1px solid var(--border); font-size: 12px; color: var(--muted); }
   .empty { padding: 28px 16px; text-align: center; color: var(--muted); }
 
@@ -360,192 +374,208 @@
     </div>
   </section>
 
-  <div class="grid">
-    <section class="card" aria-labelledby="load-title">
-      <h2 id="load-title">Load data</h2>
-      <div class="card-body">
-        <label class="drop" id="drop">
-          <input type="file" id="file-input" accept=".csv,text/csv">
-          <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 16V4M7 9l5-5 5 5"/><path d="M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3"/></svg>
-          <strong>Drop a CSV file here</strong>
-          <span class="hint">or click to choose one</span>
-        </label>
+  <section class="card full" aria-labelledby="sources-title">
+    <div class="card-head">
+      <h2 id="sources-title">Sources</h2>
+      <button class="btn small" id="refresh" type="button">Refresh</button>
+    </div>
+    <div class="card-body">
+      <div id="sources-msg" role="status"></div>
+      <div class="tag-filter" id="tag-filter" hidden></div>
+      <div class="table-wrap" id="sources"><div class="empty">Connect to see your sources.</div></div>
+    </div>
+  </section>
 
-        <div id="staged" hidden>
-          <div style="display:grid; gap:16px">
-            <div class="file-chip">
-              <div class="meta">
-                <div class="name" id="file-name"></div>
-                <div class="sub" id="file-sub"></div>
-              </div>
-              <button class="btn small" id="clear-file" type="button">Remove</button>
+  <section class="card full" id="detail" hidden aria-live="polite">
+    <div class="card-body">
+      <div class="detail-head">
+        <h2 id="detail-name"></h2>
+        <span class="tag" id="detail-type"></span>
+      </div>
+      <div class="stats" id="detail-stats"></div>
+      <div>
+        <h3 style="font-size:14px; margin:0 0 8px">First rows</h3>
+        <div class="table-wrap" id="detail-preview"></div>
+      </div>
+      <div>
+        <h3 style="font-size:14px; margin:0 0 8px">File history</h3>
+        <div class="table-wrap" id="detail-history"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="card" aria-labelledby="load-title">
+    <h2 id="load-title">Load data</h2>
+    <div class="card-body">
+      <label class="drop" id="drop">
+        <input type="file" id="file-input" accept=".csv,text/csv">
+        <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 16V4M7 9l5-5 5 5"/><path d="M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3"/></svg>
+        <strong>Drop a CSV file here</strong>
+        <span class="hint">or click to choose one</span>
+      </label>
+
+      <div id="staged" hidden>
+        <div style="display:grid; gap:16px">
+          <div class="file-chip">
+            <div class="meta">
+              <div class="name" id="file-name"></div>
+              <div class="sub" id="file-sub"></div>
             </div>
-            <div class="table-wrap" id="local-preview"></div>
+            <button class="btn small" id="clear-file" type="button">Remove</button>
+          </div>
+          <div class="table-wrap" id="local-preview"></div>
 
-            <div style="display:grid; gap:10px">
-              <div class="segmented" role="group" aria-label="Destination">
-                <button type="button" id="dest-new" aria-pressed="true">New source</button>
-                <button type="button" id="dest-existing" aria-pressed="false">Existing source</button>
-              </div>
+          <div style="display:grid; gap:10px">
+            <div class="segmented" role="group" aria-label="Destination">
+              <button type="button" id="dest-new" aria-pressed="true">New source</button>
+              <button type="button" id="dest-existing" aria-pressed="false">Existing source</button>
+            </div>
 
-              <div id="new-fields">
-                <label class="field">Source name
-                  <input type="text" id="new-name" autocomplete="off" spellcheck="false">
-                  <span class="note" id="name-note">Lowercase letters, digits and _, starting with a letter.</span>
+            <div id="new-fields">
+              <label class="field">Source name
+                <input type="text" id="new-name" autocomplete="off" spellcheck="false">
+                <span class="note" id="name-note">Lowercase letters, digits and _, starting with a letter.</span>
+              </label>
+            </div>
+
+            <div id="existing-fields" hidden style="display:grid; gap:12px">
+              <label class="field">Source
+                <select id="existing-source"></select>
+              </label>
+              <div class="modes" role="radiogroup" aria-label="What to do with the existing table">
+                <label class="mode">
+                  <span class="t"><input type="radio" name="mode" value="replace" checked> Replace contents</span>
+                  <span class="d">The table is rebuilt from this file. ET_id starts again at 1.</span>
+                </label>
+                <label class="mode">
+                  <span class="t"><input type="radio" name="mode" value="append"> Append rows</span>
+                  <span class="d">Rows are added after the existing ones. ET_id continues.</span>
                 </label>
               </div>
-
-              <div id="existing-fields" hidden style="display:grid; gap:12px">
-                <label class="field">Source
-                  <select id="existing-source"></select>
-                </label>
-                <div class="modes" role="radiogroup" aria-label="What to do with the existing table">
-                  <label class="mode">
-                    <span class="t"><input type="radio" name="mode" value="replace" checked> Replace contents</span>
-                    <span class="d">The table is rebuilt from this file. ET_id starts again at 1.</span>
-                  </label>
-                  <label class="mode">
-                    <span class="t"><input type="radio" name="mode" value="append"> Append rows</span>
-                    <span class="d">Rows are added after the existing ones. ET_id continues.</span>
-                  </label>
-                </div>
-              </div>
-
-              <div class="target" id="target"></div>
             </div>
 
-            <button class="btn primary" id="load" type="button" disabled>Load into eyetable</button>
+            <div class="target" id="target"></div>
           </div>
+
+          <button class="btn primary" id="load" type="button" disabled>Load into eyetable</button>
         </div>
-        <div id="load-result" role="status"></div>
+      </div>
+      <div id="load-result" role="status"></div>
 
-        <div class="or"><span>or a Google Sheet</span></div>
-        <div class="gs">
-          <label class="field" for="gs-url">Google Sheet link</label>
-          <div class="gs-row">
-            <input type="url" id="gs-url" placeholder="https://docs.google.com/spreadsheets/d/…" autocomplete="off" spellcheck="false">
-            <button class="btn" id="gs-check" type="button" disabled>Check tabs</button>
-          </div>
-          <p class="hint">Every tab becomes its own source, named <code>file name_tab name</code>. Paste or drop the
-            same link again later to refresh its tabs.</p>
-          <div class="gs-google" id="gs-google"></div>
-          <div id="gs-plan" hidden style="display:grid; gap:12px">
-            <div class="gs-title" id="gs-title"></div>
-            <div class="table-wrap gs-tabs" id="gs-tabs"></div>
-            <div class="modes" id="gs-modes" role="radiogroup" aria-label="What to do with tabs loaded before" hidden>
-              <label class="mode">
-                <span class="t"><input type="radio" name="gs-mode" value="replace" checked> Replace contents</span>
-                <span class="d">Tabs loaded before are rebuilt from the sheet. ET_id starts again at 1.</span>
-              </label>
-              <label class="mode">
-                <span class="t"><input type="radio" name="gs-mode" value="append"> Append rows</span>
-                <span class="d">The sheet's rows are added after what is there. ET_id continues.</span>
-              </label>
-            </div>
-            <button class="btn primary" id="gs-load" type="button" disabled>Load tabs</button>
-          </div>
-          <div id="gs-result" role="status"></div>
+      <div class="or"><span>or a Google Sheet</span></div>
+      <div class="gs">
+        <label class="field" for="gs-url">Google Sheet link</label>
+        <div class="gs-row">
+          <input type="url" id="gs-url" placeholder="https://docs.google.com/spreadsheets/d/…" autocomplete="off" spellcheck="false">
+          <button class="btn" id="gs-check" type="button" disabled>Check tabs</button>
         </div>
-
-        <div class="or"><span>or an API request</span></div>
-        <div class="gs">
-          <label class="field" for="curl-text">curl command</label>
-          <textarea id="curl-text" spellcheck="false" autocomplete="off"
-            placeholder="curl 'https://api.example.com/v1/orders?page=1&amp;per_page=100' -H 'Authorization: Bearer …'"></textarea>
-          <div><button class="btn" id="curl-check" type="button" disabled>Check request</button></div>
-          <p class="hint">Paste a curl command from your browser's dev tools (Copy as cURL), API docs or Postman.
-            To load <strong>every page</strong>, include where to start and the page size, e.g.
-            <code>page=1&amp;per_page=100</code> or <code>offset=0&amp;limit=100</code>; an API that returns a next-page
-            link (like <code>nextLink</code>) is followed on its own. Tokens, keys and passwords in the
-            command are stored encrypted.</p>
-          <div id="curl-plan" hidden style="display:grid; gap:12px">
-            <div class="curl-line" id="curl-request"></div>
-            <dl class="kv" id="curl-details"></dl>
-            <label class="check" id="curl-pages-row"><input type="checkbox" id="curl-all-pages" checked> <span id="curl-paging"></span></label>
-            <div class="curl-settings" id="curl-settings">
-              <label class="field">API page size
-                <input type="number" id="curl-page-size" min="1" max="1000000" step="1" inputmode="numeric" placeholder="e.g. 1000">
-                <span class="note">Rows per page when the API's page size is fixed. A page with fewer is the last.</span>
-              </label>
-              <label class="field">Next-page link field
-                <input type="text" id="curl-next-field" list="curl-next-fields" autocomplete="off" spellcheck="false" placeholder="e.g. nextLink">
-                <datalist id="curl-next-fields"></datalist>
-                <span class="note" id="curl-next-note"></span>
-              </label>
-              <label class="field">Rows field
-                <input type="text" id="curl-records-field" list="curl-records-fields" autocomplete="off" spellcheck="false" placeholder="e.g. value">
-                <datalist id="curl-records-fields"></datalist>
-                <span class="note" id="curl-records-note"></span>
-              </label>
-            </div>
-            <div id="curl-first"></div>
-            <div class="table-wrap" id="curl-sample"></div>
-            <label class="field">Source name
-              <input type="text" id="curl-name" autocomplete="off" spellcheck="false">
-              <span class="note" id="curl-name-note"></span>
+        <p class="hint">Every tab becomes its own source, named <code>file name_tab name</code>. Paste or drop the
+          same link again later to refresh its tabs.</p>
+        <div class="gs-google" id="gs-google"></div>
+        <div id="gs-plan" hidden style="display:grid; gap:12px">
+          <div class="gs-title" id="gs-title"></div>
+          <div class="table-wrap gs-tabs" id="gs-tabs"></div>
+          <div class="modes" id="gs-modes" role="radiogroup" aria-label="What to do with tabs loaded before" hidden>
+            <label class="mode">
+              <span class="t"><input type="radio" name="gs-mode" value="replace" checked> Replace contents</span>
+              <span class="d">Tabs loaded before are rebuilt from the sheet. ET_id starts again at 1.</span>
             </label>
-            <div class="modes" id="curl-modes" role="radiogroup" aria-label="What to do with the data loaded before" hidden>
-              <label class="mode">
-                <span class="t"><input type="radio" name="curl-mode" value="replace" checked> Replace contents</span>
-                <span class="d">The table is rebuilt from this request. ET_id starts again at 1.</span>
-              </label>
-              <label class="mode">
-                <span class="t"><input type="radio" name="curl-mode" value="append"> Append rows</span>
-                <span class="d">Rows are added after what is there. ET_id continues.</span>
-              </label>
-            </div>
-            <button class="btn primary" id="curl-load" type="button" disabled>Load</button>
+            <label class="mode">
+              <span class="t"><input type="radio" name="gs-mode" value="append"> Append rows</span>
+              <span class="d">The sheet's rows are added after what is there. ET_id continues.</span>
+            </label>
           </div>
-          <div id="curl-result" role="status"></div>
+          <button class="btn primary" id="gs-load" type="button" disabled>Load tabs</button>
         </div>
+        <div id="gs-result" role="status"></div>
+      </div>
 
-        <div class="or"><span>or a database</span></div>
-        <div class="gs">
-          <label class="field" for="db-conn">Connection string</label>
-          <textarea id="db-conn" spellcheck="false" autocomplete="off"
-            placeholder="Driver={ODBC Driver 18 for SQL Server};Server=tcp:yourserver.database.windows.net,1433;Database=yourdb;Uid=…;Pwd={…};Encrypt=yes;"></textarea>
-          <div><button class="btn" id="db-connect" type="button" disabled>Connect</button></div>
-          <p class="hint">An ODBC connection string (SQL Server, Azure SQL) or a URL such as
-            <code>postgresql://user:password@host:5432/db</code>. eyetable lists the tables and views; pick the ones to bring
-            in, each as its own source. The password goes only to your eyetable API and is stored encrypted.</p>
-          <div id="db-pick" hidden style="display:grid; gap:10px">
-            <div class="db-head" id="db-head"></div>
-            <div class="db-tools">
-              <input type="search" id="db-filter" placeholder="Filter by name or schema…" aria-label="Filter tables and views">
-              <select id="db-kind" aria-label="Show">
-                <option value="">Tables and views</option><option value="table">Tables</option><option value="view">Views</option>
-              </select>
-            </div>
-            <div class="table-wrap db-list" id="db-list"></div>
-            <div class="modes" id="db-modes" role="radiogroup" aria-label="What to do with tables loaded before" hidden>
-              <label class="mode">
-                <span class="t"><input type="radio" name="db-mode" value="replace" checked> Replace contents</span>
-                <span class="d">Ones loaded before are rebuilt from the database. ET_id starts again at 1.</span>
-              </label>
-              <label class="mode">
-                <span class="t"><input type="radio" name="db-mode" value="append"> Append rows</span>
-                <span class="d">Their rows are added after what is there. ET_id continues.</span>
-              </label>
-            </div>
-            <button class="btn primary" id="db-load" type="button" disabled>Load selected</button>
+      <div class="or"><span>or an API request</span></div>
+      <div class="gs">
+        <label class="field" for="curl-text">curl command</label>
+        <textarea id="curl-text" spellcheck="false" autocomplete="off"
+          placeholder="curl 'https://api.example.com/v1/orders?page=1&amp;per_page=100' -H 'Authorization: Bearer …'"></textarea>
+        <div><button class="btn" id="curl-check" type="button" disabled>Check request</button></div>
+        <p class="hint">Paste a curl command from your browser's dev tools (Copy as cURL), API docs or Postman.
+          To load <strong>every page</strong>, include where to start and the page size, e.g.
+          <code>page=1&amp;per_page=100</code> or <code>offset=0&amp;limit=100</code>; an API that returns a next-page
+          link (like <code>nextLink</code>) is followed on its own. Tokens, keys and passwords in the
+          command are stored encrypted.</p>
+        <div id="curl-plan" hidden style="display:grid; gap:12px">
+          <div class="curl-line" id="curl-request"></div>
+          <dl class="kv" id="curl-details"></dl>
+          <label class="check" id="curl-pages-row"><input type="checkbox" id="curl-all-pages" checked> <span id="curl-paging"></span></label>
+          <div class="curl-settings" id="curl-settings">
+            <label class="field">API page size
+              <input type="number" id="curl-page-size" min="1" max="1000000" step="1" inputmode="numeric" placeholder="e.g. 1000">
+              <span class="note">Rows per page when the API's page size is fixed. A page with fewer is the last.</span>
+            </label>
+            <label class="field">Next-page link field
+              <input type="text" id="curl-next-field" list="curl-next-fields" autocomplete="off" spellcheck="false" placeholder="e.g. nextLink">
+              <datalist id="curl-next-fields"></datalist>
+              <span class="note" id="curl-next-note"></span>
+            </label>
+            <label class="field">Rows field
+              <input type="text" id="curl-records-field" list="curl-records-fields" autocomplete="off" spellcheck="false" placeholder="e.g. value">
+              <datalist id="curl-records-fields"></datalist>
+              <span class="note" id="curl-records-note"></span>
+            </label>
           </div>
-          <div id="db-result" role="status"></div>
+          <div id="curl-first"></div>
+          <div class="table-wrap" id="curl-sample"></div>
+          <label class="field">Source name
+            <input type="text" id="curl-name" autocomplete="off" spellcheck="false">
+            <span class="note" id="curl-name-note"></span>
+          </label>
+          <div class="modes" id="curl-modes" role="radiogroup" aria-label="What to do with the data loaded before" hidden>
+            <label class="mode">
+              <span class="t"><input type="radio" name="curl-mode" value="replace" checked> Replace contents</span>
+              <span class="d">The table is rebuilt from this request. ET_id starts again at 1.</span>
+            </label>
+            <label class="mode">
+              <span class="t"><input type="radio" name="curl-mode" value="append"> Append rows</span>
+              <span class="d">Rows are added after what is there. ET_id continues.</span>
+            </label>
+          </div>
+          <button class="btn primary" id="curl-load" type="button" disabled>Load</button>
         </div>
+        <div id="curl-result" role="status"></div>
       </div>
-    </section>
 
-    <section class="card" aria-labelledby="sources-title">
-      <div class="card-head">
-        <h2 id="sources-title">Sources</h2>
-        <button class="btn small" id="refresh" type="button">Refresh</button>
+      <div class="or"><span>or a database</span></div>
+      <div class="gs">
+        <label class="field" for="db-conn">Connection string</label>
+        <textarea id="db-conn" spellcheck="false" autocomplete="off"
+          placeholder="Driver={ODBC Driver 18 for SQL Server};Server=tcp:yourserver.database.windows.net,1433;Database=yourdb;Uid=…;Pwd={…};Encrypt=yes;"></textarea>
+        <div><button class="btn" id="db-connect" type="button" disabled>Connect</button></div>
+        <p class="hint">An ODBC connection string (SQL Server, Azure SQL) or a URL such as
+          <code>postgresql://user:password@host:5432/db</code>. eyetable lists the tables and views; pick the ones to bring
+          in, each as its own source. The password goes only to your eyetable API and is stored encrypted.</p>
+        <div id="db-pick" hidden style="display:grid; gap:10px">
+          <div class="db-head" id="db-head"></div>
+          <div class="db-tools">
+            <input type="search" id="db-filter" placeholder="Filter by name or schema…" aria-label="Filter tables and views">
+            <select id="db-kind" aria-label="Show">
+              <option value="">Tables and views</option><option value="table">Tables</option><option value="view">Views</option>
+            </select>
+          </div>
+          <div class="table-wrap db-list" id="db-list"></div>
+          <div class="modes" id="db-modes" role="radiogroup" aria-label="What to do with tables loaded before" hidden>
+            <label class="mode">
+              <span class="t"><input type="radio" name="db-mode" value="replace" checked> Replace contents</span>
+              <span class="d">Ones loaded before are rebuilt from the database. ET_id starts again at 1.</span>
+            </label>
+            <label class="mode">
+              <span class="t"><input type="radio" name="db-mode" value="append"> Append rows</span>
+              <span class="d">Their rows are added after what is there. ET_id continues.</span>
+            </label>
+          </div>
+          <button class="btn primary" id="db-load" type="button" disabled>Load selected</button>
+        </div>
+        <div id="db-result" role="status"></div>
       </div>
-      <div class="card-body">
-        <div id="sources-msg" role="status"></div>
-        <div class="tag-filter" id="tag-filter" hidden></div>
-        <div class="table-wrap" id="sources"><div class="empty">Connect to see your sources.</div></div>
-      </div>
-    </section>
-  </div>
+    </div>
+  </section>
 
   <section class="card" aria-labelledby="groups-title">
     <div class="card-head">
@@ -613,23 +643,6 @@
     </div>
   </section>
 
-  <section class="card" id="detail" hidden aria-live="polite">
-    <div class="card-body">
-      <div class="detail-head">
-        <h2 id="detail-name"></h2>
-        <span class="tag" id="detail-type"></span>
-      </div>
-      <div class="stats" id="detail-stats"></div>
-      <div>
-        <h3 style="font-size:14px; margin:0 0 8px">First rows</h3>
-        <div class="table-wrap" id="detail-preview"></div>
-      </div>
-      <div>
-        <h3 style="font-size:14px; margin:0 0 8px">File history</h3>
-        <div class="table-wrap" id="detail-history"></div>
-      </div>
-    </div>
-  </section>
 </main>
 
 <section class="dock" id="dock" aria-label="Query window">
@@ -973,13 +986,13 @@
         : state.sources;
       var rows = shown.map(function (s) {
         var tr = el('tr', { class: 'clickable' + (s.name === state.selected ? ' selected' : ''), tabindex: '0' }, [
-          el('td', null, [el('strong', { text: s.name })]),
-          el('td', null, [tagsCell(s)]),
-          el('td', null, [el('span', { class: 'tag', text: typeLabel(s.type) })]),
-          el('td', { class: 'mono', text: s.table ? 'eyetable_raw.' + s.table : s.datasets + ' dataset(s)' }),
-          el('td', { class: 'num', text: s.table ? fmtInt(s.rows) : '—' }),
-          el('td', { text: s.last_upload ? s.last_upload.filename : '—' }),
-          el('td', { text: fmtTime(s.last_loaded_at || s.updated_at), title: s.last_loaded_at ? 'Last time data finished loading' : 'Not loaded yet' }),
+          el('td', { class: 'wrap', 'data-label': 'Source' }, [el('strong', { text: s.name })]),
+          el('td', { 'data-label': 'Tags' }, [tagsCell(s)]),
+          el('td', { 'data-label': 'Type' }, [el('span', { class: 'tag', text: typeLabel(s.type) })]),
+          el('td', { class: 'mono wrap', 'data-label': 'Table', text: s.table ? 'eyetable_raw.' + s.table : s.datasets + ' dataset(s)' }),
+          el('td', { class: 'num', 'data-label': 'Rows', text: s.table ? fmtInt(s.rows) : '—' }),
+          el('td', { class: 'wrap', 'data-label': 'Last file', text: s.last_upload ? s.last_upload.filename : '—' }),
+          el('td', { 'data-label': 'Last loaded', text: fmtTime(s.last_loaded_at || s.updated_at), title: s.last_loaded_at ? 'Last time data finished loading' : 'Not loaded yet' }),
           el('td', null, [reloadButton(s)])
         ]);
         var pick = function () { selectSource(s.name); };
@@ -987,7 +1000,7 @@
         tr.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); pick(); } });
         return tr;
       });
-      wrap.appendChild(el('table', null, [el('thead', null, [head]), el('tbody', null, rows)]));
+      wrap.appendChild(el('table', { class: 'sources-table' }, [el('thead', null, [head]), el('tbody', null, rows)]));
     }
 
     function selectSource(name) {
