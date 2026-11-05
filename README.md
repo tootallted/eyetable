@@ -186,6 +186,8 @@ Paste a connection string into **Connection string** and **Connect**:
 
 * ODBC, as SQL Server / Azure SQL give it to you:
   `Driver={ODBC Driver 18 for SQL Server};Server=tcp:x.database.windows.net,1433;Database=db;Uid=user;Pwd={secret};Encrypt=yes;`
+* JDBC for SQL Server, as the Azure portal gives it (`jdbc:` in front is optional):
+  `jdbc:sqlserver://x.database.windows.net:1433;database=db;user=user@x;password={secret};encrypt=true;trustServerCertificate=false;loginTimeout=30;`
 * or a URL: `postgresql://user:secret@host:5432/db`, `mysql+pymysql://…`
 
 eyetable lists every table and view the login can see (schema, name, type and

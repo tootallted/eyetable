@@ -11,6 +11,7 @@ locked out for a while.
 """
 
 import datetime as dt
+import logging
 import secrets
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -43,6 +44,7 @@ from eyetable.store import SourceNotFound
 
 DEFAULT_CORS_ORIGINS = ["https://tootallted.github.io"]
 DEFAULT_MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+log = logging.getLogger("eyetable.api")
 PAGES_DIR = Path(__file__).resolve().parents[2] / "docs"  # the GitHub Pages site, in a source checkout
 
 
@@ -185,7 +187,14 @@ def create_app(
                 wait = uploads_limit.hit(ip)
                 if wait:
                     return too_many(wait, "uploads")
-        response = await call_next(request)
+        try:
+            response = await call_next(request)
+        except Exception as exc:
+            # Answered here, inside CORS: a crash that reaches the server's own 500
+            # has no CORS headers, and the page can only say the API is unreachable.
+            log.exception("%s %s failed", request.method, request.url.path)
+            response = JSONResponse({"detail": f"eyetable hit an unexpected error ({type(exc).__name__}); "
+                                               "its log has the details"}, status_code=500)
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         response.headers.setdefault("Referrer-Policy", "no-referrer")
         if request.url.path.startswith("/api/"):

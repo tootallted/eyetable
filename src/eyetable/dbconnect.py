@@ -5,11 +5,15 @@ Accepted connection strings:
   * ODBC, e.g. SQL Server / Azure SQL:
       Driver={ODBC Driver 18 for SQL Server};Server=tcp:x.database.windows.net,1433;
       Database=db;Uid=user;Pwd={secret};Encrypt=yes;TrustServerCertificate=no;
-  * a SQLAlchemy URL, e.g. postgresql+psycopg://user:secret@host:5432/db
+  * JDBC for SQL Server, as the Azure portal gives it, with or without jdbc: in
+    front (it is turned into the ODBC form):
+      jdbc:sqlserver://x.database.windows.net:1433;database=db;user=u@x;password={secret};
+      encrypt=true;trustServerCertificate=false;loginTimeout=30;
+  * a URL, e.g. postgresql://user:secret@host:5432/db (a jdbc: prefix is fine)
 
-The password (Pwd=/Password= in ODBC, or the URL's) is taken out of the stored
-string and kept encrypted with EYETABLE_SECRET_KEY; it is put back only to
-open a connection. If the ODBC driver the string names isn't installed, the
+The password (Pwd=/Password= in ODBC and JDBC, or the URL's) is taken out of the
+stored string and kept encrypted with EYETABLE_SECRET_KEY; it is put back only
+to open a connection. If the ODBC driver the string names isn't installed, the
 nearest installed version of the same driver is used (e.g. 18 -> 17).
 
 Listing reads the database's own catalog (sys.objects + sys.partitions on SQL
@@ -17,6 +21,7 @@ Server, pg_class on Postgres, information schema elsewhere) so it is quick
 even for large databases; row counts are the database's estimates.
 """
 
+import fnmatch
 import re
 import urllib.parse
 from dataclasses import dataclass, field
@@ -31,6 +36,15 @@ from eyetable.identifiers import shorten, sanitize, source_name
 DATASET_KEY = "data"
 _PASSWORD_KEYS = {"pwd", "password"}
 _DRIVER_FAMILY = re.compile(r"^ODBC Driver (\d+) for SQL Server$", re.I)
+_DEFAULT_SQL_SERVER_DRIVER = "ODBC Driver 18 for SQL Server"
+_URL_DRIVERS = {"postgres": "postgresql+psycopg", "postgresql": "postgresql+psycopg",
+                "mysql": "mysql+pymysql", "mariadb": "mysql+pymysql"}
+_JDBC_TO_ODBC = {"database": "Database", "databasename": "Database", "user": "Uid", "username": "Uid", "password": "PWD",
+                 "encrypt": "Encrypt", "trustservercertificate": "TrustServerCertificate",
+                 "integratedsecurity": "Trusted_Connection", "authentication": "Authentication",
+                 "applicationintent": "ApplicationIntent"}
+_JDBC_HANDLED = {"servername", "server", "portnumber", "port", "instancename", "hostnameincertificate", "logintimeout"}
+_FORMATS = "Use an ODBC string, a JDBC sqlserver:// string, or a URL like postgresql://user:password@host:5432/db."
 
 
 class ConnectionError_(ValueError):
@@ -119,6 +133,33 @@ def installed_driver(requested: str) -> tuple[str, str | None]:
     )
 
 
+def parse_jdbc(text: str) -> tuple[list[tuple[str, str]], dict[str, Any], list[str]]:
+    """A sqlserver://host:port;key=value;... string as (ODBC pairs, extra config, warnings)."""
+    address, _, rest = text[len("sqlserver://"):].partition(";")
+    props = {k.lower(): v for k, v in parse_odbc(rest)}
+    address, _, port = address.partition(":")
+    host, _, instance = address.partition("\\")
+    host = host or props.get("servername") or props.get("server")
+    port = port or props.get("portnumber") or props.get("port")
+    instance = instance or props.get("instancename")
+    if not host:
+        raise ConnectionError_("the connection string has no server after sqlserver://")
+    server = host + (f"\\{instance}" if instance else "")
+    pairs = [("Driver", installed_driver(_DEFAULT_SQL_SERVER_DRIVER)[0]),
+             ("Server", f"tcp:{server},{port}" if port else server)]
+    for key, value in props.items():
+        if key in _JDBC_TO_ODBC:
+            pairs.append((_JDBC_TO_ODBC[key], {"true": "yes", "false": "no"}.get(value.lower(), value)))
+    # the certificate check against the server's own name already covers *.database.windows.net
+    certificate = props.get("hostnameincertificate")
+    if certificate and not fnmatch.fnmatch(host.lower(), certificate.lower()):
+        pairs.append(("HostNameInCertificate", certificate))
+    timeout = props.get("logintimeout", "")
+    extra = {"login_timeout": int(timeout)} if timeout.isdigit() and int(timeout) > 0 else {}
+    ignored = sorted(set(props) - set(_JDBC_TO_ODBC) - _JDBC_HANDLED)
+    return pairs, extra, [f"Ignored settings with no ODBC equivalent: {', '.join(ignored)}."] if ignored else []
+
+
 # -- prepared connections ---------------------------------------------------------------
 
 @dataclass
@@ -138,32 +179,38 @@ def prepare(text: str, secret_key: str | None) -> Prepared:
     text = (text or "").strip()
     if not text:
         raise ConnectionError_("paste a connection string")
-    if "://" in text.split(";")[0]:
+    text = re.sub(r"^jdbc:", "", text, flags=re.I)
+    jdbc = text.lower().startswith("sqlserver://")
+    warnings: list[str] = []
+    if "://" in text.split(";")[0] and not jdbc:
+        scheme, sep, rest = text.partition("://")
         try:
-            url = make_url(text)
+            url = make_url(_URL_DRIVERS.get(scheme.lower(), scheme) + sep + rest)
         except Exception as exc:
             raise ConnectionError_(f"that URL couldn't be read ({exc})") from None
-        password = url.password
+        query = dict(url.query)  # jdbc:postgresql://host/db?user=u&password=p
+        password = url.password or query.pop("password", None)
+        url = url.set(username=url.username or query.pop("user", None), query=query)
         # URL.set(password=None) means "unchanged", so drop it explicitly
         stored = url._replace(password=None).render_as_string(hide_password=False)
         config = {"url": stored}
         server = url.host or url.drivername
         database = url.database or ""
     else:
-        pairs = parse_odbc(text)
+        pairs, extra, warnings = parse_jdbc(text) if jdbc else (parse_odbc(text), {}, [])
         if not _get(pairs, "driver"):
             raise ConnectionError_("the connection string has no Driver={...}; or paste a URL like postgresql://…")
         password = _get(pairs, *_PASSWORD_KEYS)
         kept = [(k, v) for k, v in pairs if k.lower() not in _PASSWORD_KEYS]
-        config = {"odbc": build_odbc(kept)}
+        config = {"odbc": build_odbc(kept), **extra}
         server = re.sub(r"^tcp:", "", _get(pairs, "server", "address", "addr", "data source") or "?", flags=re.I)
         server = re.sub(r",\d+$", "", server)  # the port isn't worth showing
         database = _get(pairs, "database", "initial catalog") or ""
-    if password and re.fullmatch(r"\s*(your_password_here|<password>|\*+|password)\s*", password, re.I):
+    if password and re.fullmatch(r"\s*(your_password_here|<password>|\*+|x{3,}|password)\s*", password, re.I):
         raise ConnectionError_("the connection string still has a placeholder password; put the real one in")
     if password:
         config["password"] = encrypt_secret(password, secret_key)
-    return Prepared(config, password or None, server, database)
+    return Prepared(config, password or None, server, database, warnings)
 
 
 def make_engine(config: dict[str, Any], password: str | None = None, login_timeout: int = 20) -> tuple[sa.Engine, list[str]]:
@@ -182,13 +229,18 @@ def make_engine(config: dict[str, Any], password: str | None = None, login_timeo
         odbc = build_odbc(pairs)
         engine = sa.create_engine(
             "mssql+pyodbc:///?odbc_connect=" + urllib.parse.quote_plus(odbc),
-            connect_args={"timeout": login_timeout}, pool_pre_ping=True,
+            connect_args={"timeout": config.get("login_timeout", login_timeout)}, pool_pre_ping=True,
         )
         return engine, warnings
     url = make_url(config["url"])
     if password:
         url = url.set(password=password)
-    return sa.create_engine(url, pool_pre_ping=True), warnings
+    try:
+        return sa.create_engine(url, pool_pre_ping=True), warnings
+    except sa.exc.NoSuchModuleError:
+        raise ConnectionError_(f"eyetable doesn't know {url.drivername}:// connections. {_FORMATS}") from None
+    except ImportError as exc:
+        raise ConnectionError_(f"the {exc.name} driver for {url.drivername} isn't installed on the eyetable server") from None
 
 
 _NOISE = {"invalid connection string attribute", "login timeout expired"}
