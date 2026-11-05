@@ -196,6 +196,8 @@
     background: var(--surface); color: var(--text); font: 12.5px/1.5 var(--mono); }
   .curl-line { font-family: var(--mono); font-size: 12.5px; overflow-wrap: anywhere; }
   .curl-line .m { display: inline-block; padding: 0 6px; margin-right: 6px; border-radius: 4px; background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+  .cert-box summary { cursor: pointer; font-size: 13px; font-weight: 600; }
+  .cert-box .curl-settings { margin-top: 10px; }
   .curl-settings { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; }
   .curl-settings input { font-family: var(--mono); font-size: 12.5px; }
   .curl-settings .note { font-weight: 400; }
@@ -479,6 +481,41 @@
         <label class="field" for="curl-text">curl command</label>
         <textarea id="curl-text" spellcheck="false" autocomplete="off"
           placeholder="curl 'https://api.example.com/v1/orders?page=1&amp;per_page=100' -H 'Authorization: Bearer …'"></textarea>
+        <details class="cert-box" id="curl-cert-box">
+          <summary>Client certificate (if the API requires one)</summary>
+          <div class="curl-settings">
+            <label class="field">Host
+              <input type="text" id="curl-cert-host" autocomplete="off" spellcheck="false" placeholder="api.example.com">
+              <span class="note">The certificate is only sent here. Blank means the command's host; <code>*.example.com</code> works too.</span>
+            </label>
+            <label class="field">Port
+              <input type="number" id="curl-cert-port" min="1" max="65535" step="1" inputmode="numeric" placeholder="443">
+              <span class="note">Only if the API isn't on the usual port.</span>
+            </label>
+            <label class="field">PFX file
+              <input type="file" id="curl-cert-pfx" accept=".pfx,.p12">
+              <span class="note">A .pfx or .p12 holds the certificate and its key.</span>
+            </label>
+            <label class="field">CRT file
+              <input type="file" id="curl-cert-crt" accept=".crt,.pem,.cer">
+              <span class="note">Instead of a PFX: the certificate&hellip;</span>
+            </label>
+            <label class="field">KEY file
+              <input type="file" id="curl-cert-key" accept=".key,.pem">
+              <span class="note">&hellip;and its private key.</span>
+            </label>
+            <label class="field">Passphrase
+              <input type="password" id="curl-cert-pass" autocomplete="off">
+              <span class="note">Opens the file; it isn't stored.</span>
+            </label>
+            <label class="field">CA certificate file
+              <input type="file" id="curl-cert-ca" accept=".pem,.crt,.cer">
+              <span class="note">Optional: only if the API's own certificate comes from a private authority.</span>
+            </label>
+          </div>
+          <p class="hint">The certificate goes only to your eyetable API and is stored encrypted with the source, so
+            Reload and schedules use it without the file.</p>
+        </details>
         <div><button class="btn" id="curl-check" type="button" disabled>Check request</button></div>
         <p class="hint">Paste a curl command from your browser's dev tools (Copy as cURL), API docs or Postman.
           To load <strong>every page</strong>, include where to start and the page size, e.g.
@@ -2038,7 +2075,7 @@
 
 
     // -- curl commands ------------------------------------------------------------
-    var curlState = { plan: null, text: '', busy: false };
+    var curlState = { plan: null, text: '', busy: false, certFiles: {} };
 
     function curlName() { return $('curl-name').value.trim(); }
 
@@ -2080,13 +2117,48 @@
       $('curl-check').textContent = 'Checking…';
       renderCurlControls();
       api('/api/curl/inspect', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(Object.assign({ curl: text }, settings)) })
+        body: JSON.stringify(Object.assign({ curl: text }, settings, curlCertificate())) })
         .then(function (plan) {
           curlState.plan = plan;
           curlState.text = text;
           renderCurlPlan();
-        }, function (err) { out.appendChild(banner('err', err.message)); })
+        }, function (err) {
+          if (/certificate|passphrase|private key|PFX/i.test(err.message)) $('curl-cert-box').open = true;
+          out.appendChild(banner('err', err.message));
+        })
         .then(function () { curlState.busy = false; $('curl-check').textContent = 'Check request'; renderCurlControls(); });
+    }
+
+    var CERT_FILES = ['pfx', 'crt', 'key', 'ca'];
+
+    function curlCertificate() {
+      var files = curlState.certFiles;
+      if (!CERT_FILES.some(function (f) { return files[f]; })) return {};
+      return { certificate: Object.assign({
+        host: $('curl-cert-host').value.trim() || null,
+        port: parseInt($('curl-cert-port').value, 10) || null,
+        passphrase: $('curl-cert-pass').value || null
+      }, files) };
+    }
+
+    // A chosen file, as base64.
+    function readCertFile(name, file) {
+      delete curlState.certFiles[name];
+      curlState.plan = null;
+      $('curl-plan').hidden = true;
+      renderCurlControls();
+      if (!file) return;
+      file.arrayBuffer().then(function (buffer) {
+        var binary = '';
+        new Uint8Array(buffer).forEach(function (b) { binary += String.fromCharCode(b); });
+        curlState.certFiles[name] = btoa(binary);
+      });
+    }
+
+    function clearCertificate() {
+      curlState.certFiles = {};
+      CERT_FILES.forEach(function (f) { $('curl-cert-' + f).value = ''; });
+      ['host', 'port', 'pass'].forEach(function (f) { $('curl-cert-' + f).value = ''; });
     }
 
     function fillOptions(list, items) {
@@ -2104,6 +2176,8 @@
       var row = function (k, v) { dl.appendChild(el('dt', { text: k })); dl.appendChild(el('dd', { text: v })); };
       p.headers.forEach(function (h) { row(h.name, h.value); });
       if (p.secrets) row('Secrets', p.secrets + ' value' + (p.secrets === 1 ? '' : 's') + ' (shown as ••••••) will be stored encrypted');
+      if (p.certificate) row('Certificate', p.certificate.subject + ' for ' + p.certificate.host + (p.certificate.port ? ':' + p.certificate.port : '') +
+        ', expires ' + fmtTime(p.certificate.expires) + ' (will be stored encrypted)');
       $('curl-all-pages').checked = !!p.pagination;
       $('curl-all-pages').disabled = !p.pagination;
       $('curl-paging').textContent = p.paging_text;
@@ -2141,13 +2215,14 @@
       renderCurlControls();
       var out = clear($('curl-result'));
       api('/api/curl', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(Object.assign({ curl: curlState.text, name: name, mode: mode, all_pages: $('curl-all-pages').checked }, curlSettings())) })
+        body: JSON.stringify(Object.assign({ curl: curlState.text, name: name, mode: mode, all_pages: $('curl-all-pages').checked }, curlSettings(), curlCertificate())) })
         .then(function (r) { return pollJob(r.job_id, function (job) {
           $('curl-load').textContent = 'Loading… (' + Math.round((Date.now() - Date.parse(job.started_at)) / 1000) + ' s)';
         }); })
         .then(function (job) {
           if (job.status !== 'succeeded') throw new Error(job.error || 'the load failed');
           out.appendChild(banner('ok', plural(job.result.rows, 'row') + ' loaded into ' + name + ' (eyetable_raw.' + job.result.source.table + ').'));
+          clearCertificate();
           curlState.plan = null;
           $('curl-plan').hidden = true;
           state.selected = name;
@@ -2171,6 +2246,9 @@
     }
 
     $('curl-text').addEventListener('input', function () { curlState.plan = null; $('curl-plan').hidden = true; renderCurlControls(); });
+    CERT_FILES.forEach(function (name) {
+      $('curl-cert-' + name).addEventListener('change', function (e) { readCertFile(name, e.target.files[0]); });
+    });
     ['curl-page-size', 'curl-next-field', 'curl-records-field'].forEach(function (id) {
       $(id).addEventListener('change', function () { if (curlState.plan) checkCurl(true); });
       $(id).addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); $(id).blur(); } });

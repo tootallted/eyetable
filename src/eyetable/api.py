@@ -10,6 +10,7 @@ each client IP is rate limited, and an IP that keeps sending wrong tokens is
 locked out for a while.
 """
 
+import base64
 import datetime as dt
 import logging
 import secrets
@@ -39,6 +40,7 @@ from eyetable.google_auth import GoogleAuthError, GoogleConnection
 from eyetable.groups import GroupRunner
 from eyetable.ratelimit import SlidingWindow, client_ip
 from eyetable.schedule import ScheduleError, describe, next_runs, normalize
+from eyetable.tls import client_cert
 from eyetable.store import GroupNotFound
 from eyetable.store import SourceNotFound
 
@@ -79,16 +81,38 @@ class TagsIn(BaseModel):
     tags: list[str] = Field(max_length=30)
 
 
+class CertificateIn(BaseModel):
+    """A client certificate, as Postman's certificate form has it; files are base64."""
+    host: str | None = Field(default=None, max_length=255)
+    port: int | None = Field(default=None, ge=1, le=65535)
+    pfx: str | None = Field(default=None, max_length=300_000)
+    crt: str | None = Field(default=None, max_length=300_000)
+    key: str | None = Field(default=None, max_length=300_000)
+    ca: str | None = Field(default=None, max_length=300_000)
+    passphrase: str | None = Field(default=None, max_length=1000)
+
+    def read(self) -> dict[str, Any]:
+        def file(value: str | None) -> bytes | None:
+            return base64.b64decode(value, validate=True) if value else None
+
+        return client_cert(file(self.pfx), file(self.crt), file(self.key), file(self.ca),
+                           self.passphrase, self.host, self.port)
+
+
 class CurlIn(BaseModel):
     curl: str = Field(min_length=1, max_length=100_000)
     all_pages: bool = True
     page_size: int | None = Field(default=None, ge=1, le=1_000_000)  # the API's fixed rows per page
     next_field: str | None = Field(default=None, max_length=200)  # where the next-page link is
     records_field: str | None = Field(default=None, max_length=200)  # where the rows are
+    certificate: CertificateIn | None = None
 
     def paging(self) -> dict[str, Any]:
         return {"all_pages": self.all_pages, "page_size": self.page_size,
                 "next_field": self.next_field, "records_field": self.records_field}
+
+    def client_certificate(self) -> dict[str, Any] | None:
+        return self.certificate.read() if self.certificate else None
 
 
 class CurlLoadIn(CurlIn):
@@ -461,7 +485,8 @@ def create_app(
     def inspect_curl(body: CurlIn) -> dict[str, Any]:
         """Check a curl command: send it once, show its first page and how it pages. Saves nothing."""
         try:
-            result, _ = curl_plan(body.curl, engine.secret_key, client=curl_client, **body.paging())
+            result, _ = curl_plan(body.curl, engine.secret_key, client=curl_client,
+                                  certificate=body.client_certificate(), **body.paging())
         except (ValueError, KeyError) as exc:
             raise HTTPException(400, str(exc).strip("'\"")) from None
         out = jsonable_encoder(result)
@@ -479,11 +504,13 @@ def create_app(
             raise HTTPException(409, f"{body.name!r} is already a {store.get_source(body.name).type} source; pick another name")
         try:
             parse_curl(body.curl)
+            certificate = body.client_certificate()
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from None
 
         def work() -> dict[str, Any]:
-            results = engine.load_curl(body.curl, body.name, body.mode, client=curl_client, **body.paging())
+            results = engine.load_curl(body.curl, body.name, body.mode, client=curl_client,
+                                       certificate=certificate, **body.paging())
             failed = [r for r in results if r.status != "succeeded"]
             if failed:
                 raise RuntimeError("; ".join(r.error or r.status for r in failed))

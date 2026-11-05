@@ -11,6 +11,7 @@ Config:
      "allow_methods": ["POST"],                 # beyond GET, opt in explicitly
      "probe": true,                             # GET each request during discovery
      "timeout": 30,
+     "client_cert": {"pem": "...", "host": "api.example.com"},  # for APIs that require one (see eyetable.tls)
      "pagination": {"Users/List users": {"type": "page", "size_param": "per_page", "size": 100}}}
 
 Pagination is per request; see `pagination_settings` for each strategy's
@@ -44,6 +45,7 @@ import httpx
 from eyetable.connectors.base import Connector, Record
 from eyetable.credentials import env_ref
 from eyetable.identifiers import sanitize
+from eyetable.tls import mounts
 from eyetable.models import ColumnInfo, DatasetInfo
 from eyetable.types import infer_columns
 
@@ -396,7 +398,10 @@ class PostmanConnector(Connector):
                 self.pagination[key] = pagination_settings(spec)
             except ValueError as exc:
                 raise ValueError(f"pagination for {key!r}: {exc}") from None
-        self._client = client or httpx.Client(timeout=config.get("timeout", 30), follow_redirects=True)
+        self._client = client or httpx.Client(
+            timeout=config.get("timeout", 30), follow_redirects=True,
+            mounts=mounts(config["client_cert"]) if config.get("client_cert") else None,
+        )
 
     def close(self) -> None:
         self._client.close()

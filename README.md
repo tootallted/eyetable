@@ -245,6 +245,15 @@ and loads it in the background; the result appears when it's done.
   headers and query parameters, and `-u` passwords become `{{secret_N}}`
   values stored encrypted with `EYETABLE_SECRET_KEY`; only the masked form is
   ever shown.
+* **Client certificates.** For an API that requires one, open **Client
+  certificate** under the command before **Check request**. The fields match
+  Postman's: **Host** and **Port** (blank means the command's host), a **PFX
+  file** or **CRT** and **KEY files**, and the **Passphrase**, plus an optional
+  **CA certificate file** for an API whose own certificate comes from a private
+  authority. The certificate is only sent to that host, and is stored encrypted
+  with the source, so **Reload** and schedules use it without the file; the
+  passphrase isn't kept. Loading the same source from a new command needs the
+  file again.
 * Understood: `-X`, `-H`, `-d`/`--data*`, `--data-urlencode`, `--json`, `-G`,
   `-u`, `-b`, `-A`, `-e`, `--url`, `--oauth2-bearer`; flags like `-s -L -k
   --compressed` are ignored. Not loadable: `-F` uploads, `-d @file`, `-I`.

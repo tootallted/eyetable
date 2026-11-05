@@ -8,7 +8,8 @@ the same connector, so headers, bodies, auth and pagination work the same.
 Secrets in the command (Authorization and Cookie headers, API-key-like
 headers and query parameters, -u passwords) are pulled out into
 {{secret_N}} variables whose values are stored encrypted with
-EYETABLE_SECRET_KEY, and are shown masked.
+EYETABLE_SECRET_KEY, and are shown masked. A client certificate, for APIs
+that require one, is given alongside the command (see eyetable.tls).
 
 Paging is learned from the command: a page-number parameter (page=1), with
 or without a page size (per_page=100), means "every page, that many per
@@ -45,10 +46,12 @@ from eyetable.connectors.postman import (
 )
 from eyetable.credentials import encrypt_secret
 from eyetable.identifiers import sanitize, source_name
+from eyetable.tls import covers, describe
 from eyetable.types import infer_columns
 
 REQUEST_NAME = "data"  # one request, so the table is <source>__data
 MASK = "••••••"
+CERT_OPTION_NOTE = "A certificate in the command isn't read from disk; choose the file under Client certificate instead."
 
 
 class CurlError(ValueError):
@@ -83,6 +86,7 @@ _VALUE_OPTIONS = {
     "-o": None, "--output": None, "-m": None, "--max-time": None, "--connect-timeout": None, "--retry": None,
     "-w": None, "--write-out": None, "--cacert": None, "--cert": None, "-E": None, "--key": None,
     "-x": None, "--proxy": None, "--resolve": None, "-r": None, "--range": None, "-T": None, "--upload-file": None,
+    "--cert-type": None, "--key-type": None, "--pass": None,
 }
 _FLAGS = {
     "-s", "--silent", "-S", "--show-error", "-L", "--location", "-k", "--insecure", "-i", "--include", "-v",
@@ -180,6 +184,8 @@ def parse_curl(text: str) -> CurlRequest:
                 raise CurlError("multipart form uploads (-F) aren't supported for loading data")
             elif arg in ("-x", "--proxy"):
                 warnings.append("the proxy setting (-x) is ignored")
+            elif arg in ("--cert", "-E", "--key") and CERT_OPTION_NOTE not in warnings:
+                warnings.append(CERT_OPTION_NOTE)
             continue
         if arg.startswith("-") and arg != "-":
             warnings.append(f"ignored option {arg}")
@@ -261,7 +267,8 @@ def build_collection(req: CurlRequest) -> tuple[dict[str, Any], dict[str, str]]:
     parts, query = _split_query(req.url)
     query = [(k, vault.hide(v) if _secret_param(k) and v else v) for k, v in query]
     # keep {{...}} readable in the stored URL
-    raw = urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(query, safe="{}")))
+    # quote, not quote_plus: a space stays %20, which is all that some APIs (OData filters) accept
+    raw = urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(query, safe="{}", quote_via=urllib.parse.quote)))
     headers = [{"key": k, "value": vault.hide(v) if _secret_header(k) and v else v} for k, v in req.headers]
     request: dict[str, Any] = {"method": req.method, "header": headers, "url": raw}
     if req.body is not None:
@@ -526,10 +533,14 @@ class CurlPlan:
     records_field: str | None = None  # the rows' field, given or found
     link_fields: list[dict[str, str]] = field(default_factory=list)  # fields holding links, to pick from
     list_fields: list[dict[str, Any]] = field(default_factory=list)  # fields holding lists, to pick from
+    certificate: dict[str, Any] | None = None  # the client certificate used: who it says we are, for where, until when
 
 
-def prepare(text: str, secret_key: str | None) -> tuple[CurlRequest, dict[str, Any], dict[str, str]]:
-    """Parse a command into (request, stored config with encrypted secrets, plain secrets)."""
+def prepare(text: str, secret_key: str | None, certificate: dict[str, Any] | None = None) -> tuple[CurlRequest, dict[str, Any], dict[str, str]]:
+    """Parse a command into (request, stored config with encrypted secrets, plain secrets).
+
+    A `certificate` with no host (see eyetable.tls) is given the command's.
+    """
     req = parse_curl(text)
     collection, secrets = build_collection(req)
     config: dict[str, Any] = {
@@ -539,19 +550,31 @@ def prepare(text: str, secret_key: str | None) -> tuple[CurlRequest, dict[str, A
     }
     if req.method != "GET":
         config["allow_methods"] = [req.method]
+    if certificate:
+        certificate["host"] = certificate["host"] or urllib.parse.urlsplit(req.url).hostname
+        if not covers(certificate, req.url):
+            where = certificate["host"] + (f":{certificate['port']}" if certificate["port"] else "")
+            raise CurlError(f"the certificate is set for {where}, but the command calls {urllib.parse.urlsplit(req.url).netloc}")
+        config["client_cert"] = {
+            **certificate,
+            "pem": encrypt_secret(certificate["pem"], secret_key),
+            "ca": encrypt_secret(certificate["ca"], secret_key) if certificate["ca"] else None,
+        }
     return req, config, secrets
 
 
-def probe(req: CurlRequest, config: dict[str, Any], secrets: dict[str, str],
-          client: httpx.Client | None = None) -> tuple[httpx.Response, Any, list[dict[str, Any]]]:
+def probe(req: CurlRequest, config: dict[str, Any], secrets: dict[str, str], client: httpx.Client | None = None,
+          certificate: dict[str, Any] | None = None) -> tuple[httpx.Response, Any, list[dict[str, Any]]]:
     """Send the request once: (response, parsed body, records)."""
-    connector = CurlConnector({**config, "variables": dict(secrets)}, client=client)
+    connector = CurlConnector({**config, "variables": dict(secrets), "client_cert": certificate}, client=client)
     try:
         request = connector.requests[REQUEST_NAME]
         response = connector._send(connector._build(request))
     except httpx.HTTPStatusError as exc:
         raise CurlError(f"the API answered {exc.response.status_code} {exc.response.reason_phrase}") from None
     except httpx.HTTPError as exc:
+        if "CERTIFICATE_REQUIRED" in str(exc).upper():
+            raise CurlError("this API requires a client certificate; add it under Client certificate and check again") from None
         raise CurlError(f"couldn't reach the API ({type(exc).__name__}: {exc})") from None
     finally:
         if client is None:
@@ -561,17 +584,20 @@ def probe(req: CurlRequest, config: dict[str, Any], secrets: dict[str, str],
 
 
 def plan(text: str, secret_key: str | None, client: httpx.Client | None = None, *, all_pages: bool = True,
-         page_size: int | None = None, next_field: str | None = None,
-         records_field: str | None = None) -> tuple[CurlPlan, dict[str, Any]]:
+         page_size: int | None = None, next_field: str | None = None, records_field: str | None = None,
+         certificate: dict[str, Any] | None = None) -> tuple[CurlPlan, dict[str, Any]]:
     """Check a command: what it requests, how it pages, and what its first page holds."""
-    req, config, secrets = prepare(text, secret_key)
-    response, payload, _ = probe(req, config, secrets, client)
+    req, config, secrets = prepare(text, secret_key, certificate)
+    response, payload, _ = probe(req, config, secrets, client, certificate)
     paging = settle(req, config, response, payload, all_pages=all_pages, page_size=page_size,
                     next_field=next_field, records_field=records_field)
     records = paging.records
     warnings = list(req.warnings) + paging.warnings
     if req.method != "GET":
         warnings.append(f"This is a {req.method} request; eyetable sends it again every time the source loads.")
+    identity = {**describe(certificate["pem"]), "host": certificate["host"], "port": certificate["port"]} if certificate else None
+    if identity and identity["expired"]:
+        warnings.append(f"The client certificate expired on {identity['expires']:%B %d, %Y}.")
     kinds = infer_columns(records)
     stored = config["collection"]["item"][0]["request"]
     result = CurlPlan(
@@ -591,5 +617,6 @@ def plan(text: str, secret_key: str | None, client: httpx.Client | None = None, 
         records_field=paging.records_field,
         link_fields=link_fields(payload),
         list_fields=list_fields(payload),
+        certificate=identity,
     )
     return result, config

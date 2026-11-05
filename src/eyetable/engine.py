@@ -249,6 +249,7 @@ class Engine:
         page_size: int | None = None,
         next_field: str | None = None,
         records_field: str | None = None,
+        certificate: dict[str, Any] | None = None,
     ) -> list[RunResult]:
         """Make (or update) source `name` from a curl command and load it.
 
@@ -256,7 +257,8 @@ class Engine:
         the source is saved with its secrets encrypted, and every page is loaded.
         `page_size` (the API's fixed rows per page), `next_field` (where the
         next-page link is) and `records_field` (where the rows are) override
-        what the first response suggests, and are kept for reloads.
+        what the first response suggests, and are kept for reloads, as is
+        `certificate`, a client certificate (see eyetable.tls.client_cert).
         A source loaded before keeps its name and is replaced or appended to.
         """
         from eyetable import curl
@@ -268,8 +270,8 @@ class Engine:
         existing = self.store.get_source(name) if self.store.source_exists(name) else None
         if existing and existing.type != "curl":
             raise ValueError(f"{name!r} is already a {existing.type} source; pick another name")
-        req, config, secrets = curl.prepare(text, self.secret_key)
-        response, payload, _ = curl.probe(req, config, secrets, client)
+        req, config, secrets = curl.prepare(text, self.secret_key, certificate)
+        response, payload, _ = curl.probe(req, config, secrets, client, certificate)
         curl.settle(req, config, response, payload, all_pages=all_pages, page_size=page_size,
                     next_field=next_field, records_field=records_field)
         self.store.save_source(name, "curl", config)
