@@ -82,15 +82,22 @@
   #top-msg:empty { display: none; }
 
   main { padding: 24px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 20px; }
-  main > * { width: 100%; max-width: 1240px; justify-self: center; }
-  main > .full { max-width: none; }  /* tables of records use the whole page */
   @media (max-width: 900px) { main { padding: 16px; } header.top { padding: 12px 16px; } }
 
   .card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; box-shadow: var(--shadow); min-width: 0; }
   .card > h2, .card-head { margin: 0; padding: 16px 20px 0; }
   .card h2 { font-size: 16px; }
   .card-head { display: flex; align-items: center; gap: 12px; }
-  .card-head h2 { padding: 0; margin-right: auto; }
+  .card-head h2 { padding: 0; margin: 0 auto 0 0; }
+  .fold { display: inline-flex; align-items: center; gap: 8px; padding: 0; border: 0; background: none; cursor: pointer;
+    text-align: left; min-width: 0; overflow-wrap: anywhere; }
+  .fold .tri { flex: none; border-left: 5px solid transparent; border-right: 5px solid transparent;
+    border-top: 7px solid var(--muted); transition: transform .15s; }
+  .fold:hover .tri { border-top-color: var(--accent); }
+  .fold[aria-expanded=false] .tri { transform: rotate(-90deg); }
+  @media (prefers-reduced-motion: reduce) { .fold .tri { transition: none; } }
+  .folded > .card-body, .folded .card-head .btn { display: none; }
+  .folded > h2, .folded > .card-head { padding-bottom: 16px; }
   .card-body { padding: 16px 20px 20px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; }
   .card-body > * { min-width: 0; }
   .hint { color: var(--muted); font-size: 13px; margin: 0; }
@@ -280,8 +287,7 @@
   .tag { display: inline-block; padding: 1px 8px; border-radius: 999px; background: var(--surface-2); border: 1px solid var(--border); font-size: 12px; color: var(--muted); }
   .empty { padding: 28px 16px; text-align: center; color: var(--muted); }
 
-  .detail-head { display: flex; gap: 12px; align-items: baseline; flex-wrap: wrap; }
-  .detail-head h2 { margin: 0; font-size: 18px; }
+  #detail .card-head h2 { margin: 0; min-width: 0; font-size: 18px; }
   .stats { display: flex; gap: 24px; flex-wrap: wrap; }
   .stat .k { font-size: 12px; color: var(--muted); }
   .stat .v { font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; }
@@ -382,9 +388,9 @@
     </div>
   </section>
 
-  <section class="card" aria-labelledby="load-title">
-    <h2 id="load-title">Load data</h2>
-    <div class="card-body">
+  <section class="card" data-fold="load" aria-labelledby="load-title">
+    <h2 id="load-title"><button class="fold" type="button" aria-expanded="true" aria-controls="load-body"><span class="tri"></span>Load data</button></h2>
+    <div class="card-body" id="load-body">
       <label class="drop" id="drop">
         <input type="file" id="file-input" accept=".csv,text/csv">
         <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 16V4M7 9l5-5 5 5"/><path d="M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3"/></svg>
@@ -555,24 +561,24 @@
     </div>
   </section>
 
-  <section class="card full" aria-labelledby="sources-title">
+  <section class="card" data-fold="sources" aria-labelledby="sources-title">
     <div class="card-head">
-      <h2 id="sources-title">Sources</h2>
+      <h2 id="sources-title"><button class="fold" type="button" aria-expanded="true" aria-controls="sources-body"><span class="tri"></span>Sources</button></h2>
       <button class="btn small" id="refresh" type="button">Refresh</button>
     </div>
-    <div class="card-body">
+    <div class="card-body" id="sources-body">
       <div id="sources-msg" role="status"></div>
       <div class="tag-filter" id="tag-filter" hidden></div>
       <div class="table-wrap" id="sources"><div class="empty">Connect to see your sources.</div></div>
     </div>
   </section>
 
-  <section class="card full" id="detail" hidden aria-live="polite">
-    <div class="card-body">
-      <div class="detail-head">
-        <h2 id="detail-name"></h2>
-        <span class="tag" id="detail-type"></span>
-      </div>
+  <section class="card" id="detail" data-fold="detail" hidden aria-live="polite">
+    <div class="card-head">
+      <h2><button class="fold" type="button" aria-expanded="true" aria-controls="detail-body"><span class="tri"></span><span id="detail-name"></span></button></h2>
+      <span class="tag" id="detail-type"></span>
+    </div>
+    <div class="card-body" id="detail-body">
       <div class="stats" id="detail-stats"></div>
       <div>
         <h3 style="font-size:14px; margin:0 0 8px">First rows</h3>
@@ -585,12 +591,12 @@
     </div>
   </section>
 
-  <section class="card" aria-labelledby="groups-title">
+  <section class="card" data-fold="groups" aria-labelledby="groups-title">
     <div class="card-head">
-      <h2 id="groups-title">Groups</h2>
+      <h2 id="groups-title"><button class="fold" type="button" aria-expanded="true" aria-controls="groups-body"><span class="tri"></span>Groups</button></h2>
       <button class="btn small" id="group-new" type="button" disabled>New group</button>
     </div>
-    <div class="card-body">
+    <div class="card-body" id="groups-body">
       <p class="hint">Put sources that belong together in a group, then reload them all with one click, or on a schedule
         (for example every day at 6:00 AM, or every hour from 8:00 AM to 5:00 PM on weekdays). Or click a tag to reload
         every source that has it.</p>
@@ -1005,7 +1011,7 @@
           el('td', { 'data-label': 'Last loaded', text: fmtTime(s.last_loaded_at || s.updated_at), title: s.last_loaded_at ? 'Last time data finished loading' : 'Not loaded yet' }),
           el('td', null, [reloadButton(s)])
         ]);
-        var pick = function () { selectSource(s.name); };
+        var pick = function () { unfold('detail'); selectSource(s.name); };
         tr.addEventListener('click', pick);
         tr.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); pick(); } });
         return tr;
@@ -1707,6 +1713,7 @@
     }
 
     function openEditor(g) {
+      unfold('groups');
       var e = defaultEditing();
       if (g) {
         e.id = g.id; e.name = g.name; e.members = g.members.slice(); e.enabled = g.enabled;
@@ -2456,6 +2463,25 @@
     $('gs-load').addEventListener('click', loadSheet);
     initGoogle();
 
+    // -- collapsing sections ------------------------------------------------
+    var KEY_FOLDED = 'eyetable.folded';
+    var folded = read('localStorage', KEY_FOLDED).split(',').filter(Boolean);
+
+    function setFolded(section, fold) {
+      var name = section.getAttribute('data-fold');
+      section.classList.toggle('folded', fold);
+      section.querySelector('.fold').setAttribute('aria-expanded', String(!fold));
+      folded = folded.filter(function (n) { return n !== name; }).concat(fold ? [name] : []);
+      write('localStorage', KEY_FOLDED, folded.join(','));
+    }
+
+    function unfold(name) { setFolded(document.querySelector('[data-fold=' + name + ']'), false); }
+
+    document.querySelectorAll('[data-fold]').forEach(function (section) {
+      section.querySelector('.fold').addEventListener('click', function () { setFolded(section, !section.classList.contains('folded')); });
+      if (folded.indexOf(section.getAttribute('data-fold')) >= 0) setFolded(section, true);
+    });
+
     // -- wiring ------------------------------------------------------------
     var drop = $('drop');
     $('file-input').addEventListener('change', function (e) { if (e.target.files[0]) stage(e.target.files[0]); });
@@ -2473,12 +2499,14 @@
       if (!e.dataTransfer) return;
       if (e.dataTransfer.files.length) {
         e.preventDefault();
+        unfold('load');
         stage(e.dataTransfer.files[0]);
         return;
       }
       var text = (e.dataTransfer.getData('text/uri-list') || e.dataTransfer.getData('text/plain') || '').split(/\s+/)[0];
       if (SHEET_LINK.test(text)) {
         e.preventDefault();
+        unfold('load');
         $('gs-url').value = text;
         $('gs-url').scrollIntoView({ block: 'center', behavior: 'smooth' });
         checkSheet();
