@@ -46,6 +46,7 @@ from eyetable.connectors.base import Connector, Record
 from eyetable.credentials import env_ref
 from eyetable.identifiers import sanitize
 from eyetable.tls import mounts
+from eyetable.xmldata import XmlDocument, parse_xml, type_columns
 from eyetable.models import ColumnInfo, DatasetInfo
 from eyetable.types import infer_columns
 
@@ -223,6 +224,8 @@ def flatten(record: dict, sep: str = "__", prefix: str = "", depth: int = 3) -> 
 
 def records_path(obj: Any) -> str | None:
     """Dotted path of the list of rows in a response, when it isn't the whole response."""
+    if isinstance(obj, XmlDocument):
+        return obj.rows_path()
     if not isinstance(obj, dict):
         return None
     for key in _RECORD_KEYS:
@@ -256,21 +259,38 @@ def dig(payload: Any, path: str) -> Any:
 
 
 def extract_records(payload: Any, path: str | None = None) -> list[Record]:
+    xml = isinstance(payload, XmlDocument)
     if path:
-        payload = dig(payload, path)
+        try:
+            payload = dig(payload, path)
+        except (KeyError, IndexError, TypeError, ValueError):
+            if xml:  # XML leaves out what it has nothing for: no rows today
+                return []
+            raise
     elif isinstance(payload, dict):
         payload = _find_records(payload)
+    if xml and isinstance(payload, list):
+        payload = [x for x in payload if x is not None]  # an empty element is no row
+    if payload is None or payload == {}:
+        return []
     if isinstance(payload, dict):
-        return [flatten(payload)]
-    if isinstance(payload, list):
-        return [flatten(x) if isinstance(x, dict) else {"value": x} for x in payload]
-    return [{"value": payload}]
+        records = [flatten(payload)]
+    elif isinstance(payload, list):
+        records = [flatten(x) if isinstance(x, dict) else {"value": x} for x in payload]
+    else:
+        records = [{"value": payload}]
+    return type_columns(records) if xml else records
 
 
 def parse_response(response: httpx.Response) -> Any:
     content_type = response.headers.get("content-type", "")
     if "csv" in content_type:
         return list(csv.DictReader(io.StringIO(response.text)))
+    if "xml" in content_type or response.content.lstrip(b"\xef\xbb\xbf \t\r\n").startswith(b"<?xml"):
+        try:
+            return parse_xml(response.content)
+        except ValueError:
+            pass
     try:
         return response.json()
     except ValueError:

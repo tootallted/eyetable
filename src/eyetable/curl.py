@@ -47,6 +47,7 @@ from eyetable.connectors.postman import (
 from eyetable.credentials import encrypt_secret
 from eyetable.identifiers import sanitize, source_name
 from eyetable.tls import covers, describe
+from eyetable.xmldata import XmlDocument
 from eyetable.types import infer_columns
 
 REQUEST_NAME = "data"  # one request, so the table is <source>__data
@@ -466,7 +467,9 @@ def settle(req: CurlRequest, config: dict[str, Any], response: httpx.Response | 
         try:
             dig(payload, records_field)
         except (KeyError, IndexError, TypeError, ValueError):
-            raise CurlError(f"the response has no {records_field} field for the rows") from None
+            if not isinstance(payload, XmlDocument):
+                raise CurlError(f"the response has no {records_field} field for the rows") from None
+            warnings.append(f"The first response has no {records_field}, so it has no rows; later ones may.")
         config["records_path"] = {REQUEST_NAME: records_field}
     else:
         config.pop("records_path", None)

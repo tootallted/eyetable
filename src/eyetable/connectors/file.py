@@ -78,7 +78,7 @@ _CONVERSIONS = (
 )
 
 
-def _column_converter(values: list[str]):
+def column_converter(values: list[str]):
     present = [v for v in values if v != ""]
     if not present:
         return None
@@ -106,7 +106,7 @@ def parse_csv(content: bytes, delimiter: str | None = None) -> tuple[list[str], 
     headers = unique_headers(raw_header, width)
 
     columns = [[r[i] if i < len(r) else "" for r in body] for i in range(width)]
-    converters = [_column_converter(col) for col in columns]
+    converters = [column_converter(col) for col in columns]
     records = []
     for r in range(len(body)):
         record: Record = {}

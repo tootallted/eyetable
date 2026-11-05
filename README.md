@@ -245,6 +245,15 @@ and loads it in the background; the result appears when it's done.
   headers and query parameters, and `-u` passwords become `{{secret_N}}`
   values stored encrypted with `EYETABLE_SECRET_KEY`; only the masked form is
   ever shown.
+* **JSON, CSV or XML.** An XML response becomes a table too: the repeating
+  element is the rows, its child elements and attributes are the columns
+  (`<Total currency="USD">12</Total>` gives `total_currency` and `total_value`),
+  and nested elements become prefixed columns (`supplier_name`). Namespaces are
+  ignored. Numbers, dates and true/false become real column types where every
+  value fits; codes with leading zeros stay text. Elements that repeat inside a
+  row, like line items, stay together as JSON in one column. If eyetable picks
+  the wrong element, or a response can have just one, set **Rows field** (e.g.
+  `Invoices.Invoice`); a day with nothing to return then loads no rows.
 * **Client certificates.** For an API that requires one, open **Client
   certificate** under the command before **Check request**. The fields match
   Postman's: **Host** and **Port** (blank means the command's host), a **PFX
