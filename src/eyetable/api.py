@@ -275,7 +275,26 @@ def create_app(
         for source, tags in store.tags_by_source().items():
             for tag in tags:
                 by_tag.setdefault(tag, []).append(source)
-        return [{"tag": t, "sources": sorted(by_tag.get(t, []))} for t, _ in store.all_tags()]
+        last_runs = store.last_tag_runs()
+        return jsonable_encoder([
+            {"tag": t, "sources": sorted(by_tag.get(t, [])), "running": groups.is_running(f"#{t}"), "last_run": last_runs.get(t)}
+            for t, _ in store.all_tags()
+        ])
+
+    @app.post("/api/tags/{tag}/run", dependencies=auth, status_code=202)
+    def run_tag(tag: str, body: ReloadIn | None = None) -> dict[str, Any]:
+        """Start reloading every source with the tag; poll /api/group-runs/{run_id} for progress."""
+        try:
+            tag = normalize_tag(tag)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from None
+        try:
+            run_id = groups.run_tag(tag, google_token=body.google_token if body else None)
+        except LookupError as exc:
+            raise HTTPException(404, str(exc).strip("'\"")) from None
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from None
+        return {"run_id": run_id}
 
     @app.get("/api/sources/{name}", dependencies=auth)
     def source_detail(name: str) -> dict[str, Any]:

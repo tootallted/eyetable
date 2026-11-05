@@ -5,6 +5,9 @@ and records the outcome per source in eyetable.group_runs, updating it after
 every source so the page can show progress. A run happens in a background
 worker, one at a time, so a long group never holds up a web request.
 
+A tag can be run the same way without a saved group: every source that has
+the tag at that moment is reloaded.
+
 The scheduler is a thread inside `eyetable serve`. Every 30 seconds it looks
 for enabled groups whose next run time has passed, moves each to its next
 slot (atomically, so a group can't be started twice), and runs it. If the
@@ -53,7 +56,7 @@ class GroupRunner:
         self.clock = clock
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="eyetable-group")
         self._lock = threading.Lock()
-        self._active: set[int] = set()
+        self._active: set[int | str] = set()  # group ids, and "#tag" for a tag run on its own
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -125,33 +128,45 @@ class GroupRunner:
 
     # -- running -----------------------------------------------------------
 
-    def is_running(self, group_id: int) -> bool:
+    def is_running(self, key: int | str) -> bool:
         with self._lock:
-            return group_id in self._active
+            return key in self._active
 
     def run(self, group_id: int, trigger: str = "manual", google_token: str | None = None, wait: bool = False) -> int:
         """Start a run of the group; returns the run id. `wait` runs it in this thread."""
         group = self.store.get_group(group_id)
+        return self._start(group_id, group.name, group.members,
+                           lambda: self.store.start_group_run(group_id, trigger), google_token, wait)
+
+    def run_tag(self, tag: str, google_token: str | None = None, wait: bool = False) -> int:
+        """Start a run of every source with a tag; returns the run id."""
+        tag = normalize_tag(tag)
+        if not self.store.sources_with_tag(tag):
+            raise LookupError(f"no source is tagged #{tag}")
+        return self._start(f"#{tag}", f"#{tag}", [f"#{tag}"], lambda: self.store.start_tag_run(tag), google_token, wait)
+
+    def _start(self, key: int | str, name: str, members: list[str], record: Callable[[], int],
+               google_token: str | None, wait: bool) -> int:
         with self._lock:
-            if group_id in self._active:
-                raise ValueError(f"{group.name} is already running")
-            self._active.add(group_id)
+            if key in self._active:
+                raise ValueError(f"{name} is already running")
+            self._active.add(key)
         try:
-            run_id = self.store.start_group_run(group_id, trigger)
+            run_id = record()
         except Exception:
             with self._lock:
-                self._active.discard(group_id)
+                self._active.discard(key)
             raise
         if wait:
-            self._execute(group, run_id, google_token)
+            self._execute(key, name, members, run_id, google_token)
         else:
-            self._executor.submit(self._execute, group, run_id, google_token)
+            self._executor.submit(self._execute, key, name, members, run_id, google_token)
         return run_id
 
-    def _execute(self, group: Group, run_id: int, google_token: str | None) -> None:
+    def _execute(self, key: int | str, name: str, members: list[str], run_id: int, google_token: str | None) -> None:
         results: list[dict[str, Any]] = []
         try:
-            sources, empty_tags = self.resolve(group.members)
+            sources, empty_tags = self.resolve(members)
             for tag in empty_tags:
                 results.append({"source": tag, "status": "failed", "rows": 0, "error": f"no source is tagged {tag}"})
             for source in sources:
@@ -177,13 +192,13 @@ class GroupRunner:
             ok = sum(1 for r in results if r["status"] == "succeeded")
             status = "succeeded" if ok == len(results) else "failed" if ok == 0 else "partial"
             self.store.update_group_run(run_id, results, status)
-            log.info("group %s run %s (%s): %s", group.name, run_id, status, [r["source"] for r in results])
+            log.info("group %s run %s (%s): %s", name, run_id, status, [r["source"] for r in results])
         except Exception:
-            log.exception("group %s run %s crashed", group.name, run_id)
+            log.exception("group %s run %s crashed", name, run_id)
             self.store.update_group_run(run_id, results, "failed")
         finally:
             with self._lock:
-                self._active.discard(group.id)
+                self._active.discard(key)
 
     # -- scheduling --------------------------------------------------------
 

@@ -86,8 +86,8 @@ def test_tag_api(store, engine):
     summary = {s["name"]: s["tags"] for s in client.get("/api/sources", headers=AUTH).json()}
     assert summary == {"customers": ["base", "crm"], "notes": [], "orders": ["base"]}
     assert client.get("/api/tags", headers=AUTH).json() == [
-        {"tag": "base", "sources": ["customers", "orders"]},
-        {"tag": "crm", "sources": ["customers"]},
+        {"tag": "base", "sources": ["customers", "orders"], "running": False, "last_run": None},
+        {"tag": "crm", "sources": ["customers"], "running": False, "last_run": None},
     ]
 
     group = client.post("/api/groups", headers=AUTH, json={"name": "#base", "members": ["#base"]}).json()
@@ -100,3 +100,74 @@ def test_tag_api(store, engine):
         time.sleep(0.05)
     assert run["status"] == "succeeded" and [r["source"] for r in run["results"]] == ["customers", "orders"]
     assert client.put("/api/sources/customers/tags", json={"tags": []}).status_code == 401
+
+
+# -- running a tag without a group ---------------------------------------------------
+
+def test_a_tag_runs_whatever_has_it_now(store, engine):
+    runner = GroupRunner(engine)
+    store.set_source_tags("customers", ["base"])
+    first = store.get_group_run(runner.run_tag("#Base", wait=True))
+    assert first.status == "succeeded" and first.trigger == "tag"
+    assert [(r["source"], r["rows"]) for r in first.results] == [("customers", 2)]
+
+    store.set_source_tags("orders", ["base"])
+    second = store.get_group_run(runner.run_tag("base", wait=True))
+    assert [r["source"] for r in second.results] == ["customers", "orders"]
+    assert store.last_tag_runs()["base"].id == second.id  # only the latest is kept per tag
+    assert not store.list_groups()  # no group was made
+    assert not runner.is_running("#base")
+
+    with pytest.raises(LookupError, match="no source is tagged #nobody"):
+        runner.run_tag("nobody")
+
+
+def test_one_failing_source_doesnt_stop_a_tag(store, engine):
+    store.set_source_tags("customers", ["base"])
+    store.set_source_tags("orders", ["base"])
+    original = engine.reload_source
+
+    def flaky(name, **kwargs):
+        if name == "customers":
+            raise RuntimeError("the file is gone")
+        return original(name, **kwargs)
+
+    engine.reload_source = flaky
+    run = store.get_group_run(GroupRunner(engine).run_tag("base", wait=True))
+    assert run.status == "partial"
+    assert [(r["source"], r["status"]) for r in run.results] == [("customers", "failed"), ("orders", "succeeded")]
+
+
+def test_a_tag_cant_run_twice_at_once(store, engine):
+    runner = GroupRunner(engine)
+    store.set_source_tags("customers", ["base"])
+    runner._active.add("#base")
+    with pytest.raises(ValueError, match="#base is already running"):
+        runner.run_tag("base")
+
+
+def test_tag_run_api(store, engine):
+    client = TestClient(create_app(engine, TOKEN))
+    client.put("/api/sources/customers/tags", headers=AUTH, json={"tags": ["base"]})
+    client.put("/api/sources/orders/tags", headers=AUTH, json={"tags": ["base"]})
+
+    r = client.post("/api/tags/base/run", headers=AUTH, json={})
+    assert r.status_code == 202
+    for _ in range(100):
+        run = client.get(f"/api/group-runs/{r.json()['run_id']}", headers=AUTH).json()
+        if run["status"] != "running":
+            break
+        time.sleep(0.05)
+    assert run["status"] == "succeeded" and [x["source"] for x in run["results"]] == ["customers", "orders"]
+
+    for _ in range(100):  # the worker lets go of the tag just after the run is recorded
+        [tag] = client.get("/api/tags", headers=AUTH).json()
+        if not tag["running"]:
+            break
+        time.sleep(0.05)
+    assert tag["running"] is False and tag["last_run"]["id"] == run["id"] and tag["last_run"]["status"] == "succeeded"
+    assert client.get("/api/groups", headers=AUTH).json() == []
+
+    assert client.post("/api/tags/nobody/run", headers=AUTH, json={}).status_code == 404
+    assert client.post("/api/tags/no%20good/run", headers=AUTH, json={}).status_code == 400
+    assert client.post("/api/tags/base/run", json={}).status_code == 401

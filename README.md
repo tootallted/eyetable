@@ -278,8 +278,10 @@ Give any source tags such as `#base` or `#finance`: in **Sources**, click
 commas, and press Enter. Tags are lowercase letters, digits, `_` and `-`
 (`#Base`, `base` and ` base ` all mean `#base`). Click a tag on any row to
 show only the sources that have it; from there, **Make a group from #base**
-creates a group for it in one click. API: `PUT /api/sources/<name>/tags`,
-`GET /api/tags`.
+creates a group for it in one click. To reload everything with a tag right
+now, click the tag under **Run everything with a tag** in the Groups card; no
+group is needed, and its last result shows beside it. API:
+`PUT /api/sources/<name>/tags`, `GET /api/tags`, `POST /api/tags/<tag>/run`.
 
 ### Groups and schedules
 

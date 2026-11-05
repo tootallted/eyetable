@@ -162,11 +162,14 @@ class Group:
 class GroupRun:
     id: int
     group_id: int
-    trigger: str  # "manual" | "schedule" | "catch-up"
+    trigger: str  # "manual" | "schedule" | "catch-up" | "tag"
     status: str  # "running" | "succeeded" | "partial" | "failed"
     started_at: dt.datetime
     finished_at: dt.datetime | None
     results: list[dict[str, Any]]
+
+
+TAG_RUN_GROUP = 0  # group_runs.group_id of a run of a tag, which is no saved group
 
 
 class GroupNotFound(LookupError):
@@ -248,6 +251,13 @@ class CoreStore:
             sa.Column("started_at", UTCDateTime(), nullable=False),
             sa.Column("finished_at", UTCDateTime()),
             sa.Column("results", JSONType, nullable=False),
+        )
+        # The latest run of each tag run on its own (Run by tag), in group_runs.
+        self.tag_runs = sa.Table(
+            "tag_runs",
+            self.metadata,
+            sa.Column("tag", sa.String(40), primary_key=True),
+            sa.Column("run_id", sa.Integer, nullable=False),
         )
         # One row at most: the Google account scheduled runs read sheets as. The
         # refresh token is stored encrypted (see google_auth.py).
@@ -494,6 +504,20 @@ class CoreStore:
                 group_id=group_id, trigger=trigger, status="running", started_at=_now(), results=[],
             ))
             return result.inserted_primary_key[0]
+
+    def start_tag_run(self, tag: str) -> int:
+        run_id = self.start_group_run(TAG_RUN_GROUP, "tag")
+        with self.db.begin() as conn:
+            conn.execute(sa.delete(self.tag_runs).where(self.tag_runs.c.tag == tag))
+            conn.execute(sa.insert(self.tag_runs).values(tag=tag, run_id=run_id))
+        return run_id
+
+    def last_tag_runs(self) -> dict[str, GroupRun]:
+        query = sa.select(self.tag_runs.c.tag, self.group_runs).join(
+            self.group_runs, self.group_runs.c.id == self.tag_runs.c.run_id)
+        with self.db.connect() as conn:
+            rows = conn.execute(query).all()
+        return {r.tag: GroupRun(**{k: v for k, v in r._mapping.items() if k != "tag"}) for r in rows}
 
     def update_group_run(self, run_id: int, results: list[dict[str, Any]], status: str | None = None) -> None:
         values: dict[str, Any] = {"results": results}

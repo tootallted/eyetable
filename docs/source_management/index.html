@@ -204,6 +204,14 @@
   .tags-cell .add:hover { border-color: var(--accent); color: var(--accent); }
   .tags-edit { display: flex; gap: 6px; align-items: center; min-width: 220px; }
   .tags-edit input { width: 100%; min-width: 140px; padding: 3px 8px; font-size: 13px; font-family: var(--mono); }
+  .tag-runs { display: grid; gap: 8px; }
+  .tag-runs .title { font-size: 13px; font-weight: 600; }
+  .tag-run { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: baseline; font-size: 13px; }
+  .tag-run .status { display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: baseline; min-width: 0; }
+  .hash.run { padding: 3px 12px; }
+  .hash.run::before { content: ""; margin-right: 6px; border-left: 7px solid currentColor;
+    border-top: 4px solid transparent; border-bottom: 4px solid transparent; }
+  .hash.run:disabled { opacity: .5; cursor: not-allowed; }
   .tag-filter { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; font-size: 13px; padding: 8px 12px;
     border-radius: 10px; background: var(--accent-soft); }
   .members .hash { cursor: default; }
@@ -584,7 +592,8 @@
     </div>
     <div class="card-body">
       <p class="hint">Put sources that belong together in a group, then reload them all with one click, or on a schedule
-        (for example every day at 6:00 AM, or every hour from 8:00 AM to 5:00 PM on weekdays).</p>
+        (for example every day at 6:00 AM, or every hour from 8:00 AM to 5:00 PM on weekdays). Or click a tag to reload
+        every source that has it.</p>
       <div class="gs-google" id="google-conn" aria-live="polite"></div>
       <div id="groups-msg" role="status"></div>
       <form class="editor" id="group-editor" hidden>
@@ -639,6 +648,7 @@
         </div>
         <div id="ge-msg" role="status"></div>
       </form>
+      <div class="tag-runs" id="tag-runs" hidden></div>
       <div class="table-wrap" id="groups-list"><div class="empty">Connect to see your groups.</div></div>
     </div>
   </section>
@@ -925,7 +935,7 @@
             s.tags = r.tags;
             clear($('sources-msg'));
             done();
-            if (groupsState.list.length) loadGroups();
+            loadGroups();
           }, function (err) {
             save.disabled = false;
             clear($('sources-msg')).appendChild(banner('err', err.message));
@@ -1552,15 +1562,17 @@
     // -- groups ---------------------------------------------------------------
     var DAY_SHORT = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
     var BROWSER_TZ = (function () { try { return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'; } catch (e) { return 'UTC'; } })();
-    var groupsState = { list: [], editing: null, polling: {}, previewTimer: null };
+    var groupsState = { list: [], tags: {}, editing: null, polling: {}, previewTimer: null };
 
     function statusPill(status, text) { return el('span', { class: 'st ' + status, text: text || status }); }
 
     function loadGroups() {
-      return api('/api/groups').then(function (list) {
+      return Promise.all([api('/api/groups'), api('/api/tags')]).then(function (loaded) {
+        var list = loaded[0];
         groupsState.list = list;
+        var tags = loaded[1].map(function (t) { return Object.assign(tagRun(t.tag), { running: t.running, last_run: t.last_run }); });
         renderGroups();
-        list.forEach(function (g) { if (g.running && g.last_run && !groupsState.polling[g.id]) pollRun(g, g.last_run.id); });
+        list.concat(tags).forEach(function (g) { if (g.running && g.last_run && !groupsState.polling[g.id]) pollRun(g, g.last_run.id); });
       }, function (err) {
         clear($('groups-list')).appendChild(el('div', { class: 'empty', text: err.message }));
       });
@@ -1571,8 +1583,53 @@
       return ok + ' of ' + run.results.length + ' reloaded';
     }
 
+    // A tag's run state, shaped like a group so running and progress work the same way.
+    function tagRun(tag) {
+      var run = groupsState.tags[tag] || (groupsState.tags[tag] = { id: '#' + tag, name: '#' + tag, tag: tag, members: ['#' + tag], running: false, last_run: null });
+      run.sources = state.sources.filter(function (s) { return (s.tags || []).indexOf(tag) >= 0; }).map(function (s) { return s.name; });
+      return run;
+    }
+
+    // What a group or tag last did, or is doing now.
+    function fillRunStatus(node, g) {
+      var run = g.last_run;
+      if (g.running || (run && run.status === 'running')) {
+        var progress = run && run.status === 'running' ? run.results.filter(function (r) { return r.status !== 'running'; }).length : 0;
+        node.appendChild(statusPill('running', 'Running ' + progress + ' of ' + ((g.sources || g.members).length + (g.empty_tags || []).length) + '…'));
+      } else if (run) {
+        node.appendChild(statusPill(run.status, run.status === 'succeeded' ? 'Succeeded' : run.status === 'partial' ? 'Partly failed' : 'Failed'));
+        node.appendChild(el('div', { class: 'muted', text: fmtTime(run.finished_at || run.started_at) + (run.trigger === 'schedule' || run.trigger === 'catch-up' ? ' · ' + (run.trigger === 'catch-up' ? 'catch-up' : 'scheduled') : '') }));
+        var det = el('details', null, [el('summary', { text: runSummary(run) }), el('ul', null, run.results.map(function (r) {
+          return el('li', { text: r.source + ': ' + (r.status === 'succeeded' ? plural(r.rows, 'row') : r.status + (r.error ? ' (' + r.error + ')' : '')) });
+        }))]);
+        if (run.status !== 'succeeded') det.open = true;
+        node.appendChild(det);
+      } else {
+        node.appendChild(el('span', { class: 'muted', text: 'Never run' }));
+      }
+    }
+
+    function renderTagRuns() {
+      var wrap = clear($('tag-runs'));
+      var tags = allTags();
+      wrap.hidden = !tags.length;
+      if (!tags.length) return;
+      wrap.appendChild(el('div', { class: 'title', text: 'Run everything with a tag' }));
+      tags.forEach(function (t) {
+        var run = tagRun(t.tag);
+        var button = el('button', { type: 'button', class: 'hash run', text: '#' + t.tag + ' · ' + t.count,
+          title: 'Reload ' + plural(t.count, 'source') + ': ' + run.sources.join(', ') });
+        button.disabled = !!run.running || !state.connected;
+        button.addEventListener('click', function () { runGroup(run); });
+        var status = el('div', { class: 'status' });
+        fillRunStatus(status, run);
+        wrap.appendChild(el('div', { class: 'tag-run' }, [button, status]));
+      });
+    }
+
     function renderGroups() {
       $('group-new').disabled = !state.connected;
+      renderTagRuns();
       var wrap = clear($('groups-list'));
       if (!groupsState.list.length) {
         wrap.appendChild(el('div', { class: 'empty', text: state.sources.length ? 'No groups yet. Use New group to make one.' : 'Load some sources first, then group them here.' }));
@@ -1581,21 +1638,7 @@
       var head = el('tr', null, ['Group', 'Sources', 'Schedule', 'Next run', 'Last run', ''].map(function (h) { return el('th', { text: h, scope: 'col' }); }));
       var body = groupsState.list.map(function (g) {
         var last = el('td');
-        var run = g.last_run;
-        if (g.running || (run && run.status === 'running')) {
-          var progress = run ? run.results.filter(function (r) { return r.status !== 'running'; }).length : 0;
-          last.appendChild(statusPill('running', 'Running ' + progress + ' of ' + ((g.sources || g.members).length + (g.empty_tags || []).length) + '…'));
-        } else if (run) {
-          last.appendChild(statusPill(run.status, run.status === 'succeeded' ? 'Succeeded' : run.status === 'partial' ? 'Partly failed' : 'Failed'));
-          last.appendChild(el('div', { class: 'muted', text: fmtTime(run.finished_at || run.started_at) + (run.trigger !== 'manual' ? ' · ' + (run.trigger === 'catch-up' ? 'catch-up' : 'scheduled') : '') }));
-          var det = el('details', null, [el('summary', { text: runSummary(run) }), el('ul', null, run.results.map(function (r) {
-            return el('li', { text: r.source + ': ' + (r.status === 'succeeded' ? plural(r.rows, 'row') : r.status + (r.error ? ' (' + r.error + ')' : '')) });
-          }))]);
-          if (run.status !== 'succeeded') det.open = true;
-          last.appendChild(det);
-        } else {
-          last.appendChild(el('span', { class: 'muted', text: 'Never run' }));
-        }
+        fillRunStatus(last, g);
         var runBtn = el('button', { type: 'button', class: 'btn small primary', text: 'Run now' });
         runBtn.disabled = !!g.running || !state.connected;
         runBtn.addEventListener('click', function () { runGroup(g); });
@@ -1620,11 +1663,12 @@
 
     function runGroup(g) {
       var msg = clear($('groups-msg'));
-      var hasSheets = g.members.some(function (m) { return state.sources.some(function (s) { return s.name === m && s.type === 'gsheet'; }); });
+      var hasSheets = (g.sources || g.members).some(function (m) { return state.sources.some(function (s) { return s.name === m && s.type === 'gsheet'; }); });
       var body = hasSheets && googleToken() ? JSON.stringify({ google_token: googleToken() }) : '{}';
       g.running = true;
       renderGroups();
-      api('/api/groups/' + g.id + '/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: body })
+      var path = g.tag ? '/api/tags/' + encodeURIComponent(g.tag) + '/run' : '/api/groups/' + g.id + '/run';
+      api(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: body })
         .then(function (r) { pollRun(g, r.run_id); }, function (err) {
           g.running = false;
           renderGroups();
