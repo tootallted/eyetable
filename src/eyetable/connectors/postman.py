@@ -482,6 +482,9 @@ class PostmanConnector(Connector):
 
     def pages(self, key: str) -> Iterator[list[Record]]:
         """Send a request and yield the records of each page it paginates through."""
+        yield from self._pages(self._readable(key), self.pagination.get(key))
+
+    def _readable(self, key: str) -> PostmanRequest:
         request = self.requests.get(key)
         if request is None:
             raise KeyError(f"no request {key!r} in collection")
@@ -489,8 +492,11 @@ class PostmanConnector(Connector):
             raise UnsupportedRequestError(
                 f"{request.method} {key!r} is not read by default; add it to allow_methods to ingest it"
             )
+        return request
+
+    def _pages(self, request: PostmanRequest, paging: dict | None) -> Iterator[list[Record]]:
+        key = request.key
         path = (self.config.get("records_path") or {}).get(key)
-        paging = self.pagination.get(key)
         built = self._build(request)
         if paging is None:
             yield extract_records(parse_response(self._send(built)), path)

@@ -198,6 +198,20 @@
   .curl-line .m { display: inline-block; padding: 0 6px; margin-right: 6px; border-radius: 4px; background: var(--accent-soft); color: var(--accent); font-weight: 600; }
   .cert-box summary { cursor: pointer; font-size: 13px; font-weight: 600; }
   .cert-box .curl-settings { margin-top: 10px; }
+  .req-table td { white-space: normal; overflow-wrap: anywhere; }
+  .pieces { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; align-items: center; }
+  .pieces .hash { white-space: normal; overflow-wrap: anywhere; text-align: left; }
+  .set-part { border: 1px solid var(--border); border-radius: 10px; padding: 12px; display: grid; gap: 10px; }
+  .set-part .head { display: flex; gap: 8px; align-items: center; font-size: 13px; }
+  .set-part .head .link { margin-left: auto; }
+  .set-part label.field { align-content: start; }
+  .set-part textarea { width: 100%; min-height: 72px; resize: vertical; padding: 8px 10px; border-radius: 8px;
+    border: 1px solid var(--border); background: var(--surface); color: var(--text); font: 13px/1.5 var(--mono); }
+  .set-part input[type=number] { width: 100%; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--border); background: var(--surface); }
+  .set-options { display: flex; flex-wrap: wrap; gap: 8px 20px; align-items: center; font-size: 13px; }
+  .set-options input[type=number] { width: 72px; padding: 4px 8px; border-radius: 8px; border: 1px solid var(--border); background: var(--surface); }
+  .set-preview ol { margin: 6px 0 0; padding-left: 20px; font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere; }
+  .set-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
   .curl-settings { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; }
   .curl-settings input { font-family: var(--mono); font-size: 12.5px; }
   .curl-settings .note { font-weight: 400; }
@@ -617,6 +631,32 @@
     </div>
     <div class="card-body" id="detail-body">
       <div class="stats" id="detail-stats"></div>
+      <div id="detail-request" hidden style="display:grid; gap:12px">
+        <div>
+          <h3 style="font-size:14px; margin:0 0 8px">Request</h3>
+          <dl class="kv" id="req-summary"></dl>
+        </div>
+        <div class="table-wrap" id="req-query"></div>
+        <div style="display:grid; gap:10px">
+          <h3 style="font-size:14px; margin:0">Run as a set of statements</h3>
+          <p class="hint">Click a piece of the request above, such as a date or a number, to send the request once for each
+            value in a series. Every statement's rows go into this source's one table, and each run replaces the table with all of them.</p>
+          <div id="set-parts" style="display:grid; gap:10px"></div>
+          <div id="set-more" hidden style="display:grid; gap:10px">
+            <div class="set-options">
+              <label>Pause <input type="number" id="set-pause" min="0" max="60" step="0.5" value="0"> seconds between statements</label>
+              <label class="check"><input type="checkbox" id="set-stop"> Stop at the first statement with no rows</label>
+            </div>
+            <div class="preview set-preview" id="set-preview" aria-live="polite"></div>
+          </div>
+          <div class="set-actions">
+            <button class="btn primary" type="button" id="set-run" hidden>Save and run</button>
+            <button class="btn" type="button" id="set-save" hidden>Save set</button>
+            <button class="btn danger" type="button" id="set-remove" hidden>Back to one statement</button>
+          </div>
+          <div id="set-msg" role="status"></div>
+        </div>
+      </div>
       <div>
         <h3 style="font-size:14px; margin:0 0 8px">First rows</h3>
         <div class="table-wrap" id="detail-preview"></div>
@@ -1073,6 +1113,252 @@
       });
     }
 
+    // -- a curl source's request, and running it as a set of statements --------------
+    var setState = { source: null, request: null, parts: [], saved: false, dirty: false, timer: null };
+
+    function renderRequest(src) {
+      $('detail-request').hidden = !src.request;
+      if (!src.request) { setState.source = null; return; }
+      if (setState.source === src.name && setState.dirty) return;  // a page refresh mustn't lose what's being edited
+      if (setState.source !== src.name) clear($('set-msg'));
+      var saved = src.statements;
+      setState = { source: src.name, request: src.request, parts: saved ? saved.parts.map(function (p) { return Object.assign({}, p); }) : [],
+                   saved: !!saved, dirty: false, timer: null };
+      $('set-pause').value = saved ? saved.pause_seconds : 0;
+      $('set-stop').checked = !!(saved && saved.stop_when_empty);
+      renderRequestParts();
+      renderSet();
+    }
+
+    function pieceButtons(target, name, list, text) {
+      var row = el('div', { class: 'pieces' });
+      list.forEach(function (p) {
+        var b = el('button', { type: 'button', class: 'hash', text: p.text + (p.count > 1 ? ' ×' + p.count : ''),
+          title: 'Send the request once for each value in a series, in place of ' + p.text });
+        b.addEventListener('click', function () { addSetPart(target, name, p, list); });
+        row.appendChild(b);
+      });
+      if (text !== null) {
+        var other = el('button', { type: 'button', class: 'link', text: target === 'query' ? 'whole value' : 'other text' });
+        other.addEventListener('click', function () { addSetPart(target, name, { text: text, kind: 'list', count: 1 }, list); });
+        row.appendChild(other);
+      }
+      return row;
+    }
+
+    function renderRequestParts() {
+      var r = setState.request;
+      var dl = clear($('req-summary'));
+      var row = function (k, v, extra) {
+        dl.appendChild(el('dt', { text: k }));
+        dl.appendChild(el('dd', null, [v, extra]));
+      };
+      row('Method', r.method);
+      row('Host', r.host);
+      row('Path', r.path, pieceButtons('path', null, r.path_pieces, ''));
+      r.headers.forEach(function (h) { row(h.name, h.value); });
+      if (r.body) row('Body', r.body, pieceButtons('body', null, r.body_pieces, ''));
+      if (r.certificate) row('Certificate', 'Client certificate for ' + r.certificate);
+      var q = clear($('req-query'));
+      if (!r.query.length) { q.hidden = true; return; }
+      q.hidden = false;
+      q.appendChild(el('table', { class: 'req-table' }, [
+        el('thead', null, [el('tr', null, [el('th', { text: 'Query parameter', scope: 'col' }), el('th', { text: 'Value', scope: 'col' })])]),
+        el('tbody', null, r.query.map(function (p) {
+          return el('tr', null, [
+            el('td', { class: 'mono', text: p.name }),
+            el('td', null, [el('div', { class: 'mono', text: p.value }), p.secret ? null : pieceButtons('query', p.name, p.pieces, p.value)])
+          ]);
+        }))
+      ]));
+    }
+
+    function isoDate(text) {
+      var m = /^(\d{2})\/(\d{2})\/(\d{4})$/.exec(text) || null;
+      if (m) return m[3] + '-' + m[1] + '-' + m[2];
+      m = /^(\d{4})(\d{2})(\d{2})$/.exec(text);
+      return m ? m[1] + '-' + m[2] + '-' + m[3] : text;
+    }
+
+    function setKind(part, kind) {
+      part.kind = kind;
+      var text = part.find || '';
+      if (kind === 'dates') {
+        part.from = part.from && typeof part.from === 'string' ? part.from : isoDate(text);
+        part.to = part.to && typeof part.to === 'string' ? part.to : 'today';
+        part.days = part.days || 1;
+      } else if (kind === 'numbers') {
+        var n = parseInt(text, 10);
+        part.from = typeof part.from === 'number' ? part.from : isNaN(n) ? 1 : n;
+        part.to = typeof part.to === 'number' ? part.to : part.from + 9;
+        part.step = part.step || 1;
+      } else {
+        part.values = part.values || text.split(',').map(function (v) { return v.trim(); }).filter(Boolean);
+      }
+    }
+
+    function addSetPart(target, name, piece, siblings) {
+      var part = { target: target, find: piece.text };
+      if (name) part.name = name;
+      var dates = (siblings || []).filter(function (p) { return p.kind === 'dates'; });
+      if (piece.kind === 'dates') {
+        var other = dates.filter(function (p) { return p.text !== piece.text; })[0];
+        part.end_find = other ? other.text : piece.count > 1 ? piece.text : '';
+      }
+      setKind(part, piece.kind);
+      setState.parts.push(part);
+      setState.dirty = true;
+      renderSet();
+    }
+
+    // Where a part's value lives, for offering the other dates next to it.
+    function datesNear(part) {
+      var r = setState.request;
+      var list = part.target === 'path' ? r.path_pieces : part.target === 'body' ? r.body_pieces
+        : ((r.query.filter(function (q) { return q.name === part.name; })[0] || {}).pieces || []);
+      return list.filter(function (p) { return p.kind === 'dates'; });
+    }
+
+    function setField(label, input, note) {
+      return el('label', { class: 'field' }, [label, input, note ? el('span', { class: 'note', text: note }) : null]);
+    }
+
+    function setInput(part, key, type, attrs) {
+      var input = el('input', Object.assign({ type: type, autocomplete: 'off', spellcheck: 'false' }, attrs || {}));
+      input.value = part[key] === undefined || part[key] === null ? '' : part[key];
+      input.addEventListener('input', function () {
+        part[key] = type === 'number' ? (input.value === '' ? null : Number(input.value)) : input.value;
+        setChanged();
+      });
+      return input;
+    }
+
+    function renderSetPart(part, index) {
+      var remove = el('button', { type: 'button', class: 'link', text: 'Remove' });
+      remove.addEventListener('click', function () { setState.parts.splice(index, 1); setState.dirty = true; renderSet(); });
+      var kind = el('select', { 'aria-label': 'Kind of series' }, [['dates', 'Dates'], ['numbers', 'Numbers'], ['list', 'List of values']].map(function (o) {
+        var option = el('option', { value: o[0], text: o[1] });
+        if (o[0] === part.kind) option.selected = true;
+        return option;
+      }));
+      kind.addEventListener('change', function () { setKind(part, kind.value); setState.dirty = true; renderSet(); });
+      var fields = [setField('Text to change', setInput(part, 'find', 'text')), setField('Replace it with', kind)];
+      if (part.kind === 'dates') {
+        fields.push(setField('From', setInput(part, 'from', 'text'), 'A date, or today-30 for a rolling start.'));
+        fields.push(setField('To', setInput(part, 'to', 'text'), 'A date, or today.'));
+        fields.push(setField('Days per statement', setInput(part, 'days', 'number', { min: '1', max: '366', step: '1' })));
+        var near = datesNear(part);
+        var repeated = near.filter(function (p) { return p.text === part.find && p.count > 1; }).length > 0;
+        var choices = near.filter(function (p) { return p.text !== part.find; }).map(function (p) { return p.text; });
+        if (repeated) choices.unshift(part.find);
+        if (choices.length) {
+          var end = el('select', null, [el('option', { value: '', text: 'None' })].concat(choices.map(function (c) {
+            var option = el('option', { value: c, text: c === part.find ? 'Its later mentions' : c });
+            if (c === part.end_find) option.selected = true;
+            return option;
+          })));
+          end.addEventListener('change', function () { part.end_find = end.value; setChanged(); });
+          fields.push(setField('Last day of each statement goes in', end));
+        }
+      } else if (part.kind === 'numbers') {
+        fields.push(setField('From', setInput(part, 'from', 'number', { step: '1' })));
+        fields.push(setField('To', setInput(part, 'to', 'number', { step: '1' })));
+        fields.push(setField('Step', setInput(part, 'step', 'number', { min: '1', step: '1' })));
+      } else {
+        var values = el('textarea', { spellcheck: 'false' });
+        values.value = (part.values || []).join('\n');
+        values.addEventListener('input', function () { part.values = values.value.split('\n'); setChanged(); });
+        fields.push(setField('Values, one per line', values));
+      }
+      return el('div', { class: 'set-part' }, [
+        el('div', { class: 'head' }, [el('strong', { text: part.name || (part.target === 'path' ? 'Path' : 'Body') }), remove]),
+        el('div', { class: 'curl-settings' }, fields)
+      ]);
+    }
+
+    function setPayload() {
+      return {
+        parts: setState.parts,
+        pause_seconds: Number($('set-pause').value) || 0,
+        stop_when_empty: $('set-stop').checked
+      };
+    }
+
+    function setPath(suffix) { return '/api/sources/' + encodeURIComponent(setState.source) + '/statements' + (suffix || ''); }
+    var JSON_HEADERS = { 'Content-Type': 'application/json' };
+
+    function setChanged() {
+      setState.dirty = true;
+      clearTimeout(setState.timer);
+      setState.timer = setTimeout(previewSet, 350);
+    }
+
+    function renderSet() {
+      var wrap = clear($('set-parts'));
+      setState.parts.forEach(function (part, i) { wrap.appendChild(renderSetPart(part, i)); });
+      var any = setState.parts.length > 0;
+      $('set-more').hidden = !any;
+      $('set-save').hidden = $('set-run').hidden = !any;
+      $('set-remove').hidden = !setState.saved;
+      if (any) previewSet();
+    }
+
+    function previewSet() {
+      var box = $('set-preview');
+      var source = setState.source;
+      api(setPath('/preview'), { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify(setPayload()) }).then(function (p) {
+        if (source !== setState.source) return;
+        clear(box).className = 'preview set-preview';
+        box.appendChild(el('strong', { text: plural(p.count, 'statement') + ' each run' }));
+        var items = p.first.concat(p.last ? [p.last] : []);
+        box.appendChild(el('ol', null, items.map(function (s, i) {
+          var li = el('li', { text: s.url + (s.body ? '  ' + s.body : '') });
+          if (p.last && i === items.length - 1) li.setAttribute('value', p.count);
+          return li;
+        })));
+        p.notes.forEach(function (n) { box.appendChild(el('div', { text: n })); });
+      }, function (err) {
+        if (source !== setState.source) return;
+        clear(box).className = 'preview set-preview bad';
+        box.textContent = err.message;
+      });
+    }
+
+    function saveSet() {
+      clearTimeout(setState.timer);
+      var msg = clear($('set-msg'));
+      return api(setPath(), { method: 'PUT', headers: JSON_HEADERS, body: JSON.stringify(setPayload()) }).then(function (p) {
+        setState.dirty = false;
+        setState.saved = true;
+        $('set-remove').hidden = false;
+        msg.appendChild(banner('ok', 'Saved: ' + plural(p.count, 'statement') + ' run every time this source loads, on Reload and on schedules.'));
+        return refresh();
+      }, function (err) {
+        msg.appendChild(banner('err', 'Not saved: ' + err.message));
+        throw err;
+      });
+    }
+
+    function runSet() {
+      var name = setState.source;
+      saveSet().then(function () {
+        var s = state.sources.filter(function (x) { return x.name === name; })[0];
+        if (!s) return;
+        unfold('sources');
+        reloadSource(s, true);
+      }).catch(function () {});
+    }
+
+    function removeSet() {
+      if (!confirm('Go back to sending this request once? The set is removed; the table stays as it is until the next load.')) return;
+      var msg = clear($('set-msg'));
+      api(setPath(), { method: 'DELETE' }).then(function () {
+        setState.dirty = false;
+        setState.source = null;
+        return refresh();
+      }, function (err) { msg.appendChild(banner('err', err.message)); });
+    }
+
     function renderDetail(src, preview) {
       $('detail').hidden = false;
       $('detail-name').textContent = src.name;
@@ -1084,11 +1370,13 @@
         stat('Columns', fmtInt(src.columns));
         stat(src.type === 'gsheet' ? 'Times loaded' : 'Files loaded', fmtInt(src.uploads.length));
         stat('Table', 'eyetable_raw.' + src.table, true);
+        if (src.statement_count !== undefined) stat('Statements', fmtInt(src.statement_count));
       } else {
         stat('Datasets', fmtInt(src.datasets));
         stat('Runs', fmtInt(src.runs.length));
       }
 
+      renderRequest(src);
       var pv = clear($('detail-preview'));
       if (preview) pv.appendChild(dataTable(preview.columns, preview.rows, { empty: 'The table is empty.' }));
       else pv.appendChild(el('div', { class: 'empty', text: 'Previews are shown for file sources. Use the CLI to ingest ' + src.type + ' sources.' }));
@@ -2030,6 +2318,7 @@
 
     function reloadPrompt(s) {
       if (s.type === 'file') return null;  // replays the stored files: the table comes back as it was
+      if (s.type === 'curl' && s.statement_count !== undefined) return 'Reload ' + s.name + '? All ' + plural(s.statement_count, 'statement') + ' are sent again (every page) and the table is replaced.';
       if (s.type === 'curl') return 'Reload ' + s.name + '? The API is called again (every page) and the table is replaced.';
       if (s.type === 'dbtable') return 'Reload ' + s.name + '? Its table or view is read again from the database and replaces what is here.';
       if (s.type === 'gsheet') return 'Reload ' + s.name + ' from Google Sheets? Its table is replaced with the tab’s current contents.';
@@ -2058,9 +2347,16 @@
       renderSources();
       var msg = clear($('sources-msg'));
       var body = s.type === 'gsheet' && googleToken() ? JSON.stringify({ google_token: googleToken() }) : '{}';
-      api('/api/sources/' + encodeURIComponent(s.name) + '/reload', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: body
-      }).then(function (r) {
+      var path = '/api/sources/' + encodeURIComponent(s.name);
+      var post = { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: body };
+      // A set can outlast a web request, so it runs in the background.
+      (s.statement_count !== undefined
+        ? api(path + '/run', post).then(function (r) { return pollJob(r.job_id); }).then(function (job) {
+            if (job.status !== 'succeeded') throw new Error(job.error || 'the run failed');
+            return job.result;
+          })
+        : api(path + '/reload', post)
+      ).then(function (r) {
         msg.appendChild(banner('ok', s.name + ' reloaded: ' + plural(r.source.rows !== undefined && r.source.rows !== null ? r.source.rows : r.rows, 'row') +
           ' at ' + fmtTime(r.source.last_loaded_at) + '.'));
       }, function (err) {
@@ -2561,6 +2857,11 @@
     });
 
     // -- wiring ------------------------------------------------------------
+    $('set-pause').addEventListener('input', setChanged);
+    $('set-stop').addEventListener('change', setChanged);
+    $('set-save').addEventListener('click', function () { saveSet().catch(function () {}); });
+    $('set-run').addEventListener('click', runSet);
+    $('set-remove').addEventListener('click', removeSet);
     var drop = $('drop');
     $('file-input').addEventListener('change', function (e) { if (e.target.files[0]) stage(e.target.files[0]); });
     ['dragenter', 'dragover'].forEach(function (t) {

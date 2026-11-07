@@ -271,9 +271,35 @@ and loads it in the background; the result appears when it's done.
   other source. Loading the same name again replaces or appends.
 * A request that isn't a GET is sent again on every load; the check step says so.
 
+**Running one request as a set of statements.** Click a curl source to see its
+request taken apart: method, host, path, headers (secrets masked), each query
+parameter and the body. Dates, numbers and quoted text in them are clickable;
+click one, or **whole value**, to send the request once per value in a series:
+
+* **Dates**: from and to (a date, `today` or `today-30`, so a schedule keeps a
+  rolling window) and days per statement. The text keeps its format
+  (`2026-11-04`, `11/04/2026`, `20261104`), and every place it appears changes.
+  With several days per statement, the last day goes where you say: another date
+  in that value, or the later mentions of the same one.
+* **Numbers**: from, to, step (`page=1` to `page=40`). If this is the parameter
+  eyetable pages with, automatic paging turns off; **Stop at the first statement
+  with no rows** ends the set when the pages run out.
+* **List of values**: one per line (`status eq 'received'`, then `'paid'`).
+
+Several parts make every combination, up to 5,000 statements. Each statement
+pages as usual, and the page shows what will be sent before you save. All the
+rows go into the source's one table on every load, including schedules: a run
+replaces the table, so a rolling window keeps only those days (use a fixed
+start date and `today` to keep building on them). If a statement fails, the run
+stops, says which statement, and the table stays as it was. **Pause** spaces
+statements out for APIs with rate limits. Loading the source again from a new
+curl command removes its set.
+
 API: `POST /api/curl/inspect`, `POST /api/curl` (returns a job id; both take
 optional `page_size`, `next_field`, `records_field` and `all_pages`),
-`GET /api/jobs/<id>`.
+`GET /api/jobs/<id>`; `POST /api/sources/<name>/statements/preview`,
+`PUT` and `DELETE /api/sources/<name>/statements`, and
+`POST /api/sources/<name>/run` to reload in the background.
 
 ### Reloading a source
 

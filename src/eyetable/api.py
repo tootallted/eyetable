@@ -34,12 +34,13 @@ from eyetable.gsheets import SheetError, fetch_workbook, fetch_workbook_signed_i
 from eyetable.identifiers import SOURCE_NAME, normalize_tag, table_name
 from eyetable.query import MAX_LIMIT, QueryError, QueryRunner
 from eyetable import dbconnect
-from eyetable.curl import parse_curl
+from eyetable.curl import clean_statements, components, parse_curl, preview_statements
 from eyetable.curl import plan as curl_plan
 from eyetable.google_auth import GoogleAuthError, GoogleConnection
 from eyetable.groups import GroupRunner
 from eyetable.ratelimit import SlidingWindow, client_ip
 from eyetable.schedule import ScheduleError, describe, next_runs, normalize
+from eyetable.statements import count as statement_count
 from eyetable.tls import client_cert
 from eyetable.store import GroupNotFound
 from eyetable.store import SourceNotFound
@@ -79,6 +80,13 @@ class DbLoadIn(DbIn):
 
 class TagsIn(BaseModel):
     tags: list[str] = Field(max_length=30)
+
+
+class StatementsIn(BaseModel):
+    """A curl source's set of statements (see eyetable.statements, which checks it)."""
+    parts: list[dict[str, Any]] = Field(max_length=20)
+    pause_seconds: float = 0
+    stop_when_empty: bool = False
 
 
 class CertificateIn(BaseModel):
@@ -264,6 +272,11 @@ def create_app(
                 columns=len(datasets[0].columns) if datasets else None,
                 last_upload=uploads[0] if uploads else None,
             )
+        if src.type == "curl" and src.config.get("statements"):
+            try:
+                summary["statement_count"] = statement_count(src.config["statements"])
+            except ValueError:  # e.g. a fixed date range that "today" has moved past
+                summary["statement_count"] = 0
         return summary
 
     def get_source(name: str):
@@ -328,7 +341,41 @@ def create_app(
             "catalog": [d.to_dict() for _, d in store.list_datasets(name)],
             "uploads": store.list_uploads(name, limit=25),
             "runs": store.list_runs(name, limit=25),
+            **({"request": components(src.config), "statements": src.config.get("statements")} if src.type == "curl" else {}),
         })
+
+    def curl_source(name: str):
+        src = get_source(name)
+        if src.type != "curl":
+            raise HTTPException(400, f"{name} isn't a curl source")
+        return src
+
+    def checked_statements(src, body: StatementsIn) -> dict[str, Any]:
+        try:
+            return clean_statements(src.config, body.model_dump())
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from None
+
+    @app.post("/api/sources/{name}/statements/preview", dependencies=auth)
+    def preview_set(name: str, body: StatementsIn) -> dict[str, Any]:
+        """What a set would send. Sends nothing and saves nothing."""
+        src = curl_source(name)
+        return preview_statements(src.config, checked_statements(src, body))
+
+    @app.put("/api/sources/{name}/statements", dependencies=auth)
+    def save_set(name: str, body: StatementsIn) -> dict[str, Any]:
+        """Make the source run as this set from now on."""
+        src = curl_source(name)
+        plan = checked_statements(src, body)
+        store.save_source(name, src.type, {**src.config, "statements": plan})
+        return preview_statements(src.config, plan)
+
+    @app.delete("/api/sources/{name}/statements", dependencies=auth)
+    def remove_set(name: str) -> dict[str, Any]:
+        """Back to the single statement."""
+        src = curl_source(name)
+        store.save_source(name, src.type, {k: v for k, v in src.config.items() if k != "statements"})
+        return jsonable_encoder(source_summary(store.get_source(name)))
 
     @app.get("/api/sources/{name}/preview", dependencies=auth)
     def preview(name: str, limit: int = 20) -> dict[str, Any]:
@@ -618,6 +665,20 @@ def create_app(
             "results": [r.__dict__ for r in results],
             "rows": sum(r.rows for r in results),
         })
+
+    @app.post("/api/sources/{name}/run", dependencies=auth, status_code=202)
+    def run_source(name: str) -> dict[str, Any]:
+        """Reload a source in the background, for a set that can outlast a web request."""
+        curl_source(name)
+
+        def work() -> dict[str, Any]:
+            results = engine.reload_source(name)
+            failed = [r for r in results if r.status != "succeeded"]
+            if failed:
+                raise RuntimeError("; ".join(r.error or r.status for r in failed))
+            return {"source": source_summary(store.get_source(name)), "rows": sum(r.rows for r in results)}
+
+        return {"job_id": start_job("reload", work)}
 
     @app.post("/api/gsheets", dependencies=auth)
     def load_gsheet(body: SheetIn) -> dict[str, Any]:

@@ -46,6 +46,7 @@ from eyetable.connectors.postman import (
 )
 from eyetable.credentials import encrypt_secret
 from eyetable.identifiers import sanitize, source_name
+from eyetable.statements import encode_query, expand, normalize, pieces, rewrite, sets_paging
 from eyetable.tls import covers, describe
 from eyetable.xmldata import XmlDocument
 from eyetable.types import infer_columns
@@ -215,13 +216,13 @@ def parse_curl(text: str) -> CurlRequest:
             headers.append(("Accept", "application/json"))
     elif data:
         body = "&".join(data)
-        is_form = True
+        is_form = not body.lstrip().startswith(("{", "[", "<"))  # -d also carries JSON and XML, sent as they are
     if get_mode and body is not None:  # -G: the data goes in the query string
         sep = "&" if parsed.query else ""
         url = urllib.parse.urlunsplit(parsed._replace(query=parsed.query + sep + body))
         body, is_form = None, False
-    if is_form and not any(h.lower() == "content-type" for h, _ in headers):
-        headers.append(("Content-Type", "application/x-www-form-urlencoded"))
+    if data and body is not None and not any(h.lower() == "content-type" for h, _ in headers):
+        headers.append(("Content-Type", "application/x-www-form-urlencoded"))  # what curl itself sends with -d
     method = method or ("POST" if body is not None else "GET")
     return CurlRequest(method, url, headers, body, is_form, user, warnings)
 
@@ -268,8 +269,7 @@ def build_collection(req: CurlRequest) -> tuple[dict[str, Any], dict[str, str]]:
     parts, query = _split_query(req.url)
     query = [(k, vault.hide(v) if _secret_param(k) and v else v) for k, v in query]
     # keep {{...}} readable in the stored URL
-    # quote, not quote_plus: a space stays %20, which is all that some APIs (OData filters) accept
-    raw = urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(query, safe="{}", quote_via=urllib.parse.quote)))
+    raw = urllib.parse.urlunsplit(parts._replace(query=encode_query(query)))
     headers = [{"key": k, "value": vault.hide(v) if _secret_header(k) and v else v} for k, v in req.headers]
     request: dict[str, Any] = {"method": req.method, "header": headers, "url": raw}
     if req.body is not None:
@@ -623,3 +623,56 @@ def plan(text: str, secret_key: str | None, client: httpx.Client | None = None, 
         certificate=identity,
     )
     return result, config
+
+
+# -- a stored source's request ---------------------------------------------------------
+
+def stored_request(config: dict[str, Any]) -> dict[str, Any]:
+    return config["collection"]["item"][0]["request"]
+
+
+def components(config: dict[str, Any]) -> dict[str, Any]:
+    """A curl source's request taken apart for the page, secrets masked."""
+    request = stored_request(config)
+    parts, query = _split_query(request["url"])
+    path = urllib.parse.unquote(parts.path)
+    body = (request.get("body") or {}).get("raw")
+
+    def piece_list(text: str) -> list[dict[str, Any]]:
+        return [] if "{{secret_" in text else pieces(text)
+
+    return {
+        "method": request["method"],
+        "host": parts.netloc,
+        "path": path,
+        "path_pieces": piece_list(path),
+        "query": [{"name": k, "value": mask(v, {}), "secret": "{{secret_" in v, "pieces": piece_list(v)} for k, v in query],
+        "headers": [{"name": h["key"], "value": mask(h["value"], {})} for h in request["header"]],
+        "body": mask(body, {}) if body else None,
+        "body_pieces": pieces(body) if body else [],
+        "certificate": (config.get("client_cert") or {}).get("host"),
+    }
+
+
+def clean_statements(config: dict[str, Any], plan: dict[str, Any]) -> dict[str, Any]:
+    """A set checked against the source's request."""
+    request = stored_request(config)
+    return normalize(plan, request["url"], request.get("body"))
+
+
+def preview_statements(config: dict[str, Any], plan: dict[str, Any], limit: int = 4) -> dict[str, Any]:
+    """What a checked set would send: how many statements, and the first and last."""
+    request = stored_request(config)
+    seen, last, total = [], None, 0
+    for statement in expand(plan):
+        total += 1
+        url, body = rewrite(request["url"], request.get("body"), statement.changes)
+        item = {"label": statement.label, "url": mask(urllib.parse.unquote(url), {}),
+                "body": mask(body["raw"], {}) if body and any(c.target == "body" for c in statement.changes) else None}
+        if total <= limit:
+            seen.append(item)
+        last = item
+    notes = []
+    if sets_paging(plan, (config.get("pagination") or {}).get(REQUEST_NAME)):
+        notes.append("Automatic paging is off for this source while the set changes its paging parameter.")
+    return {"count": total, "first": seen, "last": last if total > limit else None, "notes": notes}
