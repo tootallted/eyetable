@@ -303,7 +303,9 @@
   .tag { display: inline-block; padding: 1px 8px; border-radius: 999px; background: var(--surface-2); border: 1px solid var(--border); font-size: 12px; color: var(--muted); }
   .empty { padding: 28px 16px; text-align: center; color: var(--muted); }
 
-  #detail .card-head h2 { margin: 0; min-width: 0; font-size: 18px; }
+  #detail .card-head { flex-wrap: wrap; }
+  #detail .card-head h2 { margin: 0; }
+  #detail-name { min-width: 0; overflow-wrap: anywhere; }
   .stats { display: flex; gap: 24px; flex-wrap: wrap; }
   .stat .k { font-size: 12px; color: var(--muted); }
   .stat .v { font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; }
@@ -624,9 +626,10 @@
     </div>
   </section>
 
-  <section class="card" id="detail" data-fold="detail" hidden aria-live="polite">
+  <section class="card" id="detail" data-fold="detail" hidden aria-live="polite" aria-labelledby="detail-title">
     <div class="card-head">
-      <h2><button class="fold" type="button" aria-expanded="true" aria-controls="detail-body"><span class="tri"></span><span id="detail-name"></span></button></h2>
+      <h2 id="detail-title"><button class="fold" type="button" aria-expanded="true" aria-controls="detail-body"><span class="tri"></span>Preview Data</button></h2>
+      <strong id="detail-name"></strong>
       <span class="tag" id="detail-type"></span>
     </div>
     <div class="card-body" id="detail-body">
