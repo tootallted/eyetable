@@ -351,7 +351,7 @@ progress, then the result per source. One failing source doesn't stop the
 rest; the run is marked *Partly failed* and lists what went wrong.
 
 Scheduled runs happen inside `eyetable serve` (so on this PC, via the
-`EyetablePublicApi` logon task), which checks every 30 seconds for groups
+`EyetableApi` service or the `EyetablePublicApi` logon task), which checks every 30 seconds for groups
 that are due. If the PC was off at a scheduled time, the group runs once when
 eyetable starts again (a *catch-up* run), not once per missed slot. A group
 never runs twice at the same time.
@@ -440,6 +440,25 @@ Stop-ScheduledTask -TaskName EyetablePublicApi     # stop the API and tunnel
 
 `-Remove` unregisters it. Only one copy of `run-public.ps1` runs at a time; a
 second start just exits.
+
+**As a Windows service** instead, so it starts with Windows before anyone
+signs in, shows in Task Manager's Services tab and services.msc as
+`EyetableApi` ("eyetable API"), and is restarted if it stops: run once in
+PowerShell opened as administrator.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install-service.ps1
+```
+
+It builds `scripts/service/EyetableService.cs` with the C# compiler that comes
+with Windows, asks for your Windows password (the service runs as you, so it can
+publish the tunnel address with your GitHub sign-in and read `.env`), gives your
+account the *Log on as a service* right, and installs the service with delayed
+automatic start and restart on failure. It disables the logon task, so the two
+never run together. Start, stop or restart it from Task Manager > Services,
+services.msc, or `Restart-Service EyetableApi`. `-Uninstall` removes it and
+turns the logon task back on. If you change your Windows password, run the
+installer again.
 
 ## Where rows come from in an API response
 

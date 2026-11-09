@@ -98,9 +98,15 @@ function Publish-Url($url) {
     }
 }
 
-# One copy at a time: a manual start and the logon task would otherwise fight over the port.
-$mutex = New-Object System.Threading.Mutex($false, "Local\eyetable-run-public")
-if (-not $mutex.WaitOne(0)) {
+# One copy at a time: a manual start, the logon task and the service would otherwise
+# fight over the port. Global, because the service runs outside the signed-in session.
+$mutex = New-Object System.Threading.Mutex($false, "Global\eyetable-run-public")
+try {
+    $owned = $mutex.WaitOne(0)
+} catch [System.Threading.AbandonedMutexException] {
+    $owned = $true  # the last copy was ended without letting go; it's ours now
+}
+if (-not $owned) {
     Write-Log "run-public.ps1 is already running; this copy exits."
     exit 0
 }
