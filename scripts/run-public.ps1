@@ -9,7 +9,10 @@ quick tunnel (the same pattern as acomwebsite's tunnel-watchdog.ps1).
     writes it into API_BASE in docs/source_management/index.html, commits that
     one line (scripts/publish_api_base.py), and pushes; GitHub Pages then
     serves the page pointing at it.
-  * If either process exits, it is restarted.
+  * If either process exits, it is restarted. Cloudflare can also drop a quick
+    tunnel on its side while cloudflared keeps running and retrying: so once a
+    minute the API is called through the tunnel URL, and after 3 failures in a
+    row (with the API fine locally) cloudflared is restarted for a new URL.
 
 Anyone on the internet can reach the tunnel URL. Every API call still needs
 EYETABLE_API_TOKEN from .env, and the API rate-limits each client and locks
@@ -66,7 +69,18 @@ function Start-Tunnel {
         }
     }
     if ($url) { Publish-Url $url } else { Write-Log "WARNING: no tunnel URL within 30 s" }
+    $script:TunnelUrl = $url
+    $script:TunnelStarted = Get-Date
+    $script:TunnelFailures = 0
     return $proc
+}
+
+function Test-Health($base) {
+    try {
+        return (Invoke-WebRequest -UseBasicParsing "$base/api/health" -TimeoutSec 15).StatusCode -eq 200
+    } catch {
+        return $false
+    }
 }
 
 function Publish-Url($url) {
@@ -93,8 +107,29 @@ if (-not $mutex.WaitOne(0)) {
 
 $api = $null
 $tunnel = $null
+$TunnelUrl = $null
+$TunnelStarted = Get-Date
+$TunnelFailures = 0
+$LastCheck = Get-Date
 try {
     while ($true) {
+        # Is the tunnel still reachable from the internet? Checked once a minute,
+        # after a new tunnel has had a minute to come up.
+        $now = Get-Date
+        if ($tunnel -and -not $tunnel.HasExited -and $TunnelUrl -and ($now - $TunnelStarted).TotalSeconds -ge 60 -and ($now - $LastCheck).TotalSeconds -ge 60) {
+            $LastCheck = $now
+            if (Test-Health $TunnelUrl) {
+                $TunnelFailures = 0
+            } elseif (Test-Health "http://127.0.0.1:$Port") {
+                $TunnelFailures++
+                Write-Log "WARNING: the API isn't reachable at $TunnelUrl ($TunnelFailures of 3)"
+                if ($TunnelFailures -ge 3) {
+                    Write-Log "The tunnel is gone on Cloudflare's side; restarting cloudflared for a new URL"
+                    Stop-Process -Id $tunnel.Id -Force
+                    $tunnel.WaitForExit(10000) | Out-Null
+                }
+            }
+        }
         if (-not $api -or $api.HasExited) {
             if ($api) { Write-Log "eyetable serve exited ($($api.ExitCode)); restarting in 5 s"; Start-Sleep -Seconds 5 }
             $api = Start-Api
