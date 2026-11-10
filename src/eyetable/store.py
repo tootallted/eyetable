@@ -291,6 +291,16 @@ class CoreStore:
             sa.Column("cache", sa.Text, nullable=False),
             sa.Column("updated_at", UTCDateTime(), nullable=False),
         )
+        # Per loaded table: the latest key scan (see keys.py) and the natural key chosen from it.
+        self.table_keys = sa.Table(
+            "table_keys",
+            self.metadata,
+            sa.Column("table_name", sa.Text, primary_key=True),
+            sa.Column("scan", JSONType),
+            sa.Column("scanned_at", UTCDateTime()),
+            sa.Column("key_columns", JSONType),
+            sa.Column("key_set_at", UTCDateTime()),
+        )
         self.uploads = sa.Table(
             "uploads",
             self.metadata,
@@ -658,6 +668,30 @@ class CoreStore:
         """Delete a table of loaded data (a database source's table that was unchosen)."""
         with self.db.begin() as conn:
             conn.execute(sa.text(f"DROP TABLE IF EXISTS {self.qualified(table)}"))
+            conn.execute(sa.delete(self.table_keys).where(self.table_keys.c.table_name == table))
+
+    # -- key scans and natural keys ------------------------------------------
+
+    def get_table_key(self, table: str) -> dict[str, Any] | None:
+        """The latest key scan of a table and its chosen natural key, if either exists."""
+        with self.db.connect() as conn:
+            row = conn.execute(sa.select(self.table_keys).where(self.table_keys.c.table_name == table)).first()
+        if row is None:
+            return None
+        return {"scan": row.scan, "scanned_at": row.scanned_at, "key": row.key_columns, "key_set_at": row.key_set_at}
+
+    def _upsert_key_row(self, table: str, **values: Any) -> None:
+        with self.db.begin() as conn:
+            done = conn.execute(sa.update(self.table_keys).where(self.table_keys.c.table_name == table).values(**values))
+            if not done.rowcount:
+                conn.execute(sa.insert(self.table_keys).values(table_name=table, **values))
+
+    def save_key_scan(self, table: str, scan: dict[str, Any]) -> None:
+        self._upsert_key_row(table, scan=json.loads(json.dumps(scan, default=str)), scanned_at=_now())
+
+    def save_table_key(self, table: str, columns: list[str] | None) -> None:
+        """Set (or, with None, clear) the natural key of a table."""
+        self._upsert_key_row(table, key_columns=columns, key_set_at=_now() if columns else None)
 
     def last_loaded(self, source: str) -> dt.datetime | None:
         """When data last finished loading into this source successfully."""

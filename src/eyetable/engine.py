@@ -3,12 +3,14 @@
 import csv
 import datetime as dt
 import io
+import logging
 import os
 from collections.abc import Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
-from eyetable import gsheets
+from eyetable import gsheets, keys
 from eyetable.connectors import Connector, build_connector
 from eyetable.connectors.file import DATASET_KEY, FileConnector
 from eyetable.credentials import decrypt_secrets, resolve_env
@@ -16,6 +18,8 @@ from eyetable.identifiers import SOURCE_NAME, table_name
 from eyetable.models import ColumnInfo, DatasetInfo
 from eyetable.store import CoreStore, SourceNotFound
 from eyetable.types import infer_columns
+
+log = logging.getLogger(__name__)
 
 # Source types whose data is one table, <source>__data, loaded by pushing data in
 # (a dropped file, a Google Sheet tab) rather than by a connector pulling it.
@@ -75,10 +79,35 @@ class Engine:
         store: CoreStore,
         connector_factory: ConnectorFactory = build_connector,
         environ: Mapping[str, str] | None = None,
+        scan_keys: str = "inline",
     ):
+        """`scan_keys`: after each load, scan the table for key candidates "inline" (before
+        the load returns), in the "background" (the API server, so a load isn't held up), or "off"."""
+        if scan_keys not in ("inline", "background", "off"):
+            raise ValueError(f"unknown scan_keys {scan_keys!r}")
         self.store = store
         self._factory = connector_factory
         self._environ = environ
+        self._scan_keys = scan_keys
+        self._scans: ThreadPoolExecutor | None = None
+
+    def scan_keys(self, table: str) -> None:
+        """Scan a just-loaded table for the columns that could be its key (see keys.py)."""
+        if self._scan_keys == "off":
+            return
+        if self._scan_keys == "background":
+            if self._scans is None:
+                self._scans = ThreadPoolExecutor(max_workers=1, thread_name_prefix="eyetable-keys")
+            self._scans.submit(self._scan_quietly, table)
+        else:
+            self._scan_quietly(table)
+
+    def _scan_quietly(self, table: str) -> None:
+        # A scan only informs; it must never fail the load it follows.
+        try:
+            keys.scan_and_save(self.store, table)
+        except Exception:
+            log.exception("key scan of %s failed", table)
 
     @property
     def secret_key(self) -> str | None:
@@ -152,6 +181,7 @@ class Engine:
             return RunResult(run_id, DATASET_KEY, table, "failed", 0, error, upload_id)
         self.store.finish_run(run_id, "succeeded", rows)
         self.store.save_catalog(source, [dataset])
+        self.scan_keys(table)
         return RunResult(run_id, DATASET_KEY, table, "succeeded", rows, upload_id=upload_id)
 
     def plan_gsheet(self, book: gsheets.Workbook) -> SheetLoad:
@@ -229,6 +259,7 @@ class Engine:
             self.store.finish_run(run_id, "failed", 0, error)
             return RunResult(run_id, tab.title, table, "failed", 0, error, upload_id)
         self.store.finish_run(run_id, "succeeded", rows)
+        self.scan_keys(table)
         kinds = infer_columns(tab.records)
         self.store.save_catalog(source, [DatasetInfo(
             key=DATASET_KEY, name=DATASET_KEY, kind="sheet",
@@ -551,4 +582,5 @@ class Engine:
                 else:
                     self.store.finish_run(run_id, "succeeded", rows)
                     results.append(RunResult(run_id, key, table, "succeeded", rows))
+                    self.scan_keys(table)
         return results

@@ -36,7 +36,7 @@ from eyetable.engine import SINGLE_TABLE_TYPES, Engine
 from eyetable.gsheets import SheetError, fetch_workbook, fetch_workbook_signed_in
 from eyetable.identifiers import SOURCE_NAME, normalize_tag, table_name
 from eyetable.query import MAX_LIMIT, QueryError, QueryRunner
-from eyetable import dbconnect, entra
+from eyetable import dbconnect, entra, keys
 from eyetable.curl import auth_scheme, clean_statements, components, parse_curl, preview_statements, secret_places, stored_request
 from eyetable.curl import plan as curl_plan
 from eyetable.google_auth import GoogleAuthError, GoogleConnection
@@ -164,6 +164,10 @@ class CurlLoadIn(CurlIn):
 
 class GoogleCodeIn(BaseModel):
     code: str = Field(min_length=1, max_length=2048)
+
+
+class KeyIn(BaseModel):
+    columns: list[str] = Field(default_factory=list, max_length=8)
 
 
 class ReloadIn(BaseModel):
@@ -731,6 +735,38 @@ def create_app(
             if found is None:
                 raise HTTPException(404, "no such job (eyetable may have restarted)")
             return jsonable_encoder(dict(found))
+
+    # -- key candidates and natural keys (keys.py) ------------------------------
+    TABLE_NAME = re.compile(r"^[A-Za-z0-9_]{1,63}$")
+
+    def loaded_table(table: str) -> str:
+        if not TABLE_NAME.match(table) or not store.table_exists(table):
+            raise HTTPException(404, f"there is no loaded table named {table}")
+        return table
+
+    @app.get("/api/tables/{table}/keys", dependencies=auth)
+    def table_keys(table: str) -> dict[str, Any]:
+        """A table's latest key scan, its natural key, and whether the key still holds."""
+        return jsonable_encoder(keys.key_info(store, loaded_table(table)))
+
+    @app.post("/api/tables/{table}/keys/scan", dependencies=auth, status_code=202)
+    def scan_table_keys(table: str) -> dict[str, Any]:
+        """Scan a table again, in the background (a big table can take a while)."""
+        loaded_table(table)
+        return {"job_id": start_job("key-scan", lambda: jsonable_encoder(keys.scan_and_save(store, table)))}
+
+    @app.put("/api/tables/{table}/key", dependencies=auth)
+    def set_table_key(table: str, body: KeyIn) -> dict[str, Any]:
+        """Make these columns the table's natural key; refused unless they identify every row."""
+        try:
+            return jsonable_encoder(keys.choose_key(store, loaded_table(table), body.columns))
+        except keys.KeyProblem as exc:
+            raise HTTPException(400, str(exc)) from None
+
+    @app.delete("/api/tables/{table}/key", dependencies=auth)
+    def clear_table_key(table: str) -> dict[str, Any]:
+        store.save_table_key(loaded_table(table), None)
+        return jsonable_encoder(keys.key_info(store, table))
 
     # -- curl commands -----------------------------------------------------------
     @app.post("/api/curl/inspect", dependencies=auth)

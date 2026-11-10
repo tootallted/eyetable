@@ -397,6 +397,44 @@ again; **Last loaded** shows when data last finished loading.
 Each reload is an ingestion run, so rows get a new `ET_timestamp` and
 `ET_run_id`, and `ET_id` starts again at 1. API: `POST /api/sources/<name>/reload`.
 
+### Key candidates and natural keys
+
+After every load, eyetable scans the table it loaded. The scan counts each
+source column's blank (null) values and distinct values. eyetable's own ET_
+columns are left out: `ET_id` is always unique, but it is only a row number
+given at load time, so it can't match a row from one load to the next.
+
+* **Primary key candidates.** These are columns with a value in every row and
+  no repeats. If there are several, the most ID-like name is suggested first
+  (`id`, `…id`, `…_key`, `…code`, `…number`).
+* **No primary key column.** When no single column qualifies, the scan says so.
+  It then looks for the smallest sets of two, then three, columns whose values
+  are unique together. It searches the most varied columns, for up to a minute.
+* **Nothing identifies the rows.** If no set of up to three columns works
+  either, the scan counts rows that are **exact copies** of another row. Copies
+  usually mean the same records were loaded twice. If there are no copies, it
+  takes a larger set of columns to identify a row.
+
+**Preview Data** shows this under **Natural key** for the table being
+previewed; a database source with several tables has a Table picker above it.
+The **Primary key** stat shows the result in short. To choose the natural key:
+
+1. Tick the column, or columns. **Use …** ticks one of the scan's column sets.
+2. Click **Save**. eyetable refuses a key that has a blank or a repeated value,
+   and says how many rows are affected.
+
+Every later scan checks the saved key again. If a load breaks the key, the key
+is kept and flagged with the blank and repeated counts. **Scan again** runs a
+scan on demand.
+
+The natural key is stored per table in `eyetable.table_keys`. It is not used
+for loading yet; it is the groundwork for features that need to match rows
+across loads.
+
+API: `GET /api/tables/<table>/keys`, `POST /api/tables/<table>/keys/scan` (a
+background job), `PUT /api/tables/<table>/key` with `{"columns": [...]}`, and
+`DELETE /api/tables/<table>/key`.
+
 ### Tags
 
 Give any source tags such as `#base` or `#finance`: in **Sources**, click

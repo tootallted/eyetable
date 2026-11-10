@@ -265,7 +265,7 @@ def serve(
             "database role (still read-only); scripts/setup-postgres.ps1 creates a SELECT-only role for it"
         )
     app_ = create_app(
-        Engine(store),
+        Engine(store, scan_keys="background"),  # key scans after loads don't hold up the page
         token,
         cors_origins=origins or DEFAULT_CORS_ORIGINS,
         max_upload_bytes=int(max_mb) * 1024 * 1024 if max_mb else DEFAULT_MAX_UPLOAD_BYTES,

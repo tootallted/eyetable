@@ -257,6 +257,8 @@
   .db-tools input[type=search] { flex: 1 1 180px; width: auto; }
   .db-tools select { width: auto; }
   .db-list { max-height: 380px; overflow: auto; }
+  .key-cols td.yes { color: var(--ok); font-weight: 600; }
+  .key-cols tr.chosen td { background: var(--accent-soft); }
   .sources-table tr.conn td { background: var(--surface-2); font-weight: 600; }
   .sources-table tr.conn td:first-child { white-space: normal; }
   .conn-caret { display: inline-block; width: 16px; color: var(--muted); transition: transform .12s; }
@@ -730,9 +732,14 @@
           <div id="set-msg" role="status"></div>
         </div>
       </div>
+      <div class="preview-pick" id="detail-preview-pick" hidden></div>
+      <div id="detail-keys" hidden style="display:grid; gap:10px">
+        <h3 style="font-size:14px; margin:0">Natural key <span class="muted" id="key-table" style="font-weight:400"></span></h3>
+        <div id="key-body" style="display:grid; gap:10px"></div>
+        <div id="key-msg" role="status"></div>
+      </div>
       <div>
         <h3 style="font-size:14px; margin:0 0 8px">First rows</h3>
-        <div class="preview-pick" id="detail-preview-pick" hidden></div>
         <div class="table-wrap" id="detail-preview"></div>
       </div>
       <div>
@@ -2027,6 +2034,8 @@
         if (src.tables && src.tables.length > 1) stat('Tables', fmtInt(src.tables.length));
         else stat('Table', 'eyetable_raw.' + src.table, true);
         if (src.statement_count !== undefined) stat('Statements', fmtInt(src.statement_count));
+        stats.appendChild(el('div', { class: 'stat' }, [el('div', { class: 'k', text: 'Primary key' }),
+          el('div', { class: 'v', id: 'key-stat', text: '\u2026' })]));
       } else {
         stat('Datasets', fmtInt(src.datasets));
         stat('Runs', fmtInt(src.runs.length));
@@ -2043,6 +2052,8 @@
           return el('option', { value: t.table, text: t.schema + '.' + t.name });
         }));
         which.addEventListener('change', function () {
+          var picked = src.tables.filter(function (t) { return t.table === which.value; })[0];
+          renderKeys(which.value, picked && picked.last_loaded_at);
           api('/api/sources/' + encodeURIComponent(src.name) + '/preview?limit=20&table=' + encodeURIComponent(which.value)).then(function (p) {
             clear($('detail-preview')).appendChild(dataTable(p.columns, p.rows, { empty: 'The table is empty.' }));
           }, function (err) { clear($('detail-preview')).appendChild(banner('err', err.message)); });
@@ -2050,6 +2061,8 @@
         pickBox.appendChild(el('span', { text: 'Table' }));
         pickBox.appendChild(which);
       }
+      renderKeys(src.table && preview && preview.columns.length ? src.table : null,
+        src.tables && src.tables.length ? src.tables[0].last_loaded_at : src.last_loaded_at);
       if (preview) pv.appendChild(dataTable(preview.columns, preview.rows, { empty: 'The table is empty.' }));
       else pv.appendChild(el('div', { class: 'empty', text: 'Previews are shown for file sources. Use the CLI to ingest ' + src.type + ' sources.' }));
 
@@ -2064,6 +2077,203 @@
           return [fmtTime(u.uploaded_at), u.filename, fmtBytes(u.size_bytes), u.mode, run.rows_written === undefined ? null : run.rows_written, run.status || null];
         })
       ));
+    }
+
+    // -- natural keys: which columns identify a row ---------------------------
+    // Every load is followed by a scan of its table (keys.py on the server): each column's
+    // blanks and distinct values, the columns that could be the primary key, and, when no
+    // single column can, the smallest sets of columns that identify every row.
+    var keyView = { table: null, info: null, chosen: {}, waits: 0 };
+
+    function keyText(cols) { return cols.join(' + '); }
+    function keyApi(table, rest) { return '/api/tables/' + encodeURIComponent(table) + rest; }
+
+    function keyStatText(info) {
+      if (info.key) return keyText(info.key) + (info.key_check && !info.key_check.ok ? ' (no longer unique)' : '');
+      var s = info.scan;
+      if (!s) return 'Not scanned yet';
+      if (!s.rows) return 'Table is empty';
+      if (s.primary_key_candidates.length) return s.primary_key_candidates[0] + ' (candidate, not set)';
+      return 'No primary key column';
+    }
+
+    function keyProblem(chk) {
+      if (!chk) return '';
+      if (chk.missing) return 'The table no longer has ' + chk.missing.join(', ') + ', so the key can\u2019t be checked. Choose another key.';
+      if (!chk.rows) return 'The table is empty, so the key can\u2019t be checked.';
+      var parts = [];
+      if (chk.null_rows) parts.push(plural(chk.null_rows, 'row') + ' with a blank (null) value');
+      if (chk.duplicate_values) parts.push(plural(chk.duplicate_values, 'value') + ' repeated across ' + fmtInt(chk.duplicate_rows) + ' rows');
+      return 'Since the latest load it no longer identifies every row: ' + parts.join(' and ') + '. The key is kept; choose another or fix the data.';
+    }
+
+    function renderKeys(table, loadedAt) {
+      keyView = { table: table, info: null, chosen: {}, waits: 0, loadedAt: loadedAt };
+      $('detail-keys').hidden = !table;
+      clear($('key-msg'));
+      if (!table) return;
+      $('key-table').textContent = 'eyetable_raw.' + table;
+      clear($('key-body')).appendChild(el('div', { class: 'muted', text: 'Loading the key scan\u2026' }));
+      fetchKeys(table);
+    }
+
+    function fetchKeys(table) {
+      api(keyApi(table, '/keys')).then(function (info) {
+        if (keyView.table !== table) return;
+        // A load scans its table just after it finishes; if this scan predates the load, look again shortly.
+        var s = info.scan, stale = keyView.loadedAt && (!s || new Date(s.scanned_at) < new Date(keyView.loadedAt));
+        if (stale && keyView.waits < 20) { keyView.waits++; setTimeout(function () { if (keyView.table === table) fetchKeys(table); }, 3000); }
+        showKeys(info, stale && keyView.waits < 20);
+      }, function (err) { if (keyView.table === table) clear($('key-body')).appendChild(banner('err', err.message)); });
+    }
+
+    function showKeys(info, scanning) {
+      keyView.info = info;
+      keyView.chosen = {};
+      (info.key || []).forEach(function (c) { keyView.chosen[c] = true; });
+      var stat = $('key-stat');
+      if (stat) stat.textContent = keyStatText(info);
+      var body = clear($('key-body')), s = info.scan;
+
+      if (info.key) {
+        var chk = info.key_check, ok = chk && chk.ok;
+        body.appendChild(banner(ok ? 'ok' : 'warn', 'Natural key: ' + keyText(info.key) + '. ' + (ok
+          ? 'Every row has a value and no two rows share one (checked against ' + plural(chk.rows, 'row') + ').'
+          : keyProblem(chk))));
+      }
+      if (scanning) body.appendChild(el('div', { class: 'muted', text: 'Scanning the latest load\u2026 this updates by itself.' }));
+      if (!s) {
+        if (!scanning) body.appendChild(el('p', { class: 'hint', style: 'margin:0', text: 'This table hasn\u2019t been scanned yet. Scan it to see which columns could be its key.' }));
+        body.appendChild(keyActions(info));
+        return;
+      }
+
+      var cands = s.primary_key_candidates, sets = s.column_sets, found;
+      if (!s.rows) found = 'The table is empty, so no column can be shown to identify its rows.';
+      else if (cands.length === 1) found = cands[0] + ' has a value in every row and no repeats, so it can be the primary key.';
+      else if (cands.length) found = fmtInt(cands.length) + ' columns have a value in every row and no repeats, so each could be the primary key: ' +
+        cands.join(', ') + '. ' + cands[0] + ' looks most like an ID.';
+      else {
+        found = 'No primary key column: no single column has a value in every row with no repeats. ';
+        if (sets.length) found += 'These sets of columns do identify every row together; choose one below.';
+        else {
+          found += 'No set of up to ' + s.max_set_size + ' columns does either' + (s.cut_short ? ' that the scan found before it stopped (it looks for a minute at most)' : '') + '. ';
+          if (s.exact_copies) found += plural(s.exact_copies, 'row') + (s.exact_copies === 1 ? ' is an exact copy' : ' are exact copies') +
+            ' of another row, so no columns can tell ' + (s.exact_copies === 1 ? 'it' : 'them') + ' apart; the source may be sending the same records more than once.';
+          else if (s.exact_copies === 0) found += 'Every row is different, but it takes more than ' + s.max_set_size +
+            ' columns, or columns with blanks, to tell them apart. You can still tick a larger set below; saving checks it.';
+        }
+      }
+      body.appendChild(el('p', { style: 'margin:0', text: found }));
+      if (sets.length) body.appendChild(el('div', { class: 'set-actions' }, sets.map(function (set) {
+        var b = el('button', { type: 'button', class: 'btn small', text: 'Use ' + keyText(set) });
+        b.addEventListener('click', function () {
+          keyView.chosen = {};
+          set.forEach(function (c) { keyView.chosen[c] = true; });
+          renderKeyColumns();
+        });
+        return b;
+      })));
+      if (s.columns.length) {
+        body.appendChild(el('div', { class: 'table-wrap db-list', id: 'key-cols' }));
+        renderKeyColumns();
+      }
+      body.appendChild(keyActions(info));
+      updateKeySave();
+      body.appendChild(el('p', { class: 'hint', style: 'margin:0', text: 'Scanned ' + fmtTime(s.scanned_at) + ' over ' + plural(s.rows, 'row') +
+        '. Every load scans its table again and re-checks the natural key. ET_id isn\u2019t offered: eyetable numbers rows as it loads them, ' +
+        'so it can\u2019t match a row from one load to the next.' }));
+    }
+
+    function chosenKey() {
+      var order = keyView.info.scan ? keyView.info.scan.columns.map(function (c) { return c.name; }) : [];
+      return order.filter(function (n) { return keyView.chosen[n]; });
+    }
+
+    function renderKeyColumns() {
+      var wrap = $('key-cols');
+      if (!wrap) return;
+      clear(wrap);
+      var s = keyView.info.scan, cands = {};
+      s.primary_key_candidates.forEach(function (n) { cands[n] = true; });
+      var head = el('tr', null, [el('th', { text: 'Key' }), el('th', { text: 'Column' }), el('th', { text: 'Type' }),
+        el('th', { class: 'num', text: 'Blank (null)' }), el('th', { class: 'num', text: 'Distinct values' }), el('th', { text: 'Identifies every row' })]);
+      wrap.appendChild(el('table', { class: 'key-cols' }, [el('thead', null, [head]), el('tbody', null, s.columns.map(function (c) {
+        var box = el('input', { type: 'checkbox', 'aria-label': 'Use ' + c.name + ' in the natural key' });
+        box.checked = !!keyView.chosen[c.name];
+        var row = el('tr', { class: box.checked ? 'chosen' : '' }, [
+          el('td', null, [box]),
+          el('td', { 'data-label': 'Column' }, [el('strong', { text: c.name }), cands[c.name] ? el('span', { class: 'pill-new', style: 'margin-left:8px', text: 'primary key candidate' }) : '']),
+          el('td', { 'data-label': 'Type', text: c.kind }),
+          el('td', { class: 'num', 'data-label': 'Blank (null)', text: fmtInt(c.nulls) }),
+          el('td', { class: 'num', 'data-label': 'Distinct values', text: fmtInt(c.distinct) }),
+          el('td', { class: c.unique ? 'yes' : '', 'data-label': 'Identifies every row', text: c.unique ? 'Yes' : 'No' })
+        ]);
+        box.addEventListener('change', function () {
+          if (box.checked) keyView.chosen[c.name] = true; else delete keyView.chosen[c.name];
+          row.className = box.checked ? 'chosen' : '';
+          updateKeySave();
+        });
+        return row;
+      }))]));
+      updateKeySave();
+    }
+
+    function updateKeySave() {
+      var save = $('key-save');
+      if (!save) return;
+      var cols = chosenKey(), current = keyView.info.key || [];
+      save.disabled = !cols.length || cols.join('\u0000') === current.join('\u0000');
+      save.textContent = cols.length ? 'Save ' + keyText(cols) + ' as the natural key' : 'Tick the key column, or columns';
+    }
+
+    function keyActions(info) {
+      var table = keyView.table;
+      var bar = el('div', { class: 'set-actions' });
+      if (info.scan && info.scan.columns.length) {
+        var save = el('button', { type: 'button', class: 'btn primary', id: 'key-save', text: 'Save' });
+        save.addEventListener('click', function () {
+          var cols = chosenKey(), msg = clear($('key-msg'));
+          save.disabled = true;
+          save.textContent = 'Checking ' + keyText(cols) + '\u2026';
+          api(keyApi(table, '/key'), { method: 'PUT', headers: JSON_HEADERS, body: JSON.stringify({ columns: cols }) }).then(function (r) {
+            if (keyView.table !== table) return;
+            showKeys(r);
+            msg.appendChild(banner('ok', keyText(cols) + ' is now the natural key of this table.'));
+          }, function (err) {
+            msg.appendChild(banner('err', 'Not saved: ' + err.message));
+            updateKeySave();
+          });
+        });
+        bar.appendChild(save);
+      }
+      if (info.key) {
+        var drop = el('button', { type: 'button', class: 'btn danger', text: 'Clear the natural key' });
+        drop.addEventListener('click', function () {
+          var msg = clear($('key-msg'));
+          api(keyApi(table, '/key'), { method: 'DELETE' }).then(function (r) {
+            if (keyView.table === table) { showKeys(r); msg.appendChild(banner('ok', 'The natural key is cleared.')); }
+          }, function (err) { msg.appendChild(banner('err', err.message)); });
+        });
+        bar.appendChild(drop);
+      }
+      var rescan = el('button', { type: 'button', class: 'btn', text: info.scan ? 'Scan again' : 'Scan now' });
+      rescan.addEventListener('click', function () {
+        var msg = clear($('key-msg'));
+        rescan.disabled = true;
+        rescan.textContent = 'Scanning\u2026';
+        api(keyApi(table, '/keys/scan'), { method: 'POST' }).then(function (r) { return pollJob(r.job_id); }).then(function (job) {
+          if (keyView.table !== table) return;
+          if (job.status !== 'succeeded') throw new Error(job.error || 'the scan failed');
+          showKeys(job.result);
+        }).then(null, function (err) {
+          msg.appendChild(banner('err', 'Couldn\u2019t scan the table: ' + err.message));
+          rescan.disabled = false;
+          rescan.textContent = 'Scan again';
+        });
+      });
+      bar.appendChild(rescan);
+      return bar;
     }
 
     // -- staging a file ----------------------------------------------------
