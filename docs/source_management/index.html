@@ -275,6 +275,15 @@
   .banner.ok { background: var(--ok-soft); color: var(--ok); }
   .banner.err { background: var(--err-soft); color: var(--err); }
   .banner.warn { background: var(--warn-soft); color: var(--warn); }
+  .pill.wait .dot { background: var(--warn); }
+  .conn-report { display: grid; gap: 10px; }
+  .conn-report h3 { margin: 0; font-size: 15px; }
+  .conn-report h4 { margin: 0; font-size: 13px; }
+  .conn-report .kv dt { color: inherit; opacity: .8; }
+  .conn-report ol, .conn-report ul { margin: 0; padding-left: 20px; font-size: 13px; display: grid; gap: 4px; }
+  .conn-report code { overflow-wrap: anywhere; }
+  .conn-report .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+  .conn-wait { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
 
   .table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 10px; }
   table { border-collapse: collapse; width: 100%; font-size: 13px; }
@@ -922,14 +931,159 @@
       write('localStorage', KEY_TOKEN, remember ? state.token : '');
       write('sessionStorage', KEY_BASE, state.base);
       write('sessionStorage', KEY_TOKEN, state.token);
+      startConnecting();
+    }
+
+    // -- connecting: up to CONNECT_TRIES tries, CONNECT_WAIT seconds apart, then a report --
+    var CONNECT_TRIES = 5, CONNECT_WAIT = 30;
+    var conn = { run: 0, tries: [], timer: null, tick: null };
+
+    function hostOf(base) { return base.replace(/^https?:\/\//, '').replace(/\/.*$/, ''); }
+
+    function startConnecting() {
+      clearTimeout(conn.timer);
+      clearInterval(conn.tick);
+      conn = { run: conn.run + 1, tries: [], timer: null, tick: null };
+      clear($('top-msg'));
+      tryConnect(conn.run);
+    }
+
+    // What answers at the address: the API itself, only something in front of it
+    // (a Cloudflare error page, which a browser can't read across sites), or nothing.
+    function probe(base) {
+      var url = base.replace(/\/+$/, '') + '/api/health';
+      return fetch(url, { cache: 'no-store' }).then(function (res) {
+        return res.json().then(function (body) { return { kind: res.ok && body && body.ok ? 'api' : 'other', status: res.status, version: body && body.version }; },
+                               function () { return { kind: 'other', status: res.status }; });
+      }, function () {
+        return fetch(url, { mode: 'no-cors', cache: 'no-store' }).then(
+          function () { return { kind: 'front' }; },
+          function () { return { kind: 'nothing' }; });
+      });
+    }
+
+    function tryConnect(run) {
+      if (run !== conn.run) return;
+      var attempt = { n: conn.tries.length + 1, at: new Date() };
+      conn.tries.push(attempt);
+      setStatus('wait', 'Connecting… (try ' + attempt.n + ' of ' + CONNECT_TRIES + ')');
       $('settings-msg').textContent = 'Connecting…';
-      return refresh().then(function () {
+      latestApiBase().then(function (fresh) {
+        attempt.published = fresh;
+        // A restarted service publishes a new tunnel address; follow it, but never
+        // replace an address typed in by hand (localhost, say).
+        if (fresh && fresh !== state.base && (/\.trycloudflare\.com/.test(state.base) || state.base === API_BASE)) useBase(fresh);
+        attempt.base = state.base;
+        attempt.online = navigator.onLine;
+        return probe(state.base);
+      }).then(function (found) {
+        if (run !== conn.run) return;
+        attempt.probe = found;
+        if (found.kind !== 'api') throw { probe: true };
+        return refresh();
+      }).then(function () {
+        if (run !== conn.run) return;
         $('settings-msg').textContent = '';
         $('settings').hidden = true;
+        clear($('top-msg'));
+        if (attempt.n > 1) $('top-msg').appendChild(banner('ok', 'Connected on try ' + attempt.n + '.'));
       }, function (err) {
-        $('settings-msg').textContent = err.status === 401 ? 'The API rejected that token.' : err.message;
-        $('settings').hidden = false;
+        if (run !== conn.run) return;
+        attempt.error = err && err.probe ? null : err;
+        // A rejected token or a lockout won't fix itself by waiting.
+        var final = attempt.error && (attempt.error.status === 401 || attempt.error.status === 429);
+        if (final || attempt.n >= CONNECT_TRIES) { connectionReport(); return; }
+        waitToRetry(run);
       });
+    }
+
+    function attemptSummary(a) {
+      if (a.error && a.error.status === 401) return 'the API is up, but rejected the token';
+      if (a.error && a.error.status === 429) return 'the API refused: ' + a.error.message;
+      if (a.error) return 'the API answered ' + (a.error.status ? a.error.status + ': ' : '') + a.error.message;
+      if (!a.online) return 'this browser is offline';
+      if (!a.probe || a.probe.kind === 'nothing') return 'nothing answers at ' + hostOf(a.base || state.base);
+      if (a.probe.kind === 'front') return hostOf(a.base) + ' answers, but not the eyetable API behind it';
+      return hostOf(a.base) + ' answered ' + a.probe.status + ', not as the eyetable API';
+    }
+
+    function waitToRetry(run) {
+      var last = conn.tries[conn.tries.length - 1];
+      var left = CONNECT_WAIT;
+      var now = el('button', { type: 'button', class: 'btn small', text: 'Try now' });
+      var text = el('span');
+      var box = clear($('top-msg'));
+      box.appendChild(el('div', { class: 'banner warn conn-wait' }, [text, now]));
+      var show = function () {
+        text.textContent = "Can't reach the eyetable API yet (try " + last.n + ' of ' + CONNECT_TRIES + ': ' + attemptSummary(last) +
+          '). Trying again in ' + left + ' s.';
+        setStatus('wait', 'Retrying in ' + left + ' s (' + last.n + ' of ' + CONNECT_TRIES + ' tried)');
+      };
+      var go = function () { clearInterval(conn.tick); clearTimeout(conn.timer); tryConnect(run); };
+      now.addEventListener('click', go);
+      show();
+      conn.tick = setInterval(function () { left = Math.max(0, left - 1); show(); }, 1000);
+      conn.timer = setTimeout(go, CONNECT_WAIT * 1000);
+    }
+
+    function connectionHints(last) {
+      var hints = [];
+      var base = last.base || state.base;
+      if (last.error && last.error.status === 401) {
+        hints.push('Enter the token again under Connection: it is EYETABLE_API_TOKEN in the .env file on the PC running eyetable.');
+        return hints;
+      }
+      if (last.error && last.error.status === 429) {
+        hints.push('Too many tries from this address: wait for the time it gives, then use Try again.');
+        return hints;
+      }
+      if (!last.online) hints.push('This browser reports no internet connection; reconnect, then use Try again.');
+      if (location.protocol === 'https:' && /^http:/.test(base)) {
+        hints.push('Browsers block an http:// API from this https:// page. Use the tunnel address the page publishes, or open the page from ' + base + ' itself.');
+      }
+      if (ON_PAGES && !last.published) hints.push('The published copy of this page couldn\u2019t be read, so the API address may be out of date; check this browser\u2019s connection to github.io.');
+      if (last.published && last.published !== base) hints.push('The page now publishes ' + last.published + ', but ' + base + ' was tried; the address in Connection was typed in by hand.');
+      if (!last.probe || last.probe.kind === 'nothing') {
+        hints.push('Nothing answers at ' + hostOf(base) + '. Cloudflare drops a tunnel\u2019s address when the tunnel stops, so the PC running eyetable may be off, asleep or offline, or its service is restarting (a new address is published about a minute later, and this page picks it up on Try again).');
+      } else if (last.probe.kind === 'front') {
+        hints.push('The tunnel at ' + hostOf(base) + ' is up, but the eyetable API behind it isn\u2019t answering: it may be starting or have stopped. The service restarts it within seconds.');
+      }
+      hints.push('On the PC running eyetable: Task Manager \u2192 Services \u2192 EyetableApi should be Running. Restart it there, or with Restart-Service EyetableApi in PowerShell opened as administrator.');
+      hints.push('That PC\u2019s log, logs\\run-public.log in the eyetable folder, shows each tunnel address published and any restarts.');
+      return hints;
+    }
+
+    function connectionReport() {
+      clearInterval(conn.tick);
+      var tries = conn.tries, last = tries[tries.length - 1], first = tries[0];
+      var unauthorized = last.error && last.error.status === 401;
+      setStatus('err', unauthorized ? 'Token rejected' : 'Not connected');
+      $('settings-msg').textContent = unauthorized ? 'The API rejected that token.' : '';
+      $('settings').hidden = false;
+      var minutes = Math.round((last.at - first.at) / 60000);
+      var details = el('dl', { class: 'kv' });
+      var row = function (k, v) { details.appendChild(el('dt', { text: k })); details.appendChild(el('dd', { text: v })); };
+      row('API address', last.base || state.base);
+      if (ON_PAGES) row('Published address', last.published || 'couldn\u2019t read the published page');
+      row('What answered', last.probe ? (last.probe.kind === 'api' ? 'the eyetable API' + (last.probe.version ? ' ' + last.probe.version : '')
+        : last.probe.kind === 'front' ? 'something in front of the API (a Cloudflare error), not the API' : 'nothing (no such address, or no connection)') : 'not checked');
+      row('Last error', attemptSummary(last));
+      row('This browser', (last.online ? 'online' : 'offline') + ' · ' + location.origin);
+      row('API token', state.token ? 'entered (' + (read('localStorage', KEY_TOKEN) ? 'remembered on this browser' : 'this tab only') + ')' : 'none');
+      row('Tried', plural(tries.length, 'time') + (tries.length > 1 ? ' over ' + (minutes < 1 ? 'under a minute' : plural(minutes, 'minute')) : '') + ', last at ' + last.at.toLocaleTimeString());
+      var again = el('button', { type: 'button', class: 'btn small', text: 'Try again' });
+      again.addEventListener('click', startConnecting);
+      var settings = el('button', { type: 'button', class: 'btn small', text: 'Connection settings' });
+      settings.addEventListener('click', function () { $('settings').hidden = false; $('api-token').focus(); });
+      clear($('top-msg')).appendChild(el('div', { class: 'banner err conn-report', role: 'alert' }, [
+        el('h3', { text: unauthorized ? 'The eyetable API rejected the token' : 'Couldn\u2019t connect to the eyetable API' + (tries.length > 1 ? ' after ' + tries.length + ' tries' : '') }),
+        details,
+        el('h4', { text: 'Each try' }),
+        el('ol', null, tries.map(function (a) { return el('li', { text: a.at.toLocaleTimeString() + ' \u2014 ' + (a.base || state.base) + ' \u2014 ' + attemptSummary(a) }); })),
+        el('h4', { text: 'What to check' }),
+        el('ul', null, connectionHints(last).map(function (h) { return el('li', { text: h }); })),
+        el('div', { class: 'actions' }, [again, settings])
+      ]));
     }
 
     function refresh() {
@@ -2925,7 +3079,9 @@
     $('api-base').value = (ON_PAGES && API_BASE) || savedBase || defaultBase();
     latestApiBase().then(function (fresh) {
       if (fresh) $('api-base').value = fresh;
-      if (savedToken) connect(); else $('settings').hidden = false;
+      if (savedToken) { connect(); return; }
+      $('settings').hidden = false;
+      $('settings-msg').textContent = 'Enter the API token. Tick Remember on this browser and the page connects by itself from then on.';
     });
   })();
 </script>
