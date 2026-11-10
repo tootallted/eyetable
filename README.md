@@ -341,6 +341,20 @@ click it; which ones are open is remembered in the browser. A source loaded or
 chosen elsewhere opens its line. A source with nothing to share a line with
 stays a row of its own.
 
+**Sorting.** Click a column header to sort by it. Click again to reverse the
+order, and a third time to go back to the usual order. Rows and Last loaded
+sort high-to-low first. Blank values always sort last, and the browser
+remembers the sort.
+
+**Filtering.** Each column has a filter box under its header. A source shows
+when every non-empty filter matches part of the column's text. Number columns
+also take comparisons such as `>1000`, `<=5` or `=0`. While a filter is on,
+every connection line with a match opens, and a count above the table shows
+how many sources match, with **Clear filters**. Escape empties a box.
+
+The natural key's column table (in Preview Data) sorts and filters the same
+way. Sorting its **Key** column brings ticked columns to the top.
+
 ### Several tables in one database source
 
 A database source can load any number of its database's tables and views, each

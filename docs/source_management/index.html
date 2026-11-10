@@ -325,6 +325,19 @@
   tr.clickable:hover td { background: var(--surface-2); }
   tr.selected td { background: var(--accent-soft); }
   .sources-table td.wrap { white-space: normal; overflow-wrap: anywhere; }  /* names can be long and have no spaces */
+  /* sortable, filterable headers */
+  thead.sf { position: sticky; top: 0; z-index: 2; }
+  thead.sf th { position: static; }
+  thead.sf tr.sf-filters th { padding-top: 0; padding-bottom: 6px; }
+  .sf-sort { all: unset; cursor: pointer; display: inline-flex; gap: 4px; align-items: center; color: inherit; font: inherit; border-radius: 4px; }
+  .sf-sort:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .sf-sort .sf-ind { font-size: 10px; opacity: .45; }
+  .sf-sort.on .sf-ind { opacity: 1; color: var(--accent); }
+  th.num .sf-sort { flex-direction: row-reverse; }
+  .sf-filter { width: 100%; min-width: 64px; box-sizing: border-box; padding: 3px 6px; font: 400 12.5px/1.3 inherit; font-family: inherit;
+    border: 1px solid var(--border); border-radius: 5px; background: var(--surface); color: var(--text); }
+  th.num .sf-filter { text-align: right; }
+  .sf-note { display: flex; gap: 10px; align-items: center; font-size: 13px; color: var(--muted); padding: 0 0 8px; }
   @media (max-width: 900px) {  /* too narrow for columns: each source becomes a small block */
     .sources-table thead { display: none; }
     .sources-table, .sources-table tbody, .sources-table tr { display: block; }
@@ -342,6 +355,12 @@
     .sources-table tr.conn td { font-weight: 400; }
     .sources-table tr.conn td:empty { display: none; }
     .sources-table .sub-name { padding-left: 0; }
+    /* the sort buttons and filters stay, as a wrapped strip above the sources */
+    .sources-table thead.sf { display: block; position: static; }
+    .sources-table thead.sf tr { display: flex; flex-wrap: wrap; gap: 6px 12px; padding: 6px 12px; border-bottom: 0; }
+    .sources-table thead.sf th { padding: 0; border: 0; background: none; text-align: left; }
+    .sources-table thead.sf th:empty { display: none; }
+    .sources-table thead.sf .sf-filter { width: 150px; text-align: left; }
   }
   .tag { display: inline-block; padding: 1px 8px; border-radius: 999px; background: var(--surface-2); border: 1px solid var(--border); font-size: 12px; color: var(--muted); }
   .empty { padding: 28px 16px; text-align: center; color: var(--muted); }
@@ -1307,7 +1326,106 @@
       bar.appendChild(make);
     }
 
+    // -- sortable, filterable tables ---------------------------------------------
+    // `cols`: [{key, label, value(row) for sorting, text(row) for filtering, numeric, num (right-aligned),
+    // sort: false / filter: false to turn either off}]. `view`: {sort, dir, filters: {key: text}}.
+    // A numeric column's filter also takes >100, <=5, =0 and so on.
+    function sfMatch(text, filter, numeric, number) {
+      var f = (filter || '').trim().toLowerCase();
+      if (!f) return true;
+      var m = numeric && /^(>=|<=|>|<|=)\s*(-?[\d,]*\.?\d+)$/.exec(f);
+      if (m) {
+        if (number === null || number === undefined || isNaN(number)) return false;
+        var v = parseFloat(m[2].replace(/,/g, ''));
+        return m[1] === '>' ? number > v : m[1] === '<' ? number < v : m[1] === '>=' ? number >= v : m[1] === '<=' ? number <= v : number === v;
+      }
+      return String(text === null || text === undefined ? '' : text).toLowerCase().indexOf(f) >= 0;
+    }
+
+    function sfBlank(v) { return v === null || v === undefined || v === ''; }
+
+    function sfApply(rows, cols, view) {
+      var out = rows.filter(function (r) {
+        return cols.every(function (c) {
+          if (c.filter === false || !view.filters[c.key]) return true;
+          return sfMatch((c.text || c.value)(r), view.filters[c.key], c.numeric, c.numeric ? c.value(r) : null);
+        });
+      });
+      var col = cols.filter(function (c) { return c.key === view.sort; })[0];
+      if (!col) return out;
+      return out.map(function (r, i) { return [r, i, col.value(r)]; }).sort(function (x, y) {
+        var a = x[2], b = y[2];
+        if (sfBlank(a) || sfBlank(b)) return sfBlank(a) === sfBlank(b) ? x[1] - y[1] : sfBlank(a) ? 1 : -1;  // blanks last, either way
+        var d = typeof a === 'number' && typeof b === 'number' ? a - b
+          : String(a).localeCompare(String(b), undefined, { numeric: true, sensitivity: 'base' });
+        return d ? d * view.dir : x[1] - y[1];
+      }).map(function (x) { return x[0]; });
+    }
+
+    function sfFiltering(view) { return Object.keys(view.filters).some(function (k) { return view.filters[k] && view.filters[k].trim(); }); }
+
+    // The two header rows: a sort button per column, then a filter box per column.
+    function sfHead(cols, view, onSort, onFilter) {
+      var heads = cols.map(function (c) {
+        var th = el('th', { class: c.num ? 'num' : '', scope: 'col' });
+        if (c.sort === false || !c.label) { th.textContent = c.label || ''; return th; }
+        var on = view.sort === c.key;
+        th.setAttribute('aria-sort', on ? (view.dir > 0 ? 'ascending' : 'descending') : 'none');
+        var b = el('button', { type: 'button', class: 'sf-sort' + (on ? ' on' : ''),
+          title: 'Sort by ' + c.label + (on ? (view.dir > 0 ? ' (now A\u2192Z / low\u2192high; click to reverse)' : ' (now Z\u2192A / high\u2192low; click to stop sorting)') : '') }, [
+          el('span', { text: c.label }), el('span', { class: 'sf-ind', 'aria-hidden': 'true', text: on ? (view.dir > 0 ? '\u25b2' : '\u25bc') : '\u21c5' })]);
+        b.addEventListener('click', function (e) {
+          e.stopPropagation();
+          if (!on) { view.sort = c.key; view.dir = c.firstDir || 1; }
+          else if (view.dir === (c.firstDir || 1)) view.dir = -view.dir;
+          else { view.sort = null; view.dir = 1; }  // third click: back to the usual order
+          onSort();
+        });
+        th.appendChild(b);
+        return th;
+      });
+      var filters = cols.map(function (c) {
+        var th = el('th', { class: c.num ? 'num' : '' });
+        if (c.filter === false || !c.label) return th;
+        var box = el('input', { type: 'search', class: 'sf-filter', placeholder: 'Filter ' + c.label.toLowerCase(), 'aria-label': 'Filter by ' + c.label,
+          title: c.numeric ? 'Part of the value, or a comparison such as >100, <=5 or =0' : 'Shows rows whose ' + c.label + ' contains this', spellcheck: 'false', autocomplete: 'off' });
+        box.value = view.filters[c.key] || '';
+        box.addEventListener('input', function () { view.filters[c.key] = box.value; onFilter(); });
+        box.addEventListener('click', function (e) { e.stopPropagation(); });
+        box.addEventListener('keydown', function (e) { e.stopPropagation(); if (e.key === 'Escape' && box.value) { box.value = ''; view.filters[c.key] = ''; onFilter(); } });
+        th.appendChild(box);
+        return th;
+      });
+      return el('thead', { class: 'sf' }, [el('tr', null, heads), el('tr', { class: 'sf-filters' }, filters)]);
+    }
+
     // -- sources list ------------------------------------------------------
+    var KEY_SOURCES_VIEW = 'eyetable.sourcesView';
+    state.sourcesView = { sort: null, dir: 1, filters: {} };
+    try {
+      var savedView = JSON.parse(read('localStorage', KEY_SOURCES_VIEW) || 'null');
+      if (savedView && savedView.sort) { state.sourcesView.sort = savedView.sort; state.sourcesView.dir = savedView.dir === -1 ? -1 : 1; }
+    } catch (e) {}
+    state.filterClosed = {};  // connections closed while a filter is on (filtering opens them all)
+
+    function sourceTimeValue(s) { return s.last_loaded_at || s.updated_at || ''; }
+    var SOURCE_COLS = [
+      { key: 'name', label: 'Source', value: function (s) { return s.name; },
+        text: function (s) { return s.name + ' ' + (s.connection ? s.connection.label : ''); } },
+      { key: 'tags', label: 'Tags', value: function (s) { return (s.tags || []).join(' '); },
+        text: function (s) { return (s.tags || []).map(function (t) { return '#' + t; }).join(' '); } },
+      { key: 'type', label: 'Type', value: function (s) { return typeLabel(s.type); } },
+      { key: 'table', label: 'Table', value: function (s) { return s.tables ? s.tables.map(function (t) { return t.name; }).join(', ') : s.table || ''; },
+        text: function (s) { return s.tables ? s.tables.map(function (t) { return t.schema + '.' + t.name + ' eyetable_raw.' + t.table; }).join(' ') : 'eyetable_raw.' + (s.table || ''); } },
+      { key: 'rows', label: 'Rows', num: true, numeric: true, firstDir: -1,
+        value: function (s) { return s.rows === null || s.rows === undefined ? null : s.rows; },
+        text: function (s) { return s.rows === null || s.rows === undefined ? '' : fmtInt(s.rows) + ' ' + s.rows; } },
+      { key: 'file', label: 'Last file', value: function (s) { return s.last_upload ? s.last_upload.filename : ''; } },
+      { key: 'loaded', label: 'Last loaded', firstDir: -1, value: sourceTimeValue,
+        text: function (s) { return sourceTimeValue(s) ? fmtTime(sourceTimeValue(s)) : 'Not loaded yet'; } },
+      { key: 'actions', label: '', sort: false, filter: false }
+    ];
+
     function renderSources() {
       var wrap = clear($('sources'));
       if (!state.sources.length) {
@@ -1315,12 +1433,34 @@
         return;
       }
       renderTagFilter();
-      var head = el('tr', null, ['Source', 'Tags', 'Type', 'Table', 'Rows', 'Last file', 'Last loaded', ''].map(function (h, i) {
-        return el('th', { class: i === 4 ? 'num' : '', text: h, scope: 'col' });
-      }));
-      var shown = state.tagFilter
+      var view = state.sourcesView;
+      var note = el('div', { class: 'sf-note', role: 'status' });
+      var body = el('tbody');
+      var fill = function () { sourcesBody(body, note); };
+      var head = sfHead(SOURCE_COLS, view, function () {
+        write('localStorage', KEY_SOURCES_VIEW, JSON.stringify({ sort: view.sort, dir: view.dir }));
+        renderSources();
+      }, fill);
+      fill();
+      wrap.appendChild(note);
+      wrap.appendChild(el('table', { class: 'sources-table' }, [head, body]));
+    }
+
+    // The source rows under the headers: tag filter, column filters, sort, then grouping by connection.
+    function sourcesBody(body, note) {
+      var view = state.sourcesView, filtering = sfFiltering(view);
+      var tagged = state.tagFilter
         ? state.sources.filter(function (s) { return (s.tags || []).indexOf(state.tagFilter) >= 0; })
         : state.sources;
+      var shown = sfApply(tagged, SOURCE_COLS, view);
+      clear(note);
+      note.hidden = !filtering;
+      if (filtering) {
+        note.appendChild(el('span', { text: fmtInt(shown.length) + ' of ' + plural(tagged.length, 'source') + (shown.length === 1 ? ' matches' : ' match') + ' the filters.' }));
+        var reset = el('button', { type: 'button', class: 'link', text: 'Clear filters' });
+        reset.addEventListener('click', function () { view.filters = {}; state.filterClosed = {}; renderSources(); });
+        note.appendChild(reset);
+      }
       // Sources that share a connection (a database, a Google Sheet, an API host) sit under one line,
       // collapsed until it's opened; a source with nothing to share it with stays a row of its own.
       var byConnection = {};
@@ -1334,14 +1474,17 @@
         if (key && byConnection[key].length > 1) {
           if (placed[key]) return;
           placed[key] = true;
-          var open = !!state.openConnections[key];
-          rows.push(connectionRow(s.connection, byConnection[key], open));
+          // a filter opens every connection with a match, so what matched is in view
+          var open = filtering ? !state.filterClosed[key] : !!state.openConnections[key];
+          rows.push(connectionRow(s.connection, byConnection[key], open, filtering));
           if (open) byConnection[key].forEach(function (m) { rows.push.apply(rows, sourceRows(m, true)); });
         } else {
           rows.push.apply(rows, sourceRows(s, false));
         }
       });
-      wrap.appendChild(el('table', { class: 'sources-table' }, [el('thead', null, [head]), el('tbody', null, rows)]));
+      clear(body);
+      if (!rows.length) rows.push(el('tr', null, [el('td', { colspan: String(SOURCE_COLS.length), class: 'empty', text: 'No source matches the filters.' })]));
+      rows.forEach(function (r) { body.appendChild(r); });
     }
 
     var KEY_OPEN_CONNECTIONS = 'eyetable.openConnections';
@@ -1361,7 +1504,7 @@
       if (state.sources.filter(function (x) { return x.connection && x.connection.key === key; }).length > 1) setConnectionOpen(key, true);
     }
 
-    function connectionRow(connection, members, open) {
+    function connectionRow(connection, members, open, filtering) {
       var tables = members.reduce(function (n, m) { return n + (m.tables ? m.tables.length : 1); }, 0);
       var counted = members.filter(function (m) { return m.rows !== null && m.rows !== undefined; });
       var loaded = members.map(function (m) { return m.last_loaded_at; }).filter(Boolean).sort();
@@ -1378,7 +1521,11 @@
         el('td', { 'data-label': 'Last loaded', text: loaded.length ? fmtTime(loaded[loaded.length - 1]) : 'Not loaded yet' }),
         el('td')
       ]);
-      var toggle = function () { setConnectionOpen(connection.key, !open); renderSources(); };
+      var toggle = function () {
+        if (filtering) { if (open) state.filterClosed[connection.key] = true; else delete state.filterClosed[connection.key]; }
+        else setConnectionOpen(connection.key, !open);
+        renderSources();
+      };
       tr.addEventListener('click', toggle);
       tr.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); } });
       return tr;
@@ -2124,7 +2271,7 @@
     }
 
     function renderKeys(table, loadedAt, src) {
-      keyView = { table: table, info: null, chosen: {}, waits: 0, loadedAt: loadedAt, src: src };
+      keyView = { table: table, info: null, chosen: {}, waits: 0, loadedAt: loadedAt, src: src, sf: null };
       $('detail-keys').hidden = $('detail-incr').hidden = !table;
       clear($('key-msg'));
       clear($('incr-msg'));
@@ -2146,6 +2293,8 @@
     }
 
     function showKeys(info, scanning) {
+      var sameTable = keyView.info && keyView.info.table === info.table;
+      if (!sameTable) keyView.sf = null;  // keep the sort and filters while the same table is shown again
       keyView.info = info;
       keyView.chosen = {};
       (info.key || []).forEach(function (c) { keyView.chosen[c] = true; });
@@ -2209,15 +2358,47 @@
       return order.filter(function (n) { return keyView.chosen[n]; });
     }
 
+    function keyCols(cands) {
+      return [
+        { key: 'key', label: 'Key', filter: false, value: function (c) { return keyView.chosen[c.name] ? 0 : 1; } },
+        { key: 'name', label: 'Column', value: function (c) { return c.name; },
+          text: function (c) { return c.name + (cands[c.name] ? ' primary key candidate' : ''); } },
+        { key: 'kind', label: 'Type', value: function (c) { return c.kind; } },
+        { key: 'nulls', label: 'Blank (null)', num: true, numeric: true, value: function (c) { return c.nulls; } },
+        { key: 'distinct', label: 'Distinct values', num: true, numeric: true, firstDir: -1, value: function (c) { return c.distinct; } },
+        { key: 'unique', label: 'Identifies every row', value: function (c) { return c.unique ? 'Yes' : 'No'; } }
+      ];
+    }
+
     function renderKeyColumns() {
       var wrap = $('key-cols');
       if (!wrap) return;
       clear(wrap);
       var s = keyView.info.scan, cands = {};
       s.primary_key_candidates.forEach(function (n) { cands[n] = true; });
-      var head = el('tr', null, [el('th', { text: 'Key' }), el('th', { text: 'Column' }), el('th', { text: 'Type' }),
-        el('th', { class: 'num', text: 'Blank (null)' }), el('th', { class: 'num', text: 'Distinct values' }), el('th', { text: 'Identifies every row' })]);
-      wrap.appendChild(el('table', { class: 'key-cols' }, [el('thead', null, [head]), el('tbody', null, s.columns.map(function (c) {
+      if (!keyView.sf) keyView.sf = { sort: null, dir: 1, filters: {} };
+      var cols = keyCols(cands), body = el('tbody');
+      var count = el('div', { class: 'sf-note', role: 'status' });
+      var fill = function () {
+        var shown = sfApply(s.columns, cols, keyView.sf);
+        clear(count);
+        count.hidden = !sfFiltering(keyView.sf);
+        count.appendChild(el('span', { text: fmtInt(shown.length) + ' of ' + plural(s.columns.length, 'column') + (shown.length === 1 ? ' matches' : ' match') + ' the filters.' }));
+        var reset = el('button', { type: 'button', class: 'link', text: 'Clear filters' });
+        reset.addEventListener('click', function () { keyView.sf.filters = {}; renderKeyColumns(); });
+        count.appendChild(reset);
+        clear(body);
+        if (!shown.length) body.appendChild(el('tr', null, [el('td', { colspan: '6', class: 'empty', text: 'No column matches the filters.' })]));
+        shown.forEach(function (c) { body.appendChild(keyColumnRow(c, cands)); });
+      };
+      fill();
+      wrap.appendChild(count);
+      wrap.appendChild(el('table', { class: 'key-cols' }, [sfHead(cols, keyView.sf, renderKeyColumns, fill), body]));
+      updateKeySave();
+    }
+
+    function keyColumnRow(c, cands) {
+      return (function (c) {
         var box = el('input', { type: 'checkbox', 'aria-label': 'Use ' + c.name + ' in the natural key' });
         box.checked = !!keyView.chosen[c.name];
         var row = el('tr', { class: box.checked ? 'chosen' : '' }, [
@@ -2234,8 +2415,7 @@
           updateKeySave();
         });
         return row;
-      }))]));
-      updateKeySave();
+      })(c);
     }
 
     function updateKeySave() {
