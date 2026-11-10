@@ -257,6 +257,12 @@
   .db-tools input[type=search] { flex: 1 1 180px; width: auto; }
   .db-tools select { width: auto; }
   .db-list { max-height: 380px; overflow: auto; }
+  .sources-table tr.conn td { background: var(--surface-2); font-weight: 600; }
+  .sources-table tr.conn td:first-child { white-space: normal; }
+  .conn-caret { display: inline-block; width: 16px; color: var(--muted); transition: transform .12s; }
+  .sources-table tr.conn.open .conn-caret { transform: rotate(90deg); }
+  @media (prefers-reduced-motion: reduce) { .conn-caret { transition: none; } }
+  .sources-table tr.member > td:first-child { padding-left: 32px; }
   .sources-table tr.sub td { background: var(--surface-2); font-size: 12.5px; padding-top: 5px; padding-bottom: 5px; }
   .sources-table .sub-name { display: inline-block; padding-left: 18px; font-family: var(--mono); }
   .tbl-count { display: inline-flex; align-items: center; gap: 6px; }
@@ -325,6 +331,10 @@
     .sources-table td::before { content: attr(data-label); color: var(--muted); }
     .sources-table td > * { justify-self: start; }
     .sources-table tr.sub { margin-left: 14px; border-left: 3px solid var(--border); }
+    .sources-table tr.member { margin-left: 10px; border-left: 3px solid var(--accent-soft); }
+    .sources-table tr.member > td:first-child { padding-left: 0; }
+    .sources-table tr.conn td { font-weight: 400; }
+    .sources-table tr.conn td:empty { display: none; }
     .sources-table .sub-name { padding-left: 0; }
   }
   .tag { display: inline-block; padding: 1px 8px; border-radius: 999px; background: var(--surface-2); border: 1px solid var(--border); font-size: 12px; color: var(--muted); }
@@ -1295,11 +1305,76 @@
       var shown = state.tagFilter
         ? state.sources.filter(function (s) { return (s.tags || []).indexOf(state.tagFilter) >= 0; })
         : state.sources;
-      var rows = [];
+      // Sources that share a connection (a database, a Google Sheet, an API host) sit under one line,
+      // collapsed until it's opened; a source with nothing to share it with stays a row of its own.
+      var byConnection = {};
       shown.forEach(function (s) {
+        var key = s.connection && s.connection.key;
+        if (key) (byConnection[key] = byConnection[key] || []).push(s);
+      });
+      var rows = [], placed = {};
+      shown.forEach(function (s) {
+        var key = s.connection && s.connection.key;
+        if (key && byConnection[key].length > 1) {
+          if (placed[key]) return;
+          placed[key] = true;
+          var open = !!state.openConnections[key];
+          rows.push(connectionRow(s.connection, byConnection[key], open));
+          if (open) byConnection[key].forEach(function (m) { rows.push.apply(rows, sourceRows(m, true)); });
+        } else {
+          rows.push.apply(rows, sourceRows(s, false));
+        }
+      });
+      wrap.appendChild(el('table', { class: 'sources-table' }, [el('thead', null, [head]), el('tbody', null, rows)]));
+    }
+
+    var KEY_OPEN_CONNECTIONS = 'eyetable.openConnections';
+    state.openConnections = {};
+    try { state.openConnections = JSON.parse(read('localStorage', KEY_OPEN_CONNECTIONS) || '{}') || {}; } catch (e) {}
+
+    function setConnectionOpen(key, open) {
+      if (open) state.openConnections[key] = true; else delete state.openConnections[key];
+      write('localStorage', KEY_OPEN_CONNECTIONS, JSON.stringify(state.openConnections));
+    }
+
+    // A source chosen from elsewhere (just loaded, say) is shown even if its connection was closed.
+    function revealSource(name) {
+      var src = state.sources.filter(function (x) { return x.name === name; })[0];
+      var key = src && src.connection && src.connection.key;
+      if (!key || state.openConnections[key]) return;
+      if (state.sources.filter(function (x) { return x.connection && x.connection.key === key; }).length > 1) setConnectionOpen(key, true);
+    }
+
+    function connectionRow(connection, members, open) {
+      var tables = members.reduce(function (n, m) { return n + (m.tables ? m.tables.length : 1); }, 0);
+      var counted = members.filter(function (m) { return m.rows !== null && m.rows !== undefined; });
+      var loaded = members.map(function (m) { return m.last_loaded_at; }).filter(Boolean).sort();
+      var types = members.map(function (m) { return typeLabel(m.type); }).filter(function (t, i, all) { return all.indexOf(t) === i; });
+      var caret = el('span', { class: 'conn-caret', 'aria-hidden': 'true', text: '\u25b8' });
+      var tr = el('tr', { class: 'clickable conn' + (open ? ' open' : ''), tabindex: '0', 'aria-expanded': String(open),
+        title: (open ? 'Close ' : 'Open ') + connection.label + ' to ' + (open ? 'hide' : 'show') + ' its ' + plural(members.length, 'source') }, [
+        el('td', { class: 'wrap', 'data-label': 'Connection' }, [el('span', null, [caret, el('strong', { text: connection.label })])]),
+        el('td', { 'data-label': '' }),
+        el('td', { 'data-label': 'Type' }, types.map(function (t) { return el('span', { class: 'tag', text: t }); })),
+        el('td', { 'data-label': 'Holds', text: plural(members.length, 'source') + (tables !== members.length ? ', ' + plural(tables, 'table') : '') }),
+        el('td', { class: 'num', 'data-label': 'Rows', text: counted.length ? fmtInt(counted.reduce(function (n, m) { return n + m.rows; }, 0)) : '\u2014' }),
+        el('td', { 'data-label': '' }),
+        el('td', { 'data-label': 'Last loaded', text: loaded.length ? fmtTime(loaded[loaded.length - 1]) : 'Not loaded yet' }),
+        el('td')
+      ]);
+      var toggle = function () { setConnectionOpen(connection.key, !open); renderSources(); };
+      tr.addEventListener('click', toggle);
+      tr.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); } });
+      return tr;
+    }
+
+    // One source's row, and its tables' rows when it holds several and is open.
+    function sourceRows(s, member) {
+      var rows = [];
+      (function () {
         var several = s.tables && s.tables.length > 1;
         var open = several && !!state.expanded[s.name];
-        var tr = el('tr', { class: 'clickable' + (s.name === state.selected ? ' selected' : ''), tabindex: '0' }, [
+        var tr = el('tr', { class: 'clickable' + (member ? ' member' : '') + (s.name === state.selected ? ' selected' : ''), tabindex: '0' }, [
           el('td', { class: 'wrap', 'data-label': 'Source' }, [el('strong', { text: s.name })]),
           el('td', { 'data-label': 'Tags' }, [tagsCell(s)]),
           el('td', { 'data-label': 'Type' }, [el('span', { class: 'tag', text: typeLabel(s.type) })]),
@@ -1318,9 +1393,9 @@
         tr.addEventListener('click', pick);
         tr.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); pick(); } });
         rows.push(tr);
-        if (open) s.tables.forEach(function (t) { rows.push(tableRow(t)); });
-      });
-      wrap.appendChild(el('table', { class: 'sources-table' }, [el('thead', null, [head]), el('tbody', null, rows)]));
+        if (open) s.tables.forEach(function (t) { rows.push(tableRow(t, member)); });
+      })();
+      return rows;
     }
 
     // Up to three tables are named; more are counted, and the row opens to list them.
@@ -1340,8 +1415,8 @@
       ]);
     }
 
-    function tableRow(t) {
-      return el('tr', { class: 'sub' }, [
+    function tableRow(t, member) {
+      return el('tr', { class: 'sub' + (member ? ' member' : '') }, [
         el('td', { class: 'wrap', 'data-label': 'Table' }, [el('span', { class: 'sub-name', text: t.schema + '.' + t.name })]),
         el('td', { 'data-label': '' }),
         el('td', { 'data-label': 'Type' }, [el('span', { class: 'tag', text: t.kind })]),
@@ -1353,7 +1428,10 @@
       ]);
     }
 
+    var revealed = null;  // the source last brought into view, so a refresh doesn't reopen what was closed
     function selectSource(name) {
+      if (name !== revealed) revealSource(name);
+      revealed = name;
       state.selected = name;
       renderSources();
       var src = state.sources.filter(function (s) { return s.name === name; })[0];

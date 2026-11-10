@@ -171,3 +171,17 @@ def test_tag_run_api(store, engine):
     assert client.post("/api/tags/nobody/run", headers=AUTH, json={}).status_code == 404
     assert client.post("/api/tags/no%20good/run", headers=AUTH, json={}).status_code == 400
     assert client.post("/api/tags/base/run", json={}).status_code == 401
+
+
+def test_sources_say_where_they_come_from(store, engine):
+    store.save_source("crm_a", "dbtable", {"url": "sqlite://", "schema": "main", "table": "a", "kind": "table", "label": "DB1.local/crm"})
+    store.save_source("crm_b", "dbtable", {"url": "sqlite://", "schema": "main", "table": "b", "kind": "table", "label": "db1.local/crm"})
+    store.save_source("sheet_tab", "gsheet", {"spreadsheet_id": "abc123", "file_title": "Budget", "url": "https://docs.google.com/x"})
+    from eyetable import curl
+    store.save_source("api_jobs", "curl", curl.prepare("curl 'https://api.test/jobs?day=1'", None)[1])
+    web = TestClient(create_app(engine, TOKEN))
+    got = {s["name"]: s["connection"] for s in web.get("/api/sources", headers=AUTH).json()}
+    assert got["crm_a"]["key"] == got["crm_b"]["key"] == "db:db1.local/crm" and got["crm_a"]["label"] == "DB1.local/crm"
+    assert got["sheet_tab"] == {"key": "sheet:abc123", "label": "Budget"}
+    assert got["api_jobs"] == {"key": "api:api.test", "label": "api.test"}
+    assert got["customers"] is None  # a file comes from nowhere to group by

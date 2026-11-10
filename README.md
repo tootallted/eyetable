@@ -327,6 +327,16 @@ organization blocks that, or device code sign-in, register your own public
 client app and set `EYETABLE_ENTRA_CLIENT_ID` in `.env`. API:
 `POST /api/entra/sign-in`, `GET /api/entra/sign-in/<id>`.
 
+### Sources grouped by connection
+
+In **Sources**, sources that come from the same place sit under one line:
+database tables from the same server and database, tabs of the same Google
+Sheet, and API requests to the same host. The line shows how many sources and
+tables it holds, their total rows and the latest load, and is closed until you
+click it; which ones are open is remembered in the browser. A source loaded or
+chosen elsewhere opens its line. A source with nothing to share a line with
+stays a row of its own.
+
 ### Several tables in one database source
 
 A database source can load any number of its database's tables and views, each

@@ -17,6 +17,7 @@ import os
 import re
 import secrets
 import threading
+import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable
 from pathlib import Path
@@ -36,7 +37,7 @@ from eyetable.gsheets import SheetError, fetch_workbook, fetch_workbook_signed_i
 from eyetable.identifiers import SOURCE_NAME, normalize_tag, table_name
 from eyetable.query import MAX_LIMIT, QueryError, QueryRunner
 from eyetable import dbconnect, entra
-from eyetable.curl import auth_scheme, clean_statements, components, parse_curl, preview_statements, secret_places
+from eyetable.curl import auth_scheme, clean_statements, components, parse_curl, preview_statements, secret_places, stored_request
 from eyetable.curl import plan as curl_plan
 from eyetable.google_auth import GoogleAuthError, GoogleConnection
 from eyetable.groups import GroupRunner
@@ -341,7 +342,23 @@ def create_app(
                 summary["statement_count"] = statement_count(src.config["statements"])
             except ValueError:  # e.g. a fixed date range that "today" has moved past
                 summary["statement_count"] = 0
+        summary["connection"] = connection_of(src)
         return summary
+
+    def connection_of(src) -> dict[str, str] | None:
+        """Where a source's data comes from, so the page can group sources that share it."""
+        c = src.config
+        if src.type == "dbtable" and c.get("label"):
+            return {"key": "db:" + c["label"].lower(), "label": c["label"]}
+        if src.type == "gsheet" and c.get("spreadsheet_id"):
+            return {"key": "sheet:" + c["spreadsheet_id"], "label": c.get("file_title") or "Google Sheet"}
+        if src.type == "curl":
+            try:
+                host = urllib.parse.urlsplit(stored_request(c)["url"]).hostname
+            except (KeyError, IndexError, TypeError, ValueError):
+                return None
+            return {"key": "api:" + host, "label": host} if host else None
+        return None
 
     def get_source(name: str):
         try:
