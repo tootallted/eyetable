@@ -279,6 +279,15 @@ class CoreStore:
             sa.Column("connected_at", UTCDateTime(), nullable=False),
             sa.Column("last_used_at", UTCDateTime()),
         )
+        # One row at most: the Microsoft Entra sign-ins database connections use
+        # (MSAL's token cache, encrypted; see entra.py).
+        self.entra_cache = sa.Table(
+            "entra_cache",
+            self.metadata,
+            sa.Column("id", sa.Integer, primary_key=True),
+            sa.Column("cache", sa.Text, nullable=False),
+            sa.Column("updated_at", UTCDateTime(), nullable=False),
+        )
         self.uploads = sa.Table(
             "uploads",
             self.metadata,
@@ -557,6 +566,15 @@ class CoreStore:
                 id=1, email=email, refresh_token=refresh_token_encrypted, scopes=scopes,
                 status="ok", error=None, connected_at=_now(),
             ))
+
+    def get_entra_cache(self) -> str | None:
+        with self.db.connect() as conn:
+            return conn.execute(sa.select(self.entra_cache.c.cache)).scalar()
+
+    def save_entra_cache(self, encrypted: str) -> None:
+        with self.db.begin() as conn:
+            conn.execute(sa.delete(self.entra_cache))
+            conn.execute(sa.insert(self.entra_cache).values(id=1, cache=encrypted, updated_at=_now()))
 
     def get_google_connection(self) -> dict[str, Any] | None:
         with self.db.connect() as conn:

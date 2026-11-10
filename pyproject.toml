@@ -21,6 +21,7 @@ dependencies = [
     "tzdata>=2024.1",  # timezone database for schedules (Windows has none built in)
     "cryptography>=42",  # encrypts stored secrets (Google authorization, passwords, API keys)
     "pyodbc>=5.1",  # SQL Server / Azure SQL and other ODBC connection strings
+    "msal>=1.31",  # Microsoft Entra sign-in (MFA) for database connections
 ]
 
 [project.optional-dependencies]

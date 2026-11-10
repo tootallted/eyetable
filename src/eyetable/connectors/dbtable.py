@@ -4,6 +4,7 @@ import sqlalchemy as sa
 
 from eyetable.connectors.database import DatabaseConnector
 from eyetable.dbconnect import ConnectionError_, db_tables, friendly, list_objects, make_engine
+from eyetable.entra import EntraSignInNeeded
 from eyetable.models import ColumnInfo, DatasetInfo
 
 
@@ -26,6 +27,8 @@ class DbTableConnector(DatabaseConnector):
         try:
             with self._engine.connect():
                 pass
+        except EntraSignInNeeded:
+            raise
         except Exception as exc:
             raise ConnectionError_(f"couldn't connect: {friendly(exc)}") from None
 
@@ -50,6 +53,8 @@ class DbTableConnector(DatabaseConnector):
                        for c in insp.get_columns(table, schema=schema)]
         except sa.exc.NoSuchTableError:
             columns = []
+        except EntraSignInNeeded:
+            raise
         except Exception as exc:
             raise ConnectionError_(f"couldn't read {schema}.{table}: {friendly(exc)}") from None
         if not columns:

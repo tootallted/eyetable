@@ -30,6 +30,7 @@ from typing import Any
 import sqlalchemy as sa
 from sqlalchemy.engine import make_url
 
+from eyetable import entra
 from eyetable.credentials import encrypt_secret
 from eyetable.identifiers import shorten, sanitize, source_name
 
@@ -202,6 +203,12 @@ def prepare(text: str, secret_key: str | None) -> Prepared:
             raise ConnectionError_("the connection string has no Driver={...}; or paste a URL like postgresql://…")
         password = _get(pairs, *_PASSWORD_KEYS)
         kept = [(k, v) for k, v in pairs if k.lower() not in _PASSWORD_KEYS]
+        if (_get(pairs, "authentication") or "").lower() in entra.INTERACTIVE:
+            # Microsoft Entra with MFA: eyetable signs in and hands the driver a token (see entra.py)
+            user = _get(pairs, "uid", "user id", "user")
+            kept = [(k, v) for k, v in kept if k.lower() not in ("authentication", "uid", "user id", "user")]
+            extra = {**extra, "entra": entra.sign_in_request(user, _get(pairs, "server", "address", "addr", "data source") or "")}
+            password = None
         config = {"odbc": build_odbc(kept), **extra}
         server = re.sub(r"^tcp:", "", _get(pairs, "server", "address", "addr", "data source") or "?", flags=re.I)
         server = re.sub(r",\d+$", "", server)  # the port isn't worth showing
@@ -231,6 +238,12 @@ def make_engine(config: dict[str, Any], password: str | None = None, login_timeo
             "mssql+pyodbc:///?odbc_connect=" + urllib.parse.quote_plus(odbc),
             connect_args={"timeout": config.get("login_timeout", login_timeout)}, pool_pre_ping=True,
         )
+        if config.get("entra"):
+            tokens, sign_in = entra.provider(), config["entra"]
+
+            @sa.event.listens_for(engine, "do_connect")
+            def _with_token(dialect, record, cargs, cparams):  # a fresh token for every new connection
+                cparams["attrs_before"] = {entra.SQL_COPT_SS_ACCESS_TOKEN: entra.token_struct(tokens.token(**sign_in))}
         return engine, warnings
     url = make_url(config["url"])
     if password:
@@ -303,6 +316,8 @@ def list_objects(engine: sa.Engine) -> list[dict[str, Any]]:
                         continue
                     rows += [(schema, t, "table", None) for t in insp.get_table_names(schema=schema)]
                     rows += [(schema, v, "view", None) for v in insp.get_view_names(schema=schema)]
+    except entra.EntraSignInNeeded:
+        raise
     except Exception as exc:
         raise ConnectionError_(f"couldn't connect: {friendly(exc)}") from None
     return [

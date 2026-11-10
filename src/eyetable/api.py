@@ -13,6 +13,8 @@ locked out for a while.
 import base64
 import datetime as dt
 import logging
+import os
+import re
 import secrets
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -33,7 +35,7 @@ from eyetable.engine import SINGLE_TABLE_TYPES, Engine
 from eyetable.gsheets import SheetError, fetch_workbook, fetch_workbook_signed_in
 from eyetable.identifiers import SOURCE_NAME, normalize_tag, table_name
 from eyetable.query import MAX_LIMIT, QueryError, QueryRunner
-from eyetable import dbconnect
+from eyetable import dbconnect, entra
 from eyetable.curl import auth_scheme, clean_statements, components, parse_curl, preview_statements, secret_places
 from eyetable.curl import plan as curl_plan
 from eyetable.google_auth import GoogleAuthError, GoogleConnection
@@ -106,6 +108,12 @@ class CertificateIn(BaseModel):
 
         return client_cert(file(self.pfx), file(self.crt), file(self.key), file(self.ca),
                            self.passphrase, self.host, self.port)
+
+
+class EntraSignInIn(BaseModel):
+    username: str | None = Field(default=None, max_length=320)
+    scope: str = Field(max_length=500)
+    authority: str = Field(max_length=500)
 
 
 class TableChoiceIn(BaseModel):
@@ -408,6 +416,9 @@ def create_app(
             out.update(format="odbc" if "odbc" in c else "url", connection=c.get("odbc") or c.get("url"),
                        has_password=bool(c.get("password")), schema=c.get("schema"), table=c.get("table"),
                        kind=c.get("kind"), label=c.get("label"), tables=len(dbconnect.db_tables(c)))
+            if c.get("entra"):
+                sign_in = c["entra"]
+                out["entra"] = {**sign_in, "signed_in": entra.provider().signed_in(sign_in["username"], sign_in["authority"])}
         elif src.type == "curl":
             cert = c.get("client_cert")
             identity = None
@@ -448,7 +459,7 @@ def create_app(
             else:
                 raise HTTPException(400, f"a {src.type} source's settings can't be changed here")
         except ValueError as exc:
-            raise HTTPException(400, str(exc).strip("'\"")) from None
+            raise problem(exc) from None
         return jsonable_encoder({**settings_of(store.get_source(name)), "warnings": warnings, "tested": body.test})
 
     def db_source(name: str):
@@ -465,7 +476,7 @@ def create_app(
             with engine._open("dbtable", src.config) as conn:
                 objects = conn.objects()
         except ValueError as exc:
-            raise HTTPException(400, str(exc).strip("'\"")) from None
+            raise problem(exc) from None
         chosen = {(i["schema"], i["table"]) for i in dbconnect.db_tables(src.config)}
         for obj in objects:
             obj["chosen"] = (obj["schema"], obj["name"]) in chosen
@@ -586,6 +597,32 @@ def create_app(
         except SheetError as exc:
             raise sheet_error(exc) from None
         return jsonable_encoder(load)
+
+    entra.set_provider(entra.EntraTokens(store, engine.secret_key, os.environ.get("EYETABLE_ENTRA_CLIENT_ID")))
+
+    def problem(exc: ValueError) -> HTTPException:
+        """A refusal for the page: a needed Microsoft sign-in says for whom, so the page can offer it."""
+        if isinstance(exc, entra.EntraSignInNeeded):
+            return HTTPException(409, {"message": str(exc), "entra": exc.request})
+        return HTTPException(400, str(exc).strip("'\""))
+
+    @app.post("/api/entra/sign-in", dependencies=auth)
+    def entra_sign_in(body: EntraSignInIn) -> dict[str, Any]:
+        """Start a Microsoft sign-in: you enter the code it returns at its verification address."""
+        if not re.fullmatch(r"https://login\.microsoftonline\.com/[A-Za-z0-9.\-]+", body.authority) \
+                or not re.fullmatch(r"https://[A-Za-z0-9.\-]+/\.default", body.scope):
+            raise HTTPException(400, "that isn't a Microsoft sign-in eyetable makes")
+        try:
+            return jsonable_encoder(entra.provider().start(body.username, body.scope, body.authority))
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from None
+
+    @app.get("/api/entra/sign-in/{flow_id}", dependencies=auth)
+    def entra_sign_in_status(flow_id: str) -> dict[str, Any]:
+        try:
+            return jsonable_encoder(entra.provider().status(flow_id))
+        except KeyError as exc:
+            raise HTTPException(404, str(exc).strip("'\"")) from None
 
     groups = group_runner or GroupRunner(engine, sheet_fetch=lambda url, google_token=None: sheet_fetch(url, google_token))
 
@@ -727,7 +764,9 @@ def create_app(
                 objects = dbconnect.list_objects(db_engine)
             finally:
                 db_engine.dispose()
-        except (ValueError, KeyError) as exc:
+        except ValueError as exc:
+            raise problem(exc) from None
+        except KeyError as exc:
             raise HTTPException(400, str(exc).strip("'\"")) from None
         loaded = {
             (s.config.get("label"), item["schema"], item["table"]): s.name

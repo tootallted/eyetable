@@ -301,6 +301,32 @@ optional `page_size`, `next_field`, `records_field` and `all_pages`),
 `PUT` and `DELETE /api/sources/<name>/statements`, and
 `POST /api/sources/<name>/run` to reload in the background.
 
+### Microsoft Entra sign-in (MFA)
+
+A connection string with `Authentication=ActiveDirectoryInteractive` (ODBC or
+JDBC), for Azure SQL, Fabric/Synapse or Dataverse's SQL endpoint
+(`*.crm.dynamics.com,5558`), signs in with Microsoft Entra, MFA included:
+
+```
+Driver={ODBC Driver 18 for SQL Server};Server=tcp:org.crm.dynamics.com,5558;Authentication=ActiveDirectoryInteractive;UID=you@yourcompany.com;Encrypt=yes;
+```
+
+The ODBC driver's own interactive sign-in opens a window on the machine it runs
+on, which a service can't, so eyetable uses Microsoft's device code sign-in: on
+**Connect** the page shows **Sign in with Microsoft**, then a short code; open
+https://microsoft.com/devicelogin in any browser, enter it, sign in as the
+`UID` and finish MFA, and the page carries on by itself. eyetable keeps the
+sign-in (MSAL's token cache, encrypted with `EYETABLE_SECRET_KEY`) and gets a
+fresh access token for every connection, so **Reload** and schedules keep
+working until your organization's sign-in policies ask for a new sign-in. Then
+loads fail with *the Microsoft sign-in has expired*, and **Connection settings**
+has **Sign in with Microsoft** to do it again.
+
+It signs in with the public client Microsoft's Azure SDKs use. If your
+organization blocks that, or device code sign-in, register your own public
+client app and set `EYETABLE_ENTRA_CLIENT_ID` in `.env`. API:
+`POST /api/entra/sign-in`, `GET /api/entra/sign-in/<id>`.
+
 ### Several tables in one database source
 
 A database source can load any number of its database's tables and views, each

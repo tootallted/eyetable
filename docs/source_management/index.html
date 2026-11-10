@@ -199,6 +199,9 @@
   .cert-box summary { cursor: pointer; font-size: 13px; font-weight: 600; }
   .cert-box .curl-settings { margin-top: 10px; }
   .req-table td { white-space: normal; overflow-wrap: anywhere; }
+  .entra { display: grid; gap: 8px; padding: 12px 14px; border-radius: 10px; background: var(--accent-soft); font-size: 13px; }
+  .entra .code { font: 600 22px/1.2 var(--mono); letter-spacing: .08em; }
+  .entra .row-inline { gap: 10px; }
   .ss-text { width: 100%; min-height: 64px; resize: vertical; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--border);
     background: var(--surface); color: var(--text); font: 12.5px/1.5 var(--mono); }
   #src-settings input[type=number] { width: 100%; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--border); background: var(--surface); }
@@ -616,7 +619,8 @@
         <textarea id="db-conn" spellcheck="false" autocomplete="off"
           placeholder="Driver={ODBC Driver 18 for SQL Server};Server=tcp:yourserver.database.windows.net,1433;Database=yourdb;Uid=…;Pwd={…};Encrypt=yes;"></textarea>
         <div><button class="btn" id="db-connect" type="button" disabled>Connect</button></div>
-        <p class="hint">An ODBC or JDBC connection string (SQL Server, Azure SQL), or a URL such as
+        <p class="hint">An ODBC or JDBC connection string (SQL Server, Azure SQL, Dataverse; <code>Authentication=ActiveDirectoryInteractive</code>
+          signs in with Microsoft Entra and MFA), or a URL such as
           <code>postgresql://user:password@host:5432/db</code>. eyetable lists the tables and views; pick the ones to bring
           in, each as its own source. The password goes only to your eyetable API and is stored encrypted.</p>
         <div id="db-pick" hidden style="display:grid; gap:10px">
@@ -946,10 +950,12 @@
             var body = null;
             try { body = text ? JSON.parse(text) : null; } catch (e) {}
             if (!res.ok) {
-              var detail = body && body.detail;
-              if (detail && typeof detail !== 'string') detail = JSON.stringify(detail);
+              var detail = body && body.detail, info = null;
+              if (detail && typeof detail === 'object' && detail.message) { info = detail; detail = detail.message; }
+              else if (detail && typeof detail !== 'string') detail = JSON.stringify(detail);
               var err = new Error(detail || res.status + ' ' + res.statusText);
               err.status = res.status;
+              err.info = info;  // e.g. {entra: ...}: a Microsoft sign-in the page can offer
               throw err;
             }
             return body;
@@ -1364,6 +1370,53 @@
       });
     }
 
+    // -- Microsoft Entra sign-in (MFA), for database connections ---------------------
+    // The eyetable server can't open a sign-in window, so you sign in on Microsoft's own
+    // page with a short code, and the server keeps the sign-in for later loads.
+    function entraSignIn(box, request, onDone, why) {
+      clear(box);
+      var who = request.username || 'your Microsoft account';
+      var start = el('button', { type: 'button', class: 'btn primary small', text: 'Sign in with Microsoft' });
+      var panel = el('div', { class: 'entra' }, [
+        el('div', { text: (why ? why + ' ' : '') + 'This connection signs in with Microsoft Entra (MFA) as ' + who + '.' }),
+        el('div', null, [start])
+      ]);
+      box.appendChild(panel);
+      start.addEventListener('click', function () {
+        start.disabled = true;
+        start.textContent = 'Starting\u2026';
+        api('/api/entra/sign-in', { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify(request) }).then(function (flow) {
+          var copy = el('button', { type: 'button', class: 'btn small', text: 'Copy code' });
+          copy.addEventListener('click', function () {
+            try { navigator.clipboard.writeText(flow.user_code); copy.textContent = 'Copied'; } catch (e) {}
+          });
+          var waiting = el('div', { class: 'muted', text: 'Waiting for you to finish signing in\u2026' });
+          clear(panel);
+          panel.appendChild(el('div', null, ['1. Open ', el('a', { href: flow.verification_uri, target: '_blank', rel: 'noopener', text: flow.verification_uri }),
+            ' and enter this code:']));
+          panel.appendChild(el('div', { class: 'row-inline' }, [el('span', { class: 'code', text: flow.user_code }), copy]));
+          panel.appendChild(el('div', { text: '2. Sign in as ' + who + ' and finish MFA. 3. Come back here; this page carries on by itself.' }));
+          panel.appendChild(waiting);
+          var poll = function () {
+            api('/api/entra/sign-in/' + encodeURIComponent(flow.flow_id)).then(function (s) {
+              if (s.status === 'pending') { setTimeout(poll, 3000); return; }
+              if (s.status === 'failed') {
+                clear(box).appendChild(banner('err', 'The Microsoft sign-in didn\u2019t finish: ' + s.error));
+                return;
+              }
+              clear(box).appendChild(banner(s.error ? 'warn' : 'ok', 'Signed in with Microsoft as ' + (s.account || who) + '.' + (s.error ? ' But ' + s.error + '.' : '')));
+              if (!s.error && onDone) onDone();
+            }, function (err) { clear(box).appendChild(banner('err', err.message)); });
+          };
+          setTimeout(poll, 3000);
+        }, function (err) {
+          start.disabled = false;
+          start.textContent = 'Sign in with Microsoft';
+          panel.appendChild(banner('err', err.message));
+        });
+      });
+    }
+
     // -- a database source's tables and views: choosing which to load --------------
     var dbt = { source: null, objects: null, chosen: {}, open: false };
 
@@ -1397,7 +1450,10 @@
         $('dbt-picker').hidden = false;
         $('dbt-open').hidden = true;
         renderDbtList();
-      }, function (err) { msg.appendChild(banner('err', 'Couldn\u2019t list the tables: ' + err.message)); })
+      }, function (err) {
+        if (err.info && err.info.entra) entraSignIn(msg, err.info.entra, openDbTables);
+        else msg.appendChild(banner('err', 'Couldn\u2019t list the tables: ' + err.message));
+      })
         .then(function () { $('dbt-open').disabled = false; $('dbt-open').innerHTML = 'Choose tables and views&hellip;'; });
     }
 
@@ -1525,9 +1581,16 @@
         i.table = ssInput('text', d.table);
         body.appendChild(setField('Connection string', i.connection,
           'Change the server, database or user here. The password is never shown: leave it out to keep the stored one.'));
-        body.appendChild(el('div', { class: 'curl-settings' }, d.tables > 1 ? [setField('Password', i.password)] : [
-          setField('Password', i.password), setField('Schema', i.schema), setField((d.kind === 'view' ? 'View' : 'Table'), i.table)
-        ]));
+        var passwordField = d.entra ? [] : [setField('Password', i.password)];
+        body.appendChild(el('div', { class: 'curl-settings' }, d.tables > 1 ? passwordField : passwordField.concat([
+          setField('Schema', i.schema), setField((d.kind === 'view' ? 'View' : 'Table'), i.table)
+        ])));
+        if (d.entra) {
+          var signIn = el('div');
+          body.appendChild(signIn);
+          entraSignIn(signIn, d.entra, function () { loadSettings({ name: ss.source }); },
+            d.entra.signed_in ? 'Signed in; sign in again if loads say the sign-in has expired.' : 'Not signed in yet: loads fail until you sign in.');
+        }
       } else if (d.type === 'curl') {
         i.secrets = {};
         if (d.secrets.length) {
@@ -1618,7 +1681,8 @@
             if (s) { unfold('sources'); reloadSource(s, true); }
           });
         }, function (err) {
-          msg.appendChild(banner('err', 'Not saved: ' + err.message));
+          if (err.info && err.info.entra) entraSignIn(msg, err.info.entra, null, 'Not saved yet: sign in, then save again.');
+          else msg.appendChild(banner('err', 'Not saved: ' + err.message));
         })
         .then(function () {
           $('ss-save').disabled = $('ss-save-reload').disabled = false;
@@ -3207,7 +3271,10 @@
           $('db-filter').value = '';
           $('db-kind').value = '';
           renderDbListing();
-        }, function (err) { out.appendChild(banner('err', err.message)); })
+        }, function (err) {
+          if (err.info && err.info.entra) entraSignIn(out, err.info.entra, connectDb);
+          else out.appendChild(banner('err', err.message));
+        })
         .then(function () { dbState.busy = false; $('db-connect').textContent = 'Connect'; renderDbControls(); });
     }
 
