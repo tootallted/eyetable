@@ -1411,7 +1411,7 @@
     function sourceTimeValue(s) { return s.last_loaded_at || s.updated_at || ''; }
     var SOURCE_COLS = [
       { key: 'name', label: 'Source', value: function (s) { return s.name; },
-        text: function (s) { return s.name + ' ' + (s.connection ? s.connection.label : ''); } },
+        text: function (s) { return s.name + ' ' + (s.source || '') + ' ' + (s.connection ? s.connection.label : ''); } },
       { key: 'tags', label: 'Tags', value: function (s) { return (s.tags || []).join(' '); },
         text: function (s) { return (s.tags || []).map(function (t) { return '#' + t; }).join(' '); } },
       { key: 'type', label: 'Type', value: function (s) { return typeLabel(s.type); } },
@@ -1452,11 +1452,17 @@
       var tagged = state.tagFilter
         ? state.sources.filter(function (s) { return (s.tags || []).indexOf(state.tagFilter) >= 0; })
         : state.sources;
-      var shown = sfApply(tagged, SOURCE_COLS, view);
+      // A database source is listed as its tables, one row each, so a connection holds tables directly.
+      var flat = [];
+      tagged.forEach(function (s) {
+        if (s.tables && s.tables.length) s.tables.forEach(function (t) { flat.push(dbTableEntry(s, t)); });
+        else flat.push(s);
+      });
+      var shown = sfApply(flat, SOURCE_COLS, view);
       clear(note);
       note.hidden = !filtering;
       if (filtering) {
-        note.appendChild(el('span', { text: fmtInt(shown.length) + ' of ' + plural(tagged.length, 'source') + (shown.length === 1 ? ' matches' : ' match') + ' the filters.' }));
+        note.appendChild(el('span', { text: fmtInt(shown.length) + ' of ' + fmtInt(flat.length) + (shown.length === 1 ? ' matches' : ' match') + ' the filters.' }));
         var reset = el('button', { type: 'button', class: 'link', text: 'Clear filters' });
         reset.addEventListener('click', function () { view.filters = {}; state.filterClosed = {}; renderSources(); });
         note.appendChild(reset);
@@ -1477,14 +1483,48 @@
           // a filter opens every connection with a match, so what matched is in view
           var open = filtering ? !state.filterClosed[key] : !!state.openConnections[key];
           rows.push(connectionRow(s.connection, byConnection[key], open, filtering));
-          if (open) byConnection[key].forEach(function (m) { rows.push.apply(rows, sourceRows(m, true)); });
+          if (open) byConnection[key].forEach(function (m) { rows.push.apply(rows, m._t ? [tableEntryRow(m, true)] : sourceRows(m, true)); });
         } else {
-          rows.push.apply(rows, sourceRows(s, false));
+          rows.push.apply(rows, s._t ? [tableEntryRow(s, false)] : sourceRows(s, false));
         }
       });
       clear(body);
       if (!rows.length) rows.push(el('tr', null, [el('td', { colspan: String(SOURCE_COLS.length), class: 'empty', text: 'No source matches the filters.' })]));
       rows.forEach(function (r) { body.appendChild(r); });
+    }
+
+    // One table of a database source, shaped like a source so it sorts and filters with the others.
+    function dbTableEntry(s, t) {
+      return { name: t.name, source: s.name, tags: s.tags, type: s.type, table: t.table, schema: t.schema,
+        rows: t.rows === undefined ? null : t.rows, last_upload: null, last_loaded_at: t.last_loaded_at, updated_at: s.updated_at,
+        connection: s.connection, _src: s, _t: t };
+    }
+
+    function tableEntryRow(e, member) {
+      var s = e._src, t = e._t;
+      var picked = state.pickedTable[s.name] || s.tables[0].table;
+      var selected = s.name === state.selected && picked === t.table;
+      var name = [el('strong', { text: t.name })];
+      if (t.name !== s.name) name.push(el('div', { class: 'muted', style: 'font-size:12px; font-weight:400', text: 'loaded by source ' + s.name }));
+      var tr = el('tr', { class: 'clickable' + (member ? ' member' : '') + (selected ? ' selected' : ''), tabindex: '0',
+        title: t.schema + '.' + t.name + (t.name !== s.name ? ', one of the tables of source ' + s.name : '') }, [
+        el('td', { class: 'wrap', 'data-label': 'Table' }, name),
+        el('td', { 'data-label': 'Tags' }, [tagsCell(s)]),
+        el('td', { 'data-label': 'Type' }, [el('span', { class: 'tag', text: typeLabel(s.type) })]),
+        el('td', { class: 'mono wrap', 'data-label': 'Loaded into', text: 'eyetable_raw.' + t.table }),
+        el('td', { class: 'num', 'data-label': 'Rows', text: t.rows === null || t.rows === undefined ? '\u2014' : fmtInt(t.rows) }),
+        el('td', { 'data-label': 'Columns', text: t.columns ? plural(t.columns, 'column') : '\u2014' }),
+        el('td', { 'data-label': 'Last loaded', text: t.last_loaded_at ? fmtTime(t.last_loaded_at) : 'Not loaded yet' }),
+        el('td', null, [loadButtons(s, s.tables.length > 1 ? t : null)])
+      ]);
+      var pick = function () {
+        state.pickedTable[s.name] = t.table;
+        unfold('detail');
+        selectSource(s.name);
+      };
+      tr.addEventListener('click', pick);
+      tr.addEventListener('keydown', function (ev) { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); pick(); } });
+      return tr;
     }
 
     var KEY_OPEN_CONNECTIONS = 'eyetable.openConnections';
@@ -1501,21 +1541,25 @@
       var src = state.sources.filter(function (x) { return x.name === name; })[0];
       var key = src && src.connection && src.connection.key;
       if (!key || state.openConnections[key]) return;
-      if (state.sources.filter(function (x) { return x.connection && x.connection.key === key; }).length > 1) setConnectionOpen(key, true);
+      var rows = state.sources.filter(function (x) { return x.connection && x.connection.key === key; })
+        .reduce(function (n, x) { return n + (x.tables && x.tables.length ? x.tables.length : 1); }, 0);
+      if (rows > 1) setConnectionOpen(key, true);
     }
 
     function connectionRow(connection, members, open, filtering) {
+      var allTables = members.every(function (m) { return m._t; });
       var tables = members.reduce(function (n, m) { return n + (m.tables ? m.tables.length : 1); }, 0);
       var counted = members.filter(function (m) { return m.rows !== null && m.rows !== undefined; });
       var loaded = members.map(function (m) { return m.last_loaded_at; }).filter(Boolean).sort();
       var types = members.map(function (m) { return typeLabel(m.type); }).filter(function (t, i, all) { return all.indexOf(t) === i; });
       var caret = el('span', { class: 'conn-caret', 'aria-hidden': 'true', text: '\u25b8' });
       var tr = el('tr', { class: 'clickable conn' + (open ? ' open' : ''), tabindex: '0', 'aria-expanded': String(open),
-        title: (open ? 'Close ' : 'Open ') + connection.label + ' to ' + (open ? 'hide' : 'show') + ' its ' + plural(members.length, 'source') }, [
+        title: (open ? 'Close ' : 'Open ') + connection.label + ' to ' + (open ? 'hide' : 'show') + ' its ' + plural(members.length, allTables ? 'table' : 'source') }, [
         el('td', { class: 'wrap', 'data-label': 'Connection' }, [el('span', null, [caret, el('strong', { text: connection.label })])]),
         el('td', { 'data-label': '' }),
         el('td', { 'data-label': 'Type' }, types.map(function (t) { return el('span', { class: 'tag', text: t }); })),
-        el('td', { 'data-label': 'Holds', text: plural(members.length, 'source') + (tables !== members.length ? ', ' + plural(tables, 'table') : '') }),
+        el('td', { 'data-label': 'Holds', text: allTables ? plural(members.length, 'table')
+          : plural(members.length, 'source') + (tables !== members.length ? ', ' + plural(tables, 'table') : '') }),
         el('td', { class: 'num', 'data-label': 'Rows', text: counted.length ? fmtInt(counted.reduce(function (n, m) { return n + m.rows; }, 0)) : '\u2014' }),
         el('td', { 'data-label': '' }),
         el('td', { 'data-label': 'Last loaded', text: loaded.length ? fmtTime(loaded[loaded.length - 1]) : 'Not loaded yet' }),
@@ -2210,6 +2254,7 @@
         which.addEventListener('change', function () {
           var picked = src.tables.filter(function (t) { return t.table === which.value; })[0];
           state.pickedTable[src.name] = which.value;
+          renderSources();  // the picked table's row is the highlighted one
           renderKeys(which.value, picked && picked.last_loaded_at, src);
           api('/api/sources/' + encodeURIComponent(src.name) + '/preview?limit=20&table=' + encodeURIComponent(which.value)).then(function (p) {
             clear($('detail-preview')).appendChild(dataTable(p.columns, p.rows, { empty: 'The table is empty.' }));

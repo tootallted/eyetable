@@ -341,6 +341,11 @@ click it; which ones are open is remembered in the browser. A source loaded or
 chosen elsewhere opens its line. A source with nothing to share a line with
 stays a row of its own.
 
+A database connection's line lists its **tables** directly, one row each,
+whichever source loads them. A table that a source holds alongside others
+says so ("loaded by source …"). Each table row has its own **Reload** and
+**Incremental** buttons, and clicking it opens that table in Preview Data.
+
 **Sorting.** Click a column header to sort by it. Click again to reverse the
 order, and a third time to go back to the usual order. Rows and Last loaded
 sort high-to-low first. Blank values always sort last, and the browser
