@@ -301,6 +301,14 @@ class CoreStore:
             sa.Column("key_columns", JSONType),
             sa.Column("key_set_at", UTCDateTime()),
         )
+        # Per loaded table: the column incremental loads go by (see incremental.py).
+        self.table_increments = sa.Table(
+            "table_increments",
+            self.metadata,
+            sa.Column("table_name", sa.Text, primary_key=True),
+            sa.Column("column_name", sa.Text, nullable=False),
+            sa.Column("set_at", UTCDateTime(), nullable=False),
+        )
         self.uploads = sa.Table(
             "uploads",
             self.metadata,
@@ -669,6 +677,7 @@ class CoreStore:
         with self.db.begin() as conn:
             conn.execute(sa.text(f"DROP TABLE IF EXISTS {self.qualified(table)}"))
             conn.execute(sa.delete(self.table_keys).where(self.table_keys.c.table_name == table))
+            conn.execute(sa.delete(self.table_increments).where(self.table_increments.c.table_name == table))
 
     # -- key scans and natural keys ------------------------------------------
 
@@ -692,6 +701,54 @@ class CoreStore:
     def save_table_key(self, table: str, columns: list[str] | None) -> None:
         """Set (or, with None, clear) the natural key of a table."""
         self._upsert_key_row(table, key_columns=columns, key_set_at=_now() if columns else None)
+
+    # -- incremental loads ----------------------------------------------------
+
+    def get_increment(self, table: str) -> str | None:
+        with self.db.connect() as conn:
+            return conn.execute(sa.select(self.table_increments.c.column_name)
+                                .where(self.table_increments.c.table_name == table)).scalar()
+
+    def increments(self) -> dict[str, str]:
+        """Every table's incremental column: table -> column."""
+        with self.db.connect() as conn:
+            return {r.table_name: r.column_name for r in conn.execute(sa.select(self.table_increments))}
+
+    def save_increment(self, table: str, column: str | None) -> None:
+        """Set (or, with None, clear) the column a table's incremental loads go by."""
+        with self.db.begin() as conn:
+            conn.execute(sa.delete(self.table_increments).where(self.table_increments.c.table_name == table))
+            if column:
+                conn.execute(sa.insert(self.table_increments).values(table_name=table, column_name=column, set_at=_now()))
+
+    def max_value(self, table: str, column: str, type_: sa.types.TypeEngine | None = None) -> Any:
+        """The largest value of a column, read as its own type (a datetime for a time column)."""
+        if type_ is not None and isinstance(type_, sa.DateTime):
+            type_ = UTCDateTime() if type_.timezone else sa.DateTime()
+        col = sa.column(column, type_ if type_ is not None else sa.Text())
+        query = sa.select(sa.func.max(col)).select_from(sa.table(table, schema=self.data_schema))
+        with self.db.connect() as conn:
+            return conn.execute(query).scalar()
+
+    def replace_older(self, table: str, key: list[str], run_id: int) -> int:
+        """After an incremental load, delete each row that a row of run `run_id` with the same key replaces."""
+        prep = self.db.dialect.identifier_preparer
+        q, idc, run = self.qualified(table), prep.quote(ID_COLUMN), prep.quote(RUN_ID_COLUMN)
+        same = " AND ".join(f"n.{prep.quote(c)} = o.{prep.quote(c)}" for c in key)
+        with self.db.begin() as conn:
+            done = conn.execute(sa.text(
+                f"DELETE FROM {q} WHERE {idc} IN (SELECT o.{idc} FROM {q} o JOIN {q} n "
+                f"ON n.{run} = :run AND n.{idc} > o.{idc} AND {same})"), {"run": run_id})
+        return done.rowcount or 0
+
+    def delete_run_rows(self, table: str, run_id: int) -> None:
+        """Take out the rows a failed incremental load had already added."""
+        if not self.table_exists(table):
+            return
+        prep = self.db.dialect.identifier_preparer
+        with self.db.begin() as conn:
+            conn.execute(sa.text(f"DELETE FROM {self.qualified(table)} WHERE {prep.quote(RUN_ID_COLUMN)} = :run"),
+                         {"run": run_id})
 
     def last_loaded(self, source: str) -> dt.datetime | None:
         """When data last finished loading into this source successfully."""

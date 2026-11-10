@@ -1,5 +1,7 @@
 """The tables and views of one database connection, as a source (see eyetable.dbconnect)."""
 
+import datetime as dt
+
 import sqlalchemy as sa
 
 from eyetable.connectors.database import DatabaseConnector
@@ -18,6 +20,7 @@ class DbTableConnector(DatabaseConnector):
     """
 
     type = "dbtable"
+    reads_since = True  # read() can ask the database for only the rows past a value (incremental loads)
 
     def __init__(self, config: dict):
         self.config = config
@@ -79,17 +82,25 @@ class DbTableConnector(DatabaseConnector):
             return None
         return [ColumnInfo(d[0], getattr(d[1], "__name__", str(d[1])), True) for d in description]
 
-    def read(self, key: str, batch_size: int = 1000):
+    def read(self, key: str, batch_size: int = 1000, since: tuple | None = None):
+        """Rows of one table; with `since` = (column, value, inclusive), only rows past that value."""
         item = self._item(key)
         schema, table = item["schema"], item["table"]
         try:
             source = sa.Table(table, sa.MetaData(), schema=schema, autoload_with=self._engine)
             query = sa.select(source)
+            column = source.c[since[0]] if since else None
         except EntraSignInNeeded:
             raise
         except sa.exc.SQLAlchemyError:
             # can't be described (Dataverse has no column catalog): take the rows as they come
             query = sa.select(sa.text("*")).select_from(sa.table(table, schema=schema))
+            column = sa.column(since[0]) if since else None
+        if since:
+            value = since[1]
+            if isinstance(value, dt.datetime) and value.tzinfo:  # databases mostly keep UTC without a zone
+                value = value.astimezone(dt.timezone.utc).replace(tzinfo=None)
+            query = query.where(column >= value if since[2] else column > value)
         try:
             with self._engine.connect() as conn:
                 result = conn.execution_options(stream_results=True, yield_per=batch_size).execute(query)

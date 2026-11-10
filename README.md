@@ -435,6 +435,57 @@ API: `GET /api/tables/<table>/keys`, `POST /api/tables/<table>/keys/scan` (a
 background job), `PUT /api/tables/<table>/key` with `{"columns": [...]}`, and
 `DELETE /api/tables/<table>/key`.
 
+### Incremental loads
+
+A full load reads a table's whole source again and replaces it. An incremental
+load adds only the rows that are new since the last load. It goes by the
+table's **incremental column**: a column whose values only grow as rows are
+added or changed.
+
+**Choosing the column.** The key scan suggests candidates under **Preview
+Data → Incremental loads**, best first, each with its latest value:
+
+1. Last-modified times (`modifiedon`, `updated_at`, …). These pick up new
+   *and* changed rows.
+2. Row version numbers.
+3. Creation times, and IDs with no repeats. These pick up new rows, but not
+   changes to older ones.
+4. Other date and time columns.
+
+Text columns count when they hold ISO dates or times, as JSON from APIs usually
+does. Pick a candidate, or any other column from **Another column…**, and click
+**Use … for incremental loads**. **Stop incremental loads** turns it off.
+
+**What an incremental load does:**
+
+* It reads the largest value of the column already loaded, and loads only rows
+  past it.
+* A **database** table is asked for just those rows (`WHERE column > value`).
+* An **API** or **Google Sheet** source is fetched in full, because it can't be
+  asked for less. Only the newer rows are kept.
+* The rows are appended and get a new `ET_run_id`.
+* With a **natural key**, each new row replaces the older copy of the same row.
+  The boundary value is then fetched again (`>=`), so rows that share the last
+  timestamp aren't missed. Without a natural key, a changed row is added again
+  as a second copy.
+* Rows with no value in the column are never picked up.
+* If the table is empty, it is loaded in full.
+* A failed incremental load takes its rows back out, so the table is left as it
+  was.
+* File sources have no incremental load: they get new rows by loading a file
+  with **Append**.
+
+**Where to start one.** Every source row in **Sources** has **Reload** (full)
+and **Incremental**. Incremental loads the source's tables that have an
+incremental column and leaves the rest alone. Each table row of an opened
+database source has its own pair of buttons, as does **Preview Data** (**Full
+load** and **Incremental load**). Groups and schedules still run full loads.
+
+API: `PUT /api/tables/<table>/incremental` with `{"column": "..."}`, and
+`DELETE /api/tables/<table>/incremental`. Load with
+`POST /api/sources/<name>/reload` and `{"incremental": true, "table": "..."}`;
+both fields are optional.
+
 ### Tags
 
 Give any source tags such as `#base` or `#finance`: in **Sources**, click
@@ -632,7 +683,7 @@ server or network.
 
 ## Not built yet
 
-* Incremental loads (watermark columns, change tracking)
+* Incremental loads on a schedule (groups run full loads), and change tracking
 * Scheduling ingestion runs
 * Analysis layer: modeled views on top of `eyetable_raw`, and a UI
 * More API auth flows (OAuth2 client credentials / refresh, AWS SigV4), and

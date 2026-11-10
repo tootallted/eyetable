@@ -258,6 +258,10 @@
   .db-tools select { width: auto; }
   .db-list { max-height: 380px; overflow: auto; }
   .key-cols td.yes { color: var(--ok); font-weight: 600; }
+  .incr-list { display: grid; gap: 6px; }
+  .incr-list label { display: flex; gap: 8px; align-items: baseline; font-size: 14px; cursor: pointer; }
+  .incr-list label .why { color: var(--muted); font-size: 13px; }
+  .load-btns { display: inline-flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
   .key-cols tr.chosen td { background: var(--accent-soft); }
   .sources-table tr.conn td { background: var(--surface-2); font-weight: 600; }
   .sources-table tr.conn td:first-child { white-space: normal; }
@@ -737,6 +741,11 @@
         <h3 style="font-size:14px; margin:0">Natural key <span class="muted" id="key-table" style="font-weight:400"></span></h3>
         <div id="key-body" style="display:grid; gap:10px"></div>
         <div id="key-msg" role="status"></div>
+      </div>
+      <div id="detail-incr" hidden style="display:grid; gap:10px">
+        <h3 style="font-size:14px; margin:0">Incremental loads</h3>
+        <div id="incr-body" style="display:grid; gap:10px"></div>
+        <div id="incr-msg" role="status"></div>
       </div>
       <div>
         <h3 style="font-size:14px; margin:0 0 8px">First rows</h3>
@@ -1389,7 +1398,7 @@
           el('td', { class: 'num', 'data-label': 'Rows', text: s.table ? fmtInt(s.rows) : '—' }),
           el('td', { class: 'wrap', 'data-label': 'Last file', text: s.last_upload ? s.last_upload.filename : '—' }),
           el('td', { 'data-label': 'Last loaded', text: fmtTime(s.last_loaded_at || s.updated_at), title: s.last_loaded_at ? 'Last time data finished loading' : 'Not loaded yet' }),
-          el('td', null, [reloadButton(s)])
+          el('td', null, [loadButtons(s)])
         ]);
         // a source with several tables opens to a row per table
         var pick = function () {
@@ -1400,7 +1409,7 @@
         tr.addEventListener('click', pick);
         tr.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); pick(); } });
         rows.push(tr);
-        if (open) s.tables.forEach(function (t) { rows.push(tableRow(t, member)); });
+        if (open) s.tables.forEach(function (t) { rows.push(tableRow(s, t, member)); });
       })();
       return rows;
     }
@@ -1422,7 +1431,7 @@
       ]);
     }
 
-    function tableRow(t, member) {
+    function tableRow(s, t, member) {
       return el('tr', { class: 'sub' + (member ? ' member' : '') }, [
         el('td', { class: 'wrap', 'data-label': 'Table' }, [el('span', { class: 'sub-name', text: t.schema + '.' + t.name })]),
         el('td', { 'data-label': '' }),
@@ -1431,7 +1440,7 @@
         el('td', { class: 'num', 'data-label': 'Rows', text: t.rows === null || t.rows === undefined ? '\u2014' : fmtInt(t.rows) }),
         el('td', { 'data-label': 'Columns', text: t.columns ? plural(t.columns, 'column') : '' }),
         el('td', { 'data-label': 'Last loaded', text: t.last_loaded_at ? fmtTime(t.last_loaded_at) : 'Not loaded yet' }),
-        el('td')
+        el('td', null, [loadButtons(s, t)])
       ]);
     }
 
@@ -2053,16 +2062,22 @@
         }));
         which.addEventListener('change', function () {
           var picked = src.tables.filter(function (t) { return t.table === which.value; })[0];
-          renderKeys(which.value, picked && picked.last_loaded_at);
+          state.pickedTable[src.name] = which.value;
+          renderKeys(which.value, picked && picked.last_loaded_at, src);
           api('/api/sources/' + encodeURIComponent(src.name) + '/preview?limit=20&table=' + encodeURIComponent(which.value)).then(function (p) {
             clear($('detail-preview')).appendChild(dataTable(p.columns, p.rows, { empty: 'The table is empty.' }));
           }, function (err) { clear($('detail-preview')).appendChild(banner('err', err.message)); });
         });
         pickBox.appendChild(el('span', { text: 'Table' }));
         pickBox.appendChild(which);
+        var remembered = state.pickedTable[src.name];
+        if (remembered && remembered !== src.table && src.tables.some(function (t) { return t.table === remembered; })) {
+          which.value = remembered;
+          setTimeout(function () { which.dispatchEvent(new Event('change')); }, 0);
+        }
       }
       renderKeys(src.table && preview && preview.columns.length ? src.table : null,
-        src.tables && src.tables.length ? src.tables[0].last_loaded_at : src.last_loaded_at);
+        src.tables && src.tables.length ? src.tables[0].last_loaded_at : src.last_loaded_at, src);
       if (preview) pv.appendChild(dataTable(preview.columns, preview.rows, { empty: 'The table is empty.' }));
       else pv.appendChild(el('div', { class: 'empty', text: 'Previews are shown for file sources. Use the CLI to ingest ' + src.type + ' sources.' }));
 
@@ -2084,6 +2099,7 @@
     // blanks and distinct values, the columns that could be the primary key, and, when no
     // single column can, the smallest sets of columns that identify every row.
     var keyView = { table: null, info: null, chosen: {}, waits: 0 };
+    state.pickedTable = {};  // a database source's table last picked in Preview Data
 
     function keyText(cols) { return cols.join(' + '); }
     function keyApi(table, rest) { return '/api/tables/' + encodeURIComponent(table) + rest; }
@@ -2107,10 +2123,12 @@
       return 'Since the latest load it no longer identifies every row: ' + parts.join(' and ') + '. The key is kept; choose another or fix the data.';
     }
 
-    function renderKeys(table, loadedAt) {
-      keyView = { table: table, info: null, chosen: {}, waits: 0, loadedAt: loadedAt };
-      $('detail-keys').hidden = !table;
+    function renderKeys(table, loadedAt, src) {
+      keyView = { table: table, info: null, chosen: {}, waits: 0, loadedAt: loadedAt, src: src };
+      $('detail-keys').hidden = $('detail-incr').hidden = !table;
       clear($('key-msg'));
+      clear($('incr-msg'));
+      clear($('incr-body'));
       if (!table) return;
       $('key-table').textContent = 'eyetable_raw.' + table;
       clear($('key-body')).appendChild(el('div', { class: 'muted', text: 'Loading the key scan\u2026' }));
@@ -2131,6 +2149,7 @@
       keyView.info = info;
       keyView.chosen = {};
       (info.key || []).forEach(function (c) { keyView.chosen[c] = true; });
+      renderIncremental(info);
       var stat = $('key-stat');
       if (stat) stat.textContent = keyStatText(info);
       var body = clear($('key-body')), s = info.scan;
@@ -2274,6 +2293,130 @@
       });
       bar.appendChild(rescan);
       return bar;
+    }
+
+    // -- incremental loads: which column shows what's new -------------------------
+    // The key scan also suggests columns whose values only grow as rows are added or changed
+    // (a modified time, best). With one chosen, an incremental load adds just the rows past the
+    // largest value already loaded; with a natural key, they replace their older copies.
+    var INCR_KINDS = { timestamp: 1, timestamptz: 1, date: 1, bigint: 1, double: 1, numeric: 1, text: 1, varchar: 1 };
+
+    function fmtValue(v) {
+      if (v === null || v === undefined) return '\u2014';
+      if (typeof v === 'string' && /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}/.test(v)) {
+        var d = new Date(/[zZ]|[+-]\d{2}:?\d{2}$/.test(v) ? v : v.replace(' ', 'T') + 'Z');
+        if (!isNaN(d)) return fmtTime(d.toISOString()) + ' (' + v + ')';
+      }
+      return String(v);
+    }
+
+    function renderIncremental(info) {
+      var src = keyView.src, table = keyView.table, body = clear($('incr-body'));
+      if (!src) return;
+      if (src.type === 'file') {
+        body.appendChild(el('p', { class: 'hint', style: 'margin:0', text: 'A file source gets new rows by loading a file with Append ' +
+          '(under Load data), so it has no incremental load.' }));
+        return;
+      }
+      var inc = info.incremental, s = info.scan;
+      var how = src.type === 'dbtable' ? 'The database is asked for just those rows.'
+        : src.type === 'gsheet' ? 'The whole tab is fetched (a sheet can\u2019t be asked for less) and only those rows are kept.'
+        : 'The API is still called for everything (every page and statement); only those rows are kept.';
+      var keyNote = info.key ? ' Each row replaces its older copy with the same ' + keyText(info.key) + ' (the natural key), and rows at the latest value are fetched again so none are missed.'
+        : ' There is no natural key, so a changed row is added again rather than replacing its older copy; set a natural key above to avoid that.';
+      if (inc && inc.missing) body.appendChild(banner('warn', 'Incremental loads went by ' + inc.column + ', which this table no longer has. Choose another column.'));
+      else if (inc) body.appendChild(banner('ok', 'Incremental loads go by ' + inc.column + '. The latest value loaded is ' + fmtValue(inc.latest) +
+        '; an incremental load adds rows past it. ' + how + keyNote));
+      else body.appendChild(el('p', { style: 'margin:0', text: 'Choose the column that shows which rows are new, usually a last-modified time. ' +
+        'Then Incremental load adds only rows past the latest value already loaded, instead of loading the whole table again.' }));
+
+      var chosen = inc && !inc.missing ? inc.column : null;
+      var cands = s && s.incremental_candidates;
+      if (!s) {
+        body.appendChild(el('p', { class: 'hint', style: 'margin:0', text: 'Scan the table (above) to see which columns could drive incremental loads.' }));
+      } else if (!cands) {
+        body.appendChild(el('p', { class: 'hint', style: 'margin:0', text: 'This scan is from before incremental loads; Scan again above to see which columns could drive them.' }));
+      }
+      var pick = { value: chosen };
+      var list = el('div', { class: 'incr-list', role: 'radiogroup', 'aria-label': 'Incremental column' });
+      var radios = [];
+      var addChoice = function (name, kindText, why, extra) {
+        var r = el('input', { type: 'radio', name: 'incr-col', value: name });
+        r.checked = name === chosen;
+        r.addEventListener('change', function () { pick.value = name; other.value = ''; updateIncrSave(); });
+        radios.push(r);
+        list.appendChild(el('label', null, [r, el('span', null, [el('strong', { text: name }), ' ', el('span', { class: 'muted', text: kindText }),
+          why ? el('span', { class: 'why', text: ' \u2014 ' + why + (extra ? '. ' + extra : '') }) : ''])]));
+      };
+      if (cands && cands.length) {
+        body.appendChild(el('p', { style: 'margin:0', text: cands.length === 1 ? 'The scan found one column that could do this:' : 'The scan found these columns that could do this, best first:' }));
+        cands.forEach(function (c) { addChoice(c.name, c.kind, c.why, 'Latest: ' + fmtValue(c.max)); });
+      } else if (cands) {
+        body.appendChild(el('p', { style: 'margin:0', text: 'The scan found no date, time or growing-number column that looks like it shows new rows. You can still pick one below.' }));
+      }
+      var listed = {};
+      (cands || []).forEach(function (c) { listed[c.name] = true; });
+      if (chosen && !listed[chosen]) addChoice(chosen, '', 'the column chosen now');
+      if (list.childNodes.length) body.appendChild(list);
+      var others = s ? s.columns.filter(function (c) { return INCR_KINDS[c.kind] && !listed[c.name] && c.name !== chosen; }) : [];
+      var other = el('select', { 'aria-label': 'Another column for incremental loads' },
+        [el('option', { value: '', text: others.length ? 'Another column\u2026' : 'No other date, time, number or text columns' })]
+          .concat(others.map(function (c) { return el('option', { value: c.name, text: c.name + ' (' + c.kind + ')' }); })));
+      other.disabled = !others.length;
+      other.addEventListener('change', function () {
+        if (!other.value) return;
+        pick.value = other.value;
+        radios.forEach(function (r) { r.checked = false; });
+        updateIncrSave();
+      });
+      if (s) body.appendChild(el('div', { class: 'row-inline' }, [other]));
+
+      var bar = el('div', { class: 'set-actions' });
+      var save = el('button', { type: 'button', class: 'btn primary', text: 'Use for incremental loads' });
+      var updateIncrSave = function () {
+        save.disabled = !pick.value || pick.value === chosen;
+        save.textContent = pick.value ? 'Use ' + pick.value + ' for incremental loads' : 'Pick a column';
+      };
+      updateIncrSave();
+      save.addEventListener('click', function () {
+        var col = pick.value, msg = clear($('incr-msg'));
+        save.disabled = true;
+        api(keyApi(table, '/incremental'), { method: 'PUT', headers: JSON_HEADERS, body: JSON.stringify({ column: col }) }).then(function (r) {
+          if (keyView.table !== table) return;
+          showKeys(r);
+          $('incr-msg').appendChild(banner('ok', 'Incremental loads of this table now go by ' + col + '.'));
+          refreshSourcesOnly();
+        }, function (err) { msg.appendChild(banner('err', 'Not saved: ' + err.message)); updateIncrSave(); });
+      });
+      if (s) bar.appendChild(save);
+      if (inc) {
+        var stop = el('button', { type: 'button', class: 'btn danger', text: 'Stop incremental loads' });
+        stop.addEventListener('click', function () {
+          var msg = clear($('incr-msg'));
+          api(keyApi(table, '/incremental'), { method: 'DELETE' }).then(function (r) {
+            if (keyView.table !== table) return;
+            showKeys(r);
+            $('incr-msg').appendChild(banner('ok', 'Incremental loads are off for this table; Reload loads it in full.'));
+            refreshSourcesOnly();
+          }, function (err) { msg.appendChild(banner('err', err.message)); });
+        });
+        bar.appendChild(stop);
+      }
+      body.appendChild(bar);
+
+      // load this table now, either way
+      var t = src.tables ? src.tables.filter(function (x) { return x.table === table; })[0] : null;
+      var target = { table: table, incremental: chosen, label: t ? t.schema + '.' + t.name : null };
+      body.appendChild(el('div', { class: 'set-actions' }, [
+        el('span', { class: 'muted', text: 'Load this table now:' }),
+        loadButton(src, target, false, 'Full load'),
+        loadButton(src, target, true, 'Incremental load')
+      ]));
+    }
+
+    // Re-read the sources list without re-opening Preview Data (which would reset what is being edited).
+    function refreshSourcesOnly() {
+      return api('/api/sources').then(function (sources) { state.sources = sources; renderSources(); }, function () {});
     }
 
     // -- staging a file ----------------------------------------------------
@@ -3279,28 +3422,78 @@
       return 'Reload ' + s.name + '? Every table it feeds is pulled again from the source and replaced.';
     }
 
-    function reloadButton(s) {
-      var b = el('button', { type: 'button', class: 'btn small reload' + (reloading[s.name] ? ' busy' : ''),
-        title: s.type === 'file' ? 'Load the stored files again' : s.type === 'gsheet' ? 'Fetch the tab from Google Sheets again' : 'Pull the data from the source again',
-        'aria-label': 'Reload ' + s.name });
+    function reloadButton(s) { return loadButton(s, null, false); }
+
+    // The tables an incremental load of a source (or of one table, `t`) would load.
+    function incrementalTables(s, t) {
+      if (s.type === 'file') return null;
+      if (t) return t.incremental ? [t] : [];
+      if (s.tables) return s.tables.filter(function (x) { return x.incremental; });
+      return s.incremental ? [{ table: s.table, incremental: s.incremental }] : [];
+    }
+
+    function loadButtons(s, t) {
+      var target = t ? { table: t.table, incremental: t.incremental, label: t.schema + '.' + t.name } : null;
+      var box = el('span', { class: 'load-btns' }, [loadButton(s, target, false)]);
+      if (s.type !== 'file') box.appendChild(loadButton(s, target, true));
+      return box;
+    }
+
+    function loadButton(s, target, incremental, text) {
+      var busyKey = s.name + (target && s.tables && s.tables.length > 1 ? '/' + target.table : '');
+      var busy = reloading[busyKey] === (incremental ? 'inc' : 'full');
+      var what = target ? (target.label || target.table) : s.name;
+      var tables = incremental ? incrementalTables(s, target) : null;
+      var b = el('button', { type: 'button', class: 'btn small reload' + (busy ? ' busy' : ''), 'aria-label': (incremental ? 'Incremental load of ' : 'Reload ') + what });
+      if (incremental) {
+        b.title = !tables.length ? 'Choose an incremental column for ' + (target ? 'this table' : 'a table of this source') + ' in Preview Data first'
+          : 'Add only the rows past the latest ' + tables.map(function (x) { return x.incremental; }).filter(function (c, i, all) { return all.indexOf(c) === i; }).join(' / ') + ' already loaded';
+      } else {
+        b.title = s.type === 'file' ? 'Load the stored files again' : s.type === 'gsheet' ? 'Fetch the tab from Google Sheets again'
+          : target ? 'Load this table again in full' : 'Pull the data from the source again';
+      }
       b.innerHTML = RELOAD_ICON;
-      b.appendChild(document.createTextNode(reloading[s.name] ? 'Reloading…' : 'Reload'));
-      b.disabled = !!reloading[s.name];
+      b.appendChild(document.createTextNode(busy ? (incremental ? 'Loading new\u2026' : 'Reloading\u2026') : text || (incremental ? 'Incremental' : 'Reload')));
+      b.disabled = !!reloading[busyKey] || (incremental && !tables.length);
       b.addEventListener('click', function (e) {
         e.stopPropagation();  // the row itself opens the source's details
-        reloadSource(s);
+        reloadSource(s, false, { incremental: incremental, table: target ? target.table : null,
+          label: target && s.tables && s.tables.length > 1 ? what : null, fromPanel: !!text });
       });
       b.addEventListener('keydown', function (e) { e.stopPropagation(); });
       return b;
     }
 
-    function reloadSource(s, confirmed) {
-      var prompt = reloadPrompt(s);
+    function loadSummary(s, r, opts) {
+      var res = r.results || [];
+      if (!opts.incremental) return (opts.label ? opts.label + ' of ' : '') + s.name + ' reloaded: ' +
+        plural(opts.label && res.length ? res.reduce(function (n, x) { return n + x.rows; }, 0)
+          : r.source.rows !== undefined && r.source.rows !== null ? r.source.rows : r.rows, 'row') + ' at ' + fmtTime(r.source.last_loaded_at) + '.';
+      var parts = res.map(function (x) {
+        if (x.mode !== 'incremental') return x.table + ': the table was empty, so it was loaded in full (' + plural(x.rows, 'row') + ')';
+        if (!x.rows) return x.table + ': nothing new after ' + fmtValue(x.since);
+        if (x.rows === x.replaced) return x.table + ': no new rows (' + plural(x.rows, 'row') + ' at ' + fmtValue(x.since) +
+          ' fetched again, replacing ' + (x.rows === 1 ? 'its older copy' : 'their older copies') + ')';
+        return x.table + ': ' + plural(x.rows, 'row') + ' from ' + fmtValue(x.since) + ' on' + (x.replaced
+          ? ' — ' + fmtInt(x.rows - x.replaced) + ' new, ' + fmtInt(x.replaced) + ' replacing ' + (x.replaced === 1 ? 'its older copy' : 'their older copies')
+          : '');
+      });
+      return 'Incremental load of ' + (opts.label || s.name) + ' done. ' + parts.join('; ') + '.';
+    }
+
+    function reloadSource(s, confirmed, opts) {
+      opts = opts || {};
+      var busyKey = s.name + (opts.table && s.tables && s.tables.length > 1 ? '/' + opts.table : '');
+      var prompt = opts.incremental ? null : opts.table && s.tables ? 'Reload ' + (opts.label || opts.table) + ' of ' + s.name + '? It is read again in full and replaces what is here.' : reloadPrompt(s);
       if (prompt && !confirmed && !confirm(prompt)) return;
-      reloading[s.name] = true;
+      reloading[busyKey] = opts.incremental ? 'inc' : 'full';
       renderSources();
       var msg = clear($('sources-msg'));
-      var body = s.type === 'gsheet' && googleToken() ? JSON.stringify({ google_token: googleToken() }) : '{}';
+      var payload = {};
+      if (s.type === 'gsheet' && googleToken()) payload.google_token = googleToken();
+      if (opts.incremental) payload.incremental = true;
+      if (opts.table && s.tables && s.tables.length > 1) payload.table = opts.table;
+      var body = JSON.stringify(payload);
       var path = '/api/sources/' + encodeURIComponent(s.name);
       var post = { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: body };
       // A set can outlast a web request, so it runs in the background.
@@ -3311,15 +3504,21 @@
           })
         : api(path + '/reload', post)
       ).then(function (r) {
-        msg.appendChild(banner('ok', s.name + ' reloaded: ' + plural(r.source.rows !== undefined && r.source.rows !== null ? r.source.rows : r.rows, 'row') +
-          ' at ' + fmtTime(r.source.last_loaded_at) + '.'));
+        var text = loadSummary(s, r, opts);
+        msg.appendChild(banner('ok', text));
+        if (state.selected === s.name && $('incr-msg')) { clear($('incr-msg')); }
+        return text;
       }, function (err) {
+        var what = (opts.incremental ? 'The incremental load of ' : '') + (opts.label ? opts.label + ' of ' : '') + s.name + (opts.incremental ? ' failed: ' : ' was not reloaded: ');
         msg.appendChild(s.type === 'gsheet'
-          ? sheetErrorBanner(s.name + ' was not reloaded: ', err, function () { reloadSource(s, true); }, 'sources-msg')
-          : banner('err', s.name + ' was not reloaded: ' + err.message));
-      }).then(function () {
-        delete reloading[s.name];
-        return refresh().catch(function () {});
+          ? sheetErrorBanner(what, err, function () { reloadSource(s, true, opts); }, 'sources-msg')
+          : banner('err', what + err.message));
+      }).then(function (text) {
+        delete reloading[busyKey];
+        return refresh().catch(function () {}).then(function () {
+          // say it in Preview Data too, when the load was started from there
+          if (text && opts.fromPanel && $('incr-msg')) setTimeout(function () { clear($('incr-msg')).appendChild(banner('ok', text)); }, 600);
+        });
       });
     }
 

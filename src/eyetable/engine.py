@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
-from eyetable import gsheets, keys
+from eyetable import gsheets, incremental, keys
 from eyetable.connectors import Connector, build_connector
 from eyetable.connectors.file import DATASET_KEY, FileConnector
 from eyetable.credentials import decrypt_secrets, resolve_env
@@ -37,6 +37,9 @@ class RunResult:
     rows: int
     error: str | None = None
     upload_id: int | None = None
+    mode: str = "replace"  # "replace" | "append" | "incremental"
+    since: Any = None  # an incremental load's starting point: the largest value loaded before it
+    replaced: int = 0  # older copies of rows an incremental load replaced (by natural key)
 
 
 class UnknownDataset(KeyError):
@@ -504,6 +507,8 @@ class Engine:
         self,
         source: str,
         sheet_fetch: Callable[[str], gsheets.Workbook] = gsheets.fetch_workbook,
+        incremental: bool = False,
+        table: str | None = None,
     ) -> list[RunResult]:
         """Load a source's data again, so its table (and last-loaded time) is fresh.
 
@@ -511,8 +516,24 @@ class Engine:
           table built from a replace plus appends comes back exactly as it was.
         * gsheet: the tab is fetched again and replaces the table.
         * database / postman: every readable dataset is pulled again (replace).
+
+        With `incremental`, only rows past each table's incremental column are
+        loaded (see incremental.py); tables without one are left alone. `table`
+        loads just that one of a database source's tables.
         """
         src = self.store.get_source(source)
+        if incremental and src.type == "file":
+            raise incremental_problem("a file source gets new rows by loading a file with Append; there is nothing to fetch")
+        keys_ = None
+        if table is not None:
+            if src.type == "dbtable":
+                from eyetable import dbconnect
+
+                keys_ = [i["key"] for i in dbconnect.db_tables(src.config) if table_name(source, i["name"]) == table]
+                if not keys_:
+                    raise ValueError(f"{source} has no table {table}")
+            elif table != table_name(source, DATASET_KEY):
+                raise ValueError(f"{source} has no table {table}")
         if src.type == "file":
             history = [u for u, status in self.store.load_history(source) if status == "succeeded"]
             if not history:
@@ -536,8 +557,37 @@ class Engine:
                 raise ValueError(f'the tab "{wanted}" is no longer in "{book.title}"; it may have been renamed or deleted')
             if not tab.headers:
                 raise ValueError(f'the tab "{wanted}" is empty now; nothing was reloaded')
-            return [self._load_sheet_tab(book, tab, source, table_name(source, DATASET_KEY), "replace")]
-        return self.ingest(source)
+            target = table_name(source, DATASET_KEY)
+            if incremental:
+                return [self._sheet_increment(book, tab, source, target)]
+            return [self._load_sheet_tab(book, tab, source, target, "replace")]
+        return self.ingest(source, keys=keys_, mode="incremental" if incremental else "replace")
+
+    def _sheet_increment(self, book: gsheets.Workbook, tab: gsheets.Tab, source: str, table: str) -> RunResult:
+        """Add the tab's rows past the incremental column (the whole tab is fetched; sheets can't be asked for less)."""
+        p = incremental.plan(self.store, table)
+        if p.since is None:
+            return self._load_sheet_tab(book, tab, source, table, "replace")
+        run_id = self.store.start_run(source, DATASET_KEY, table, "incremental")
+        origin = f"{source} - {book.title} / {tab.title}"
+        return self._write_increment(run_id, tab.title, table, origin, p,
+                                     lambda: incremental.newer([tab.records], p.column, p.since, p.inclusive))
+
+    def _write_increment(self, run_id: int, key: str, table: str, origin: str, p: "incremental.Plan",
+                         batches: Callable[[], Any]) -> RunResult:
+        """Append an incremental load's rows; with a natural key, they replace their older copies."""
+        try:
+            rows = self.store.write(table, batches(), "append", run_id, origin=origin)
+            replaced = self.store.replace_older(table, p.key, run_id) if p.key and rows else 0
+        except Exception as exc:
+            self.store.delete_run_rows(table, run_id)  # all or nothing, like a replace
+            error = f"{type(exc).__name__}: {exc}"
+            self.store.finish_run(run_id, "failed", 0, error)
+            return RunResult(run_id, key, table, "failed", 0, error, mode="incremental", since=p.since)
+        self.store.finish_run(run_id, "succeeded", rows)
+        if rows:
+            self.scan_keys(table)
+        return RunResult(run_id, key, table, "succeeded", rows, mode="incremental", since=p.since, replaced=replaced)
 
     def discover(self, source: str) -> list[DatasetInfo]:
         """Walk the source's metadata, record every dataset found in the catalog."""
@@ -566,15 +616,27 @@ class Engine:
         unknown = [k for k in keys if k not in catalog]
         if unknown:
             raise UnknownDataset(f"not in {source!r} catalog (run discover?): {', '.join(unknown)}")
+        if mode == "incremental":
+            chosen = self.store.increments()
+            keys = [k for k in keys if table_name(source, catalog[k].name) in chosen]
+            if not keys:
+                raise incremental_problem("no incremental column is chosen for this table; choose one in Preview Data")
 
         results = []
         with self.connector(source) as conn:
             for key in keys:
                 table = table_name(source, catalog[key].name)
-                run_id = self.store.start_run(source, key, table, mode)
+                if mode == "incremental":
+                    p = incremental.plan(self.store, table)
+                    if p.since is not None:
+                        results.append(self._ingest_increment(conn, source, key, catalog[key], table, p, batch_size))
+                        continue
+                    # an empty (or missing) table: there is nothing to go on, so load it all
+                run_id = self.store.start_run(source, key, table, "replace" if mode == "incremental" else mode)
                 try:
                     origin = f"{source} - {conn.origin(key)}"
-                    rows = self.store.write(table, conn.read(key, batch_size), mode, run_id, origin=origin)
+                    rows = self.store.write(table, conn.read(key, batch_size), "replace" if mode == "incremental" else mode,
+                                            run_id, origin=origin)
                 except Exception as exc:
                     error = f"{type(exc).__name__}: {exc}"
                     self.store.finish_run(run_id, "failed", 0, error)
@@ -584,3 +646,21 @@ class Engine:
                     results.append(RunResult(run_id, key, table, "succeeded", rows))
                     self.scan_keys(table)
         return results
+
+    def _ingest_increment(self, conn: Connector, source: str, key: str, dataset: DatasetInfo, table: str,
+                          p: "incremental.Plan", batch_size: int) -> RunResult:
+        run_id = self.store.start_run(source, key, table, "incremental")
+        origin = f"{source} - {conn.origin(key)}"
+        column = incremental.source_key([c.name for c in dataset.columns], p.column) \
+            if getattr(conn, "reads_since", False) else None
+
+        def batches():
+            if column is not None:  # the database is asked for just the newer rows
+                return conn.read(key, batch_size, since=(column, p.since, p.inclusive))
+            return incremental.newer(conn.read(key, batch_size), p.column, p.since, p.inclusive)
+
+        return self._write_increment(run_id, key, table, origin, p, batches)
+
+
+def incremental_problem(message: str) -> Exception:
+    return incremental.IncrementalProblem(message)

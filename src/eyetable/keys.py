@@ -20,6 +20,7 @@ from typing import Any
 
 import sqlalchemy as sa
 
+from . import incremental
 from .store import ID_COLUMN, META_COLUMNS, CoreStore, kind_of
 
 MAX_SET_SIZE = 3
@@ -137,6 +138,7 @@ def scan(store: CoreStore, table: str) -> dict[str, Any]:
             copies = int(conn.execute(sa.text(
                 f"SELECT COALESCE(SUM(n - 1), 0) FROM (SELECT COUNT(*) AS n FROM {q} GROUP BY {group} HAVING COUNT(*) > 1) d"
             )).scalar_one())
+        increments = incremental.candidates(conn, store, table, columns, rows)
     return {
         "table": table,
         "rows": rows,
@@ -147,6 +149,7 @@ def scan(store: CoreStore, table: str) -> dict[str, Any]:
         "max_set_size": MAX_SET_SIZE,
         "cut_short": cut_short,
         "exact_copies": copies,  # counted only when nothing smaller identifies the rows
+        "incremental_candidates": increments,
         "scanned_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "seconds": round(time.monotonic() - started, 2),
     }
@@ -172,7 +175,35 @@ def key_info(store: CoreStore, table: str) -> dict[str, Any]:
         "key": key,
         "key_set_at": saved["key_set_at"] if saved else None,
         "key_check": check,
+        "incremental": increment_info(store, table),
     }
+
+
+def increment_info(store: CoreStore, table: str) -> dict[str, Any] | None:
+    """The table's incremental column, and the largest value of it loaded so far."""
+    column = store.get_increment(table)
+    if column is None:
+        return None
+    cols = {c["name"]: c["type"] for c in sa.inspect(store.db).get_columns(table, schema=store.data_schema)}         if store.table_exists(table) else {}
+    if column not in cols:
+        return {"column": column, "kind": None, "latest": None, "missing": True}
+    return {"column": column, "kind": kind_of(cols[column]), "latest": store.max_value(table, column, cols[column]),
+            "missing": False}
+
+
+def choose_increment(store: CoreStore, table: str, column: str | None) -> dict[str, Any]:
+    """Make `column` the table's incremental column (None stops incremental loads)."""
+    if column:
+        kinds = source_columns(store, table)
+        if column in ET_COLUMNS:
+            raise KeyProblem(f"{column} is eyetable's own; choose a column from the source")
+        if column not in kinds:
+            raise KeyProblem(f"{table} has no column {column}")
+        if not incremental.usable(kinds[column]):
+            raise KeyProblem(f"{column} holds {kinds[column]} values, which can't show which rows are new; "
+                             "choose a date, time or number column")
+    store.save_increment(table, column or None)
+    return key_info(store, table)
 
 
 def choose_key(store: CoreStore, table: str, columns: list[str]) -> dict[str, Any]:

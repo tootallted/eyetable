@@ -173,6 +173,12 @@ class KeyIn(BaseModel):
 class ReloadIn(BaseModel):
     # For a Google Sheet source whose sheet is private (see SheetIn.google_token).
     google_token: str | None = Field(default=None, max_length=4096)
+    incremental: bool = False  # only the rows past each table's incremental column (incremental.py)
+    table: str | None = Field(default=None, max_length=128)  # just this one of a database source's tables
+
+
+class IncrementIn(BaseModel):
+    column: str = Field(min_length=1, max_length=128)
 
 
 class SheetIn(BaseModel):
@@ -293,6 +299,7 @@ def create_app(
     def db_source_tables(src, datasets) -> list[dict[str, Any]]:
         """Each table a database source loads, with its rows and when it last loaded."""
         loads = store.table_loads(src.name)
+        increments = store.increments()
         catalog = {d.key: d for d in datasets}
         out = []
         for item in dbconnect.db_tables(src.config):
@@ -301,7 +308,7 @@ def create_app(
             # a replace writes the whole table, so its count is the table's; otherwise count it
             rows = written if mode == "replace" else store.count_rows(table)
             out.append({"key": item["key"], "schema": item["schema"], "name": item["table"], "kind": item.get("kind", "table"),
-                        "table": table, "rows": rows, "last_loaded_at": finished,
+                        "table": table, "rows": rows, "last_loaded_at": finished, "incremental": increments.get(table),
                         "columns": len(catalog[item["key"]].columns) if item["key"] in catalog else None})
         return out
 
@@ -327,6 +334,7 @@ def create_app(
             counted = [t["rows"] for t in tables if t["rows"] is not None]
             summary.update(
                 table=tables[0]["table"],
+                incremental=tables[0]["incremental"] if len(tables) == 1 else None,
                 rows=sum(counted) if counted else None,
                 columns=tables[0]["columns"] if len(tables) == 1 else None,
                 last_upload=None,
@@ -337,6 +345,7 @@ def create_app(
             uploads = store.list_uploads(src.name, limit=1)
             summary.update(
                 table=table,
+                incremental=store.get_increment(table),
                 rows=store.count_rows(table),
                 columns=len(datasets[0].columns) if datasets else None,
                 last_upload=uploads[0] if uploads else None,
@@ -763,6 +772,18 @@ def create_app(
         except keys.KeyProblem as exc:
             raise HTTPException(400, str(exc)) from None
 
+    @app.put("/api/tables/{table}/incremental", dependencies=auth)
+    def set_table_increment(table: str, body: IncrementIn) -> dict[str, Any]:
+        """Make this column the one the table's incremental loads go by."""
+        try:
+            return jsonable_encoder(keys.choose_increment(store, loaded_table(table), body.column))
+        except keys.KeyProblem as exc:
+            raise HTTPException(400, str(exc)) from None
+
+    @app.delete("/api/tables/{table}/incremental", dependencies=auth)
+    def clear_table_increment(table: str) -> dict[str, Any]:
+        return jsonable_encoder(keys.choose_increment(store, loaded_table(table), None))
+
     @app.delete("/api/tables/{table}/key", dependencies=auth)
     def clear_table_key(table: str) -> dict[str, Any]:
         store.save_table_key(loaded_table(table), None)
@@ -895,7 +916,8 @@ def create_app(
         get_source(name)
         token_ = body.google_token if body else None
         try:
-            results = engine.reload_source(name, sheet_fetch=lambda url: sheet_fetch(url, token_))
+            results = engine.reload_source(name, sheet_fetch=lambda url: sheet_fetch(url, token_),
+                                           incremental=bool(body and body.incremental), table=body.table if body else None)
         except SheetError as exc:
             raise sheet_error(exc) from None
         except (ValueError, KeyError) as exc:
@@ -910,16 +932,18 @@ def create_app(
         })
 
     @app.post("/api/sources/{name}/run", dependencies=auth, status_code=202)
-    def run_source(name: str) -> dict[str, Any]:
+    def run_source(name: str, body: ReloadIn | None = None) -> dict[str, Any]:
         """Reload a source in the background, for a set that can outlast a web request."""
         curl_source(name)
+        incremental_ = bool(body and body.incremental)
 
         def work() -> dict[str, Any]:
-            results = engine.reload_source(name)
+            results = engine.reload_source(name, incremental=incremental_)
             failed = [r for r in results if r.status != "succeeded"]
             if failed:
                 raise RuntimeError("; ".join(r.error or r.status for r in failed))
-            return {"source": source_summary(store.get_source(name)), "rows": sum(r.rows for r in results)}
+            return jsonable_encoder({"source": source_summary(store.get_source(name)), "rows": sum(r.rows for r in results),
+                                     "results": [r.__dict__ for r in results]})
 
         return {"job_id": start_job("reload", work)}
 
