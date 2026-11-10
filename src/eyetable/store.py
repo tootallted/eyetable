@@ -19,6 +19,7 @@ and quick local experiments without a Postgres server.
 import datetime as dt
 import hashlib
 import json
+import secrets
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
@@ -39,6 +40,8 @@ SOURCE_COLUMN = "ET_source"
 RUN_ID_COLUMN = "ET_run_id"
 # Data columns may not take these names (compared case-insensitively, as SQLite does).
 RESERVED_COLUMNS = {c.lower() for c in (ID_COLUMN, TIMESTAMP_COLUMN, SOURCE_COLUMN, RUN_ID_COLUMN)}
+# Every loaded table: ET_id, then the source's own columns, then these.
+META_COLUMNS = {TIMESTAMP_COLUMN: "timestamptz", SOURCE_COLUMN: "varchar", RUN_ID_COLUMN: "bigint"}
 
 
 def _now() -> dt.datetime:
@@ -715,6 +718,7 @@ class CoreStore:
         for batch in batches:
             meta = {TIMESTAMP_COLUMN: _now(), SOURCE_COLUMN: origin, RUN_ID_COLUMN: run_id}
             rows += writer.write(batch, meta)
+        writer.finish(reorder=(mode == "replace"))
         if mode == "replace":
             prep = self.db.dialect.identifier_preparer
             with self.db.begin() as conn:
@@ -736,13 +740,21 @@ class CoreStore:
 
 
 class _TableWriter:
-    """Creates and evolves one data table as batches arrive."""
+    """Creates and evolves one data table as batches arrive.
+
+    A new table is created from the first batch, so its columns run ET_id, the
+    source's columns, then ET_timestamp, ET_source, ET_run_id. A column first
+    seen later can only be added at the end; finish(reorder=True) then rebuilds
+    the table in that order (a replace's staging table, before it's swapped in).
+    """
 
     def __init__(self, store: CoreStore, table: str, fresh: bool):
         self.store = store
         self.table = table
         self.columns: dict[str, str] = {}  # column name -> kind, for every column we insert into
         self.key_to_column: dict[str, str] = {}
+        self.pending = False  # created with the first batch, so its columns come first
+        self.out_of_order = False  # a source column was added after the ET columns
 
         qualified = store.qualified(table)
         insp = sa.inspect(store.db)
@@ -759,18 +771,55 @@ class _TableWriter:
                 if col["name"] != ID_COLUMN:  # the database assigns ET_id
                     self.columns[col["name"]] = kind_of(col["type"])
         else:
-            self.columns = {TIMESTAMP_COLUMN: "timestamptz", SOURCE_COLUMN: "varchar", RUN_ID_COLUMN: "bigint"}
-            cols = [
-                # BIGINT identity on Postgres; SQLite only auto-numbers an INTEGER PRIMARY KEY.
-                sa.Column(
-                    ID_COLUMN,
-                    sa.BigInteger().with_variant(sa.Integer(), "sqlite"),
-                    sa.Identity(start=1, increment=1, always=True),
-                    primary_key=True,
-                ),
-                *(sa.Column(n, sa_type(k), nullable=False) for n, k in self.columns.items()),
-            ]
-            sa.Table(table, sa.MetaData(), *cols, schema=store.data_schema).create(store.db)
+            self.pending = True
+        self._rebuild()
+
+    def _create(self, name: str, data: dict[str, str]) -> None:
+        """A table of ET_id, the source's columns (`data`), then the other ET columns."""
+        cols = [
+            # BIGINT identity on Postgres; SQLite only auto-numbers an INTEGER PRIMARY KEY.
+            sa.Column(
+                ID_COLUMN,
+                sa.BigInteger().with_variant(sa.Integer(), "sqlite"),
+                sa.Identity(start=1, increment=1, always=True),
+                primary_key=True,
+            ),
+            *(sa.Column(n, sa_type(k)) for n, k in data.items()),
+            *(sa.Column(n, sa_type(k), nullable=False) for n, k in META_COLUMNS.items()),
+        ]
+        sa.Table(name, sa.MetaData(), *cols, schema=self.store.data_schema).create(self.store.db)
+
+    def _create_from(self, kinds: dict[str, str | None]) -> None:
+        data = {self._column_for(key): kind or "text" for key, kind in kinds.items()}
+        self._create(self.table, data)
+        self.columns = {**data, **META_COLUMNS}
+        self.pending = False
+        self._rebuild()
+
+    def finish(self, reorder: bool = False) -> None:
+        """Create the table if no rows came; with `reorder`, put late columns before the ET ones."""
+        if self.pending:
+            self._create_from({})
+        if not (reorder and self.out_of_order):
+            return
+        db, prep = self.store.db, self.store.db.dialect.identifier_preparer
+        data = {n: k for n, k in self.columns.items() if n not in META_COLUMNS}
+        temp = f"et_reorder_{secrets.token_hex(6)}"
+        self._create(temp, data)
+        names = ", ".join(prep.quote(c) for c in [ID_COLUMN, *data, *META_COLUMNS])
+        overriding = " OVERRIDING SYSTEM VALUE" if db.dialect.name == "postgresql" else ""
+        with db.begin() as conn:
+            conn.execute(sa.text(f"INSERT INTO {self.store.qualified(temp)} ({names}){overriding} "
+                                 f"SELECT {names} FROM {self.store.qualified(self.table)} ORDER BY {prep.quote(ID_COLUMN)}"))
+            if db.dialect.name == "postgresql":  # the copied ET_ids were given, so move the counter past them
+                conn.execute(sa.text(
+                    f"SELECT setval(pg_get_serial_sequence(:t, :c), COALESCE(MAX({prep.quote(ID_COLUMN)}), 1), "
+                    f"MAX({prep.quote(ID_COLUMN)}) IS NOT NULL) FROM {self.store.qualified(temp)}"
+                ), {"t": self.store.qualified(temp), "c": ID_COLUMN})
+            conn.execute(sa.text(f"DROP TABLE {self.store.qualified(self.table)}"))
+            conn.execute(sa.text(f"ALTER TABLE {self.store.qualified(temp)} RENAME TO {prep.quote(self.table)}"))
+        self.columns = {**data, **META_COLUMNS}
+        self.out_of_order = False
         self._rebuild()
 
     def _rebuild(self) -> None:
@@ -802,6 +851,7 @@ class _TableWriter:
                     ddl = sa_type(kind).compile(dialect=db.dialect)
                     conn.execute(sa.text(f"ALTER TABLE {qualified} ADD COLUMN {prep.quote(col)} {ddl}"))
                     self.columns[col] = kind
+                    self.out_of_order = self.out_of_order or any(m in self.columns for m in META_COLUMNS)
                     changed = True
                     continue
                 current = self.columns[col]
@@ -822,7 +872,10 @@ class _TableWriter:
     def write(self, records: list[dict[str, Any]], meta: dict[str, Any]) -> int:
         if not records:
             return 0
-        self._evolve(infer_columns(records))
+        kinds = infer_columns(records)
+        if self.pending:
+            self._create_from(kinds)
+        self._evolve(kinds)
         rows = []
         for record in records:
             row = {c: None for c in self.columns}

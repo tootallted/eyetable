@@ -81,8 +81,8 @@ def test_schema_lists_sources_and_tables(client):
     body = client.get("/api/schema", headers=AUTH).json()
     assert {s["name"]: s.get("table") for s in body["sources"]} == {"orders": "orders__data", "parts": "parts__data"}
     tables = {t["table"]: [c["name"] for c in t["columns"]] for t in body["tables"]}
-    assert tables["parts__data"][:4] == ["ET_id", "ET_timestamp", "ET_source", "ET_run_id"]
-    assert tables["parts__data"][4:] == ["sku", "qty", "price"]
+    assert tables["parts__data"][0] == "ET_id" and tables["parts__data"][-3:] == ["ET_timestamp", "ET_source", "ET_run_id"]
+    assert tables["parts__data"][1:-3] == ["sku", "qty", "price"]
 
 
 def test_runner_leaves_no_views_behind(loaded):

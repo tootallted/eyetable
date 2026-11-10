@@ -49,9 +49,9 @@ def test_drop_create_then_replace_and_append(client):
     assert all(r["status"] == "succeeded" for r in detail["runs"])
 
     preview = client.get("/api/sources/parts/preview", headers=AUTH).json()
-    assert preview["columns"][:4] == ["ET_id", "ET_timestamp", "ET_source", "ET_run_id"]
+    assert preview["columns"][0] == "ET_id" and preview["columns"][-3:] == ["ET_timestamp", "ET_source", "ET_run_id"]
     assert [row[0] for row in preview["rows"]] == [1, 2]
-    assert preview["rows"][0][2] == "parts - parts_v3.csv"
+    assert preview["rows"][0][preview["columns"].index("ET_source")] == "parts - parts_v3.csv"
 
 
 def test_upload_errors(client):

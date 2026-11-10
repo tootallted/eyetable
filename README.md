@@ -47,7 +47,11 @@ ones you want into a core Postgres database where every run is logged.
 
 ### Columns on every ingested row
 
-However a table is ingested, every row gets these columns ahead of its data:
+However a table is ingested, every row gets these columns. `ET_id` comes first,
+then the source's own columns, then `ET_timestamp`, `ET_source` and `ET_run_id`
+(a column that first turns up partway through a load is still put before them).
+Tables made before this order take it on their next replace (a **Reload**); an
+append adds new columns at the end until then.
 
 | column         | type          | value                                                               |
 |----------------|---------------|---------------------------------------------------------------------|

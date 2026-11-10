@@ -29,7 +29,7 @@ def test_database_source_end_to_end(store, source_db):
     assert {r["ET_source"] for r in rows} == {"crm - main.customers"}
     assert all(isinstance(r["ET_timestamp"], dt.datetime) for r in rows)
     assert all(r["ET_run_id"] for r in rows)
-    assert list(rows[0])[:4] == ["ET_id", "ET_timestamp", "ET_source", "ET_run_id"]
+    assert list(rows[0])[0] == "ET_id" and list(rows[0])[-3:] == ["ET_timestamp", "ET_source", "ET_run_id"]
 
     # replace swaps in a fresh table, so ET_id starts over; append continues it
     engine.ingest("crm", ["main.customers"])

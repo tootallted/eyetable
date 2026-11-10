@@ -165,7 +165,7 @@ def test_api_inspect_load_and_query(store):
     assert summary["general_ledger_2026_q1_actuals"]["rows"] == 2
 
     preview = client.get("/api/sources/general_ledger_2026_q1_actuals/preview", headers=AUTH).json()
-    assert preview["rows"][0][2] == "general_ledger_2026_q1_actuals - General Ledger 2026 / Q1 Actuals"
+    assert preview["rows"][0][preview["columns"].index("ET_source")] == "general_ledger_2026_q1_actuals - General Ledger 2026 / Q1 Actuals"
 
     q = client.post("/api/query", headers=AUTH, json={"sql": "SELECT account, amount FROM general_ledger_2026_q1_actuals ORDER BY amount"})
     assert q.json()["rows"] == [["Rent", 1200.5], ["Payroll", 5400.0]]
