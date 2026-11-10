@@ -301,6 +301,27 @@ optional `page_size`, `next_field`, `records_field` and `all_pages`),
 `PUT` and `DELETE /api/sources/<name>/statements`, and
 `POST /api/sources/<name>/run` to reload in the background.
 
+### Changing a source's connection
+
+Click a source and open **Preview Data**: **Connection settings** shows how it
+connects, never with its passwords, tokens or keys, and lets you change it in
+place, keeping the source's name, table, tags, groups and history:
+
+* **Database table**: edit the connection string (server, database, user) and,
+  separately, the password, plus the schema and table. A connection string
+  without a password keeps the stored one.
+* **API (curl)**: a new value for each stored secret, named by where it goes
+  (*the Authorization header*, *the api_key query parameter*); for a `Bearer`
+  header, paste just the token. Add, replace or remove the client certificate,
+  or paste a whole new curl command: the source keeps its paging, rows field,
+  certificate and set of statements (a set that no longer fits is removed).
+* Google Sheet and file sources show where they come from; there's nothing to
+  connect to change.
+
+With **Check the connection before saving** (on by default), nothing is saved
+unless the table can be read or the request works. **Save and reload** loads it
+straight away. API: `GET` and `PUT /api/sources/<name>/settings`.
+
 ### Reloading a source
 
 Every row in **Sources** has a **Reload** button that loads that source's data

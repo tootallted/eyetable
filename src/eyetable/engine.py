@@ -278,6 +278,117 @@ class Engine:
         self.discover(name)
         return self.ingest(name, mode=mode if existing else "replace")
 
+    def update_db_source(
+        self,
+        name: str,
+        connection: str | None = None,
+        password: str | None = None,
+        schema: str | None = None,
+        table: str | None = None,
+        test: bool = True,
+    ) -> list[str]:
+        """Change a database table source's connection (or schema/table), keeping its name and table.
+
+        A connection string without a password keeps the stored one; `password`
+        replaces it. With `test`, nothing is saved unless the table can be read.
+        """
+        from eyetable import dbconnect
+        from eyetable.credentials import encrypt_secret
+
+        src = self.store.get_source(name)
+        if src.type != "dbtable":
+            raise ValueError(f"{name} isn't a database table source")
+        config = dict(src.config)
+        if connection and connection.strip():
+            prepared = dbconnect.prepare(connection, self.secret_key)
+            fresh = dict(prepared.config)
+            if "password" not in fresh and config.get("password"):
+                fresh["password"] = config["password"]
+            config = {**fresh, "schema": config["schema"], "table": config["table"],
+                      "kind": config.get("kind", "table"), "label": prepared.label}
+        if password:
+            config["password"] = encrypt_secret(password, self.secret_key)
+        if schema and schema.strip():
+            config["schema"] = schema.strip()
+        if table and table.strip():
+            config["table"] = table.strip()
+        if test:
+            with self._open("dbtable", config) as conn:
+                conn.discover()
+        self.store.save_source(name, "dbtable", config)
+        warnings = []
+        if test:
+            self.discover(name)
+        else:
+            warnings.append("Saved without checking the connection; the next load will show whether it works.")
+        return warnings
+
+    def update_curl_source(
+        self,
+        name: str,
+        command: str | None = None,
+        secrets: dict[str, str] | None = None,
+        certificate: dict[str, Any] | None = None,
+        remove_certificate: bool = False,
+        test: bool = True,
+    ) -> list[str]:
+        """Change a curl source's request, secrets or client certificate, keeping its name and table.
+
+        A new command keeps the source's paging, rows field, certificate and set
+        of statements (the set is dropped if it no longer fits). With `test`, the
+        request is sent once and nothing is saved unless it works.
+        """
+        import httpx
+
+        from eyetable import curl
+        from eyetable.credentials import encrypt_secret
+
+        src = self.store.get_source(name)
+        if src.type != "curl":
+            raise ValueError(f"{name} isn't a curl source")
+        config = {**src.config, "variables": dict(src.config.get("variables") or {})}
+        warnings: list[str] = []
+        if command and command.strip():
+            _, fresh, _ = curl.prepare(command, self.secret_key)
+            for key in ("pagination", "records_path", "client_cert", "timeout"):
+                if key in config:
+                    fresh[key] = config[key]
+            plan = config.get("statements")
+            if plan:
+                try:
+                    fresh["statements"] = curl.clean_statements(fresh, plan)
+                except ValueError as exc:
+                    warnings.append(f"The set of statements no longer fits the request ({exc}), so it was removed.")
+            config = fresh
+        for secret, value in (secrets or {}).items():
+            if not value:
+                continue
+            if secret not in config["variables"]:
+                raise ValueError(f"the request has no {secret}")
+            # "Bearer abc" was stored whole; a new token on its own keeps the "Bearer "
+            scheme = curl.auth_scheme(decrypt_secrets(config["variables"][secret], self.secret_key))
+            if scheme and not curl.auth_scheme(value):
+                value = scheme + value.strip()
+            config["variables"][secret] = encrypt_secret(value, self.secret_key)
+        url = curl.stored_request(config)["url"]
+        if remove_certificate:
+            config.pop("client_cert", None)
+        if certificate:
+            curl.attach_certificate(config, certificate, url, self.secret_key)
+        elif config.get("client_cert") and not curl.covers(config["client_cert"], url):
+            warnings.append(f"The client certificate is for {config['client_cert']['host']}, which this request "
+                            "doesn't call, so it won't be sent.")
+        if test:
+            try:
+                with self._open("curl", config) as conn:
+                    conn.fetch(curl.REQUEST_NAME)
+            except httpx.HTTPError as exc:
+                raise ValueError(curl.http_problem(exc)) from None
+        else:
+            warnings.append("Saved without checking the connection; the next load will show whether it works.")
+        self.store.save_source(name, "curl", config)
+        return warnings
+
     def load_db_objects(
         self,
         connection: str,

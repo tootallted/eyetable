@@ -555,7 +555,13 @@ class PostmanConnector(Connector):
 
     def _send(self, built: httpx.Request) -> httpx.Response:
         response = self._client.send(built)
-        response.raise_for_status()
+        if response.is_error:
+            # Not raise_for_status(): its message has the whole URL, and a query string
+            # can hold API keys. This message is shown on the page and kept with the run.
+            raise httpx.HTTPStatusError(
+                f"the API answered {response.status_code} {response.reason_phrase} ({built.url.host}{built.url.path})",
+                request=built, response=response,
+            )
         return response
 
     def _follow(self, request: PostmanRequest, built: httpx.Request, url: str) -> httpx.Request:

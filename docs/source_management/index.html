@@ -199,6 +199,12 @@
   .cert-box summary { cursor: pointer; font-size: 13px; font-weight: 600; }
   .cert-box .curl-settings { margin-top: 10px; }
   .req-table td { white-space: normal; overflow-wrap: anywhere; }
+  .ss-text { width: 100%; min-height: 64px; resize: vertical; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--border);
+    background: var(--surface); color: var(--text); font: 12.5px/1.5 var(--mono); }
+  #src-settings input[type=number] { width: 100%; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--border); background: var(--surface); }
+  #src-settings details summary { cursor: pointer; font-size: 13px; font-weight: 600; }
+  #src-settings details > .curl-settings, #src-settings details > label { margin-top: 10px; }
+  #src-settings label.field { align-content: start; }
   .pieces { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; align-items: center; }
   .pieces .hash { white-space: normal; overflow-wrap: anywhere; text-align: left; }
   .set-part { border: 1px solid var(--border); border-radius: 10px; padding: 12px; display: grid; gap: 10px; }
@@ -650,6 +656,16 @@
     </div>
     <div class="card-body" id="detail-body">
       <div class="stats" id="detail-stats"></div>
+      <div id="src-settings" hidden style="display:grid; gap:10px">
+        <h3 style="font-size:14px; margin:0">Connection settings</h3>
+        <div id="ss-body" style="display:grid; gap:12px"></div>
+        <div class="set-actions" id="ss-actions" hidden>
+          <button class="btn primary" type="button" id="ss-save-reload">Save and reload</button>
+          <button class="btn" type="button" id="ss-save">Save changes</button>
+          <label class="check"><input type="checkbox" id="ss-test" checked> Check the connection before saving</label>
+        </div>
+        <div id="ss-msg" role="status"></div>
+      </div>
       <div id="detail-request" hidden style="display:grid; gap:12px">
         <div>
           <h3 style="font-size:14px; margin:0 0 8px">Request</h3>
@@ -1284,6 +1300,165 @@
       });
     }
 
+    // -- a source's connection settings: shown, and changed in place ------------------
+    var ss = { source: null, data: null, dirty: false, files: {} };
+    var KEEP = 'Stored \u2014 leave blank to keep it';
+
+    function loadSettings(src) {
+      var box = $('src-settings');
+      if (ss.source === src.name && ss.dirty) return;  // a page refresh mustn't lose what's being typed
+      if (ss.source !== src.name) { clear($('ss-msg')); box.hidden = true; }
+      var name = src.name;
+      api('/api/sources/' + encodeURIComponent(name) + '/settings').then(function (d) {
+        if (state.selected !== name || (ss.source === name && ss.dirty)) return;
+        ss = { source: name, data: d, dirty: false, files: {} };
+        renderSettings();
+      }, function () { box.hidden = true; });
+    }
+
+    function ssChanged() { ss.dirty = true; }
+
+    function ssInput(type, value, placeholder) {
+      var input = type === 'textarea' ? el('textarea', { class: 'ss-text', spellcheck: 'false' })
+        : el('input', { type: type, autocomplete: type === 'password' ? 'new-password' : 'off', spellcheck: 'false' });
+      input.value = value || '';
+      if (placeholder) input.placeholder = placeholder;
+      input.addEventListener('input', ssChanged);
+      return input;
+    }
+
+    function ssFile(name, accept) {
+      var input = el('input', { type: 'file', accept: accept });
+      input.addEventListener('change', function () {
+        ssChanged();
+        delete ss.files[name];
+        var file = input.files[0];
+        if (!file) return;
+        file.arrayBuffer().then(function (buffer) {
+          var binary = '';
+          new Uint8Array(buffer).forEach(function (b) { binary += String.fromCharCode(b); });
+          ss.files[name] = btoa(binary);
+        });
+      });
+      return input;
+    }
+
+    function renderSettings() {
+      var d = ss.data, body = clear($('ss-body'));
+      ss.inputs = {};
+      var editable = d.type === 'dbtable' || d.type === 'curl';
+      $('src-settings').hidden = ['dbtable', 'curl', 'gsheet', 'file'].indexOf(d.type) < 0;
+      $('ss-actions').hidden = !editable;
+      $('ss-test').checked = true;
+      var i = ss.inputs;
+      if (d.type === 'dbtable') {
+        i.connection = ssInput('textarea', d.connection);
+        i.password = ssInput('password', '', d.has_password ? KEEP : 'None stored');
+        i.schema = ssInput('text', d.schema);
+        i.table = ssInput('text', d.table);
+        body.appendChild(setField('Connection string', i.connection,
+          'Change the server, database or user here. The password is never shown: leave it out to keep the stored one.'));
+        body.appendChild(el('div', { class: 'curl-settings' }, [
+          setField('Password', i.password), setField('Schema', i.schema), setField((d.kind === 'view' ? 'View' : 'Table'), i.table)
+        ]));
+      } else if (d.type === 'curl') {
+        i.secrets = {};
+        if (d.secrets.length) {
+          body.appendChild(el('div', { class: 'curl-settings' }, d.secrets.map(function (sec) {
+            i.secrets[sec.name] = ssInput('password', '', KEEP);
+            return sec.scheme
+              ? setField('New token for ' + sec.where, i.secrets[sec.name], 'Just the token: \u201c' + sec.scheme + ' \u201d is kept in front of it.')
+              : setField('New value for ' + sec.where, i.secrets[sec.name]);
+          })));
+        } else {
+          body.appendChild(el('p', { class: 'hint', text: 'This request has no stored tokens, keys or passwords.' }));
+        }
+        var c = d.certificate;
+        body.appendChild(el('div', { class: 'hint', text: c
+          ? 'Client certificate: ' + (c.subject || 'unreadable') + ' for ' + c.host + (c.port ? ':' + c.port : '') +
+            (c.expires ? ', ' + (c.expired ? 'expired ' : 'expires ') + fmtTime(c.expires) : '') + (c.has_ca ? ', with a CA certificate' : '') + '.'
+          : 'No client certificate.' }));
+        i.certHost = ssInput('text', '', c ? c.host : 'the request\u2019s host');
+        i.certPort = ssInput('number', '', '443');
+        i.certPass = ssInput('password', '');
+        var certFields = [
+          setField('Host', i.certHost), setField('Port', i.certPort),
+          setField('PFX file', ssFile('pfx', '.pfx,.p12')), setField('CRT file', ssFile('crt', '.crt,.pem,.cer')),
+          setField('KEY file', ssFile('key', '.key,.pem')), setField('Passphrase', i.certPass),
+          setField('CA certificate file', ssFile('ca', '.pem,.crt,.cer'), 'Optional.')
+        ];
+        var certBox = el('details', null, [el('summary', { text: c ? 'Replace the client certificate' : 'Add a client certificate' }),
+          el('div', { class: 'curl-settings' }, certFields)]);
+        if (c) {
+          i.removeCert = el('input', { type: 'checkbox' });
+          i.removeCert.addEventListener('change', ssChanged);
+          certBox.appendChild(el('label', { class: 'check' }, [i.removeCert, ' Remove the client certificate']));
+        }
+        body.appendChild(certBox);
+        i.command = ssInput('textarea', '', "curl 'https://\u2026' -H 'Authorization: Bearer \u2026'");
+        body.appendChild(el('details', null, [el('summary', { text: 'Replace the request with a new curl command' }),
+          setField('curl command', i.command,
+            'The source keeps its name, table, paging, rows field, certificate and set of statements (the set is dropped if it no longer fits).')]));
+      } else if (d.type === 'gsheet') {
+        var link = el('a', { href: d.url, target: '_blank', rel: 'noopener', text: d.file || d.url });
+        body.appendChild(el('dl', { class: 'kv' }, [el('dt', { text: 'Sheet' }), el('dd', null, [link]), el('dt', { text: 'Tab' }), el('dd', { text: d.tab || '' })]));
+        body.appendChild(el('p', { class: 'hint', text: 'Reload reads this tab again. To read a different sheet, load its link under Load data.' }));
+      } else if (d.type === 'file') {
+        body.appendChild(el('p', { class: 'hint', text: 'A file source has no connection: drop a new version of the file under Load data to replace or add to it.' }));
+      }
+    }
+
+    function settingsChanges() {
+      var d = ss.data, i = ss.inputs, out = {};
+      var changed = function (input, was) { var v = input.value.trim(); return v && v !== (was || '') ? v : null; };
+      if (d.type === 'dbtable') {
+        out.connection = changed(i.connection, d.connection);
+        out.password = i.password.value || null;
+        out.schema = changed(i.schema, d.schema);
+        out.table = changed(i.table, d.table);
+      } else {
+        var secrets = {};
+        Object.keys(i.secrets).forEach(function (k) { if (i.secrets[k].value) secrets[k] = i.secrets[k].value; });
+        if (Object.keys(secrets).length) out.secrets = secrets;
+        if (i.command.value.trim()) out.command = i.command.value.trim();
+        if (['pfx', 'crt', 'key', 'ca'].some(function (f) { return ss.files[f]; })) {
+          out.certificate = Object.assign({ host: i.certHost.value.trim() || null, port: parseInt(i.certPort.value, 10) || null,
+                                            passphrase: i.certPass.value || null }, ss.files);
+        }
+        if (i.removeCert && i.removeCert.checked) out.remove_certificate = true;
+      }
+      Object.keys(out).forEach(function (k) { if (out[k] === null) delete out[k]; });
+      return out;
+    }
+
+    function saveSettings(thenReload) {
+      var name = ss.source, msg = clear($('ss-msg'));
+      var changes = settingsChanges();
+      if (!Object.keys(changes).length) { msg.appendChild(banner('warn', 'Nothing has changed yet.')); return; }
+      changes.test = $('ss-test').checked;
+      $('ss-save').disabled = $('ss-save-reload').disabled = true;
+      $('ss-save').textContent = changes.test ? 'Checking\u2026' : 'Saving\u2026';
+      api('/api/sources/' + encodeURIComponent(name) + '/settings', { method: 'PUT', headers: JSON_HEADERS, body: JSON.stringify(changes) })
+        .then(function (d) {
+          ss = { source: name, data: d, dirty: false, files: {} };
+          renderSettings();
+          var m = clear($('ss-msg'));
+          m.appendChild(banner('ok', d.tested ? 'Saved: the connection works with the new settings.' : 'Saved.'));
+          d.warnings.forEach(function (w) { m.appendChild(banner('warn', w)); });
+          return refresh().then(function () {
+            if (!thenReload) return;
+            var s = state.sources.filter(function (x) { return x.name === name; })[0];
+            if (s) { unfold('sources'); reloadSource(s, true); }
+          });
+        }, function (err) {
+          msg.appendChild(banner('err', 'Not saved: ' + err.message));
+        })
+        .then(function () {
+          $('ss-save').disabled = $('ss-save-reload').disabled = false;
+          $('ss-save').textContent = 'Save changes';
+        });
+    }
+
     // -- a curl source's request, and running it as a set of statements --------------
     var setState = { source: null, request: null, parts: [], saved: false, dirty: false, timer: null };
 
@@ -1547,6 +1722,7 @@
         stat('Runs', fmtInt(src.runs.length));
       }
 
+      loadSettings(src);
       renderRequest(src);
       var pv = clear($('detail-preview'));
       if (preview) pv.appendChild(dataTable(preview.columns, preview.rows, { empty: 'The table is empty.' }));
@@ -3095,6 +3271,8 @@
     });
 
     // -- wiring ------------------------------------------------------------
+    $('ss-save').addEventListener('click', function () { saveSettings(false); });
+    $('ss-save-reload').addEventListener('click', function () { saveSettings(true); });
     $('q-find').value = query.filter.text;
     $('q-find').addEventListener('input', function () { query.filter.text = $('q-find').value; saveTableFilter(); filterTables(); });
     $('q-find').addEventListener('keydown', function (e) { if (e.key === 'Escape' && $('q-find').value) { e.preventDefault(); $('q-find').value = ''; $('q-find').dispatchEvent(new Event('input')); } });

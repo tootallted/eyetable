@@ -34,14 +34,15 @@ from eyetable.gsheets import SheetError, fetch_workbook, fetch_workbook_signed_i
 from eyetable.identifiers import SOURCE_NAME, normalize_tag, table_name
 from eyetable.query import MAX_LIMIT, QueryError, QueryRunner
 from eyetable import dbconnect
-from eyetable.curl import clean_statements, components, parse_curl, preview_statements
+from eyetable.curl import auth_scheme, clean_statements, components, parse_curl, preview_statements, secret_places
 from eyetable.curl import plan as curl_plan
 from eyetable.google_auth import GoogleAuthError, GoogleConnection
 from eyetable.groups import GroupRunner
 from eyetable.ratelimit import SlidingWindow, client_ip
 from eyetable.schedule import ScheduleError, describe, next_runs, normalize
 from eyetable.statements import count as statement_count
-from eyetable.tls import client_cert
+from eyetable.credentials import decrypt_secrets
+from eyetable.tls import client_cert, describe as describe_certificate
 from eyetable.store import GroupNotFound
 from eyetable.store import SourceNotFound
 
@@ -105,6 +106,20 @@ class CertificateIn(BaseModel):
 
         return client_cert(file(self.pfx), file(self.crt), file(self.key), file(self.ca),
                            self.passphrase, self.host, self.port)
+
+
+class SettingsIn(BaseModel):
+    """Changes to a source's connection; what's left out stays as it is."""
+    model_config = {"populate_by_name": True}
+    connection: str | None = Field(default=None, max_length=8000)  # database: a new connection string
+    password: str | None = Field(default=None, max_length=1000)  # database: a new password
+    schema_: str | None = Field(default=None, alias="schema", max_length=256)
+    table: str | None = Field(default=None, max_length=256)
+    command: str | None = Field(default=None, max_length=100_000)  # curl: a whole new command
+    secrets: dict[str, str] | None = None  # curl: secret_N -> new value
+    certificate: CertificateIn | None = None  # curl: a new client certificate
+    remove_certificate: bool = False
+    test: bool = True  # check the connection before saving
 
 
 class CurlIn(BaseModel):
@@ -343,6 +358,57 @@ def create_app(
             "runs": store.list_runs(name, limit=25),
             **({"request": components(src.config), "statements": src.config.get("statements")} if src.type == "curl" else {}),
         })
+
+    def settings_of(src) -> dict[str, Any]:
+        """A source's connection settings for the page, secrets left out."""
+        c = src.config
+        out: dict[str, Any] = {"type": src.type}
+        if src.type == "dbtable":
+            out.update(format="odbc" if "odbc" in c else "url", connection=c.get("odbc") or c.get("url"),
+                       has_password=bool(c.get("password")), schema=c.get("schema"), table=c.get("table"),
+                       kind=c.get("kind"), label=c.get("label"))
+        elif src.type == "curl":
+            cert = c.get("client_cert")
+            identity = None
+            if cert:
+                try:
+                    identity = describe_certificate(decrypt_secrets(cert["pem"], engine.secret_key))
+                except ValueError:
+                    identity = {}
+                identity.update(host=cert.get("host"), port=cert.get("port"), has_ca=bool(cert.get("ca")))
+            secrets = secret_places(c)
+            for secret in secrets:  # say when a "Bearer " goes in front, so just the token can be pasted
+                try:
+                    scheme = auth_scheme(decrypt_secrets(c["variables"][secret["name"]], engine.secret_key))
+                except ValueError:
+                    scheme = None
+                secret["scheme"] = scheme.strip() if scheme else None
+            out.update(secrets=secrets, certificate=identity, request=components(c))
+        elif src.type == "gsheet":
+            out.update(url=c.get("url"), tab=c.get("tab_title"), file=c.get("file_title"))
+        return out
+
+    @app.get("/api/sources/{name}/settings", dependencies=auth)
+    def source_settings(name: str) -> dict[str, Any]:
+        """How a source connects, with passwords, tokens and keys left out."""
+        return jsonable_encoder(settings_of(get_source(name)))
+
+    @app.put("/api/sources/{name}/settings", dependencies=auth)
+    def change_settings(name: str, body: SettingsIn) -> dict[str, Any]:
+        """Change how a source connects. With test (the default), nothing is saved unless it works."""
+        src = get_source(name)
+        try:
+            if src.type == "dbtable":
+                warnings = engine.update_db_source(name, body.connection, body.password, body.schema_, body.table, body.test)
+            elif src.type == "curl":
+                certificate = body.certificate.read() if body.certificate else None
+                warnings = engine.update_curl_source(name, body.command, body.secrets, certificate,
+                                                     body.remove_certificate, body.test)
+            else:
+                raise HTTPException(400, f"a {src.type} source's settings can't be changed here")
+        except ValueError as exc:
+            raise HTTPException(400, str(exc).strip("'\"")) from None
+        return jsonable_encoder({**settings_of(store.get_source(name)), "warnings": warnings, "tested": body.test})
 
     def curl_source(name: str):
         src = get_source(name)

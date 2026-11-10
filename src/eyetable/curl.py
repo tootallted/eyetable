@@ -554,16 +554,30 @@ def prepare(text: str, secret_key: str | None, certificate: dict[str, Any] | Non
     if req.method != "GET":
         config["allow_methods"] = [req.method]
     if certificate:
-        certificate["host"] = certificate["host"] or urllib.parse.urlsplit(req.url).hostname
-        if not covers(certificate, req.url):
-            where = certificate["host"] + (f":{certificate['port']}" if certificate["port"] else "")
-            raise CurlError(f"the certificate is set for {where}, but the command calls {urllib.parse.urlsplit(req.url).netloc}")
-        config["client_cert"] = {
-            **certificate,
-            "pem": encrypt_secret(certificate["pem"], secret_key),
-            "ca": encrypt_secret(certificate["ca"], secret_key) if certificate["ca"] else None,
-        }
+        attach_certificate(config, certificate, req.url, secret_key)
     return req, config, secrets
+
+
+def attach_certificate(config: dict[str, Any], certificate: dict[str, Any], url: str, secret_key: str | None) -> None:
+    """Store a client certificate (see eyetable.tls) in a config, encrypted. No host means the request's own."""
+    certificate["host"] = certificate["host"] or urllib.parse.urlsplit(url).hostname
+    if not covers(certificate, url):
+        where = certificate["host"] + (f":{certificate['port']}" if certificate["port"] else "")
+        raise CurlError(f"the certificate is set for {where}, but the command calls {urllib.parse.urlsplit(url).netloc}")
+    config["client_cert"] = {
+        **certificate,
+        "pem": encrypt_secret(certificate["pem"], secret_key),
+        "ca": encrypt_secret(certificate["ca"], secret_key) if certificate["ca"] else None,
+    }
+
+
+def http_problem(exc: httpx.HTTPError) -> str:
+    """An HTTP failure as a sentence, without the URL (it can hold secrets)."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f"the API answered {exc.response.status_code} {exc.response.reason_phrase}"
+    if "CERTIFICATE_REQUIRED" in str(exc).upper():
+        return "this API requires a client certificate; add it under Client certificate and check again"
+    return f"couldn't reach the API ({type(exc).__name__}: {exc})"
 
 
 def probe(req: CurlRequest, config: dict[str, Any], secrets: dict[str, str], client: httpx.Client | None = None,
@@ -573,12 +587,8 @@ def probe(req: CurlRequest, config: dict[str, Any], secrets: dict[str, str], cli
     try:
         request = connector.requests[REQUEST_NAME]
         response = connector._send(connector._build(request))
-    except httpx.HTTPStatusError as exc:
-        raise CurlError(f"the API answered {exc.response.status_code} {exc.response.reason_phrase}") from None
     except httpx.HTTPError as exc:
-        if "CERTIFICATE_REQUIRED" in str(exc).upper():
-            raise CurlError("this API requires a client certificate; add it under Client certificate and check again") from None
-        raise CurlError(f"couldn't reach the API ({type(exc).__name__}: {exc})") from None
+        raise CurlError(http_problem(exc)) from None
     finally:
         if client is None:
             connector.close()
@@ -676,3 +686,33 @@ def preview_statements(config: dict[str, Any], plan: dict[str, Any], limit: int 
     if sets_paging(plan, (config.get("pagination") or {}).get(REQUEST_NAME)):
         notes.append("Automatic paging is off for this source while the set changes its paging parameter.")
     return {"count": total, "first": seen, "last": last if total > limit else None, "notes": notes}
+
+
+_SCHEME = re.compile(r"(bearer|basic|token|bot|apikey|api-key)\s+", re.I)
+
+
+def auth_scheme(value: str | None) -> str | None:
+    """The "Bearer " (or Basic, Token...) in front of a header's credential, if any."""
+    match = _SCHEME.match(value or "")
+    return match.group(0) if match else None
+
+
+def secret_places(config: dict[str, Any]) -> list[dict[str, str]]:
+    """Each stored secret of a curl source, and where in the request it goes."""
+    request = stored_request(config)
+    places: dict[str, str] = {}
+
+    def note(text: str, where: str) -> None:
+        for name in re.findall(r"\{\{(secret_\d+)\}\}", text or ""):
+            places.setdefault(name, where)
+
+    _, query = _split_query(request["url"])
+    for key, value in query:
+        note(value, f"the {key} query parameter")
+    for header in request["header"]:
+        note(header["value"], f"the {header['key']} header")
+    note((request.get("body") or {}).get("raw"), "the request body")
+    for item in (request.get("auth") or {}).get("basic") or []:
+        note(item.get("value"), "the -u password")
+    return [{"name": name, "where": places.get(name, "the request")}
+            for name in sorted(config.get("variables") or {}, key=lambda n: int(n.split("_")[1]))]
