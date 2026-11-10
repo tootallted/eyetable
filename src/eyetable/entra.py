@@ -42,9 +42,37 @@ class EntraSignInNeeded(ValueError):
 def scope_for(server: str) -> str:
     """What a token must be for: the Dataverse environment itself, or Azure SQL (also Fabric and Synapse)."""
     host = re.sub(r"^tcp:", "", server.strip().lower()).split(",")[0].split("\\")[0].split(":")[0]
-    if re.search(r"\.crm\d*\.dynamics\.com$", host):
+    if is_dataverse(host):
         return f"https://{host}/.default"
     return "https://database.windows.net/.default"
+
+
+def is_dataverse(server: str) -> bool:
+    host = re.sub(r"^tcp:", "", server.strip().lower()).split(",")[0].split("\\")[0].split(":")[0]
+    return bool(re.search(r"\.crm\d*\.dynamics\.com$", host))
+
+
+def connect_with_retry(dbapi: Any, cargs: list, cparams: dict, attempts: int = 3):
+    """Connect and check the connection with a first query, trying again when the link drops.
+
+    Dataverse drops the first connection a process makes at its first query
+    ("Communication link failure", SQLSTATE 08S01); the next one works.
+    """
+    for attempt in range(1, attempts + 1):
+        conn = None
+        try:
+            conn = dbapi.connect(*cargs, **cparams)
+            conn.cursor().execute("SELECT 1").fetchall()
+            return conn
+        except dbapi.Error as exc:
+            if conn is not None:
+                try:
+                    conn.close()
+                except dbapi.Error:
+                    pass
+            state = str(exc.args[0]) if exc.args else ""
+            if attempt == attempts or state != "08S01":
+                raise
 
 
 def authority_for(username: str | None) -> str:

@@ -207,6 +207,9 @@ def prepare(text: str, secret_key: str | None) -> Prepared:
             # Microsoft Entra with MFA: eyetable signs in and hands the driver a token (see entra.py)
             user = _get(pairs, "uid", "user id", "user")
             kept = [(k, v) for k, v in kept if k.lower() not in ("authentication", "uid", "user id", "user")]
+            # Dataverse turns the server name into an address and can't read "tcp:" in it
+            kept = [(k, re.sub(r"^tcp:", "", v, flags=re.I) if k.lower() in ("server", "address", "addr", "data source")
+                     and entra.is_dataverse(v) else v) for k, v in kept]
             extra = {**extra, "entra": entra.sign_in_request(user, _get(pairs, "server", "address", "addr", "data source") or "")}
             password = None
         config = {"odbc": build_odbc(kept), **extra}
@@ -244,6 +247,7 @@ def make_engine(config: dict[str, Any], password: str | None = None, login_timeo
             @sa.event.listens_for(engine, "do_connect")
             def _with_token(dialect, record, cargs, cparams):  # a fresh token for every new connection
                 cparams["attrs_before"] = {entra.SQL_COPT_SS_ACCESS_TOKEN: entra.token_struct(tokens.token(**sign_in))}
+                return entra.connect_with_retry(dialect.loaded_dbapi, cargs, cparams)
         return engine, warnings
     url = make_url(config["url"])
     if password:
@@ -277,12 +281,35 @@ def friendly(exc: Exception) -> str:
     lowered = text.lower()
     if "client with ip address" in lowered and "not allowed" in lowered:
         text += ". Add this IP to the server's firewall rules (in Azure: the SQL server's Networking page)."
-    elif "login failed" in lowered:
-        text += ". Check the user name (Uid) and password (Pwd)."
+    elif "login failed" in lowered and "invalid uri" not in lowered:
+        text += ". Check the user name (Uid) and password (Pwd), or which account signed in with Microsoft."
     elif "not found or not accessible" in lowered or "timed out" in lowered or "could not translate host" in lowered:
         text += (". Check the server name and port, that the server accepts remote (TCP) connections, "
                  "and that no firewall blocks this PC.")
     return text[:600]
+
+
+_MSSQL_OBJECTS = """
+    SELECT s.name, o.name, CASE o.type WHEN 'V' THEN 'view' ELSE 'table' END, {rows}
+    FROM sys.objects o JOIN sys.schemas s ON s.schema_id = o.schema_id
+    WHERE o.type IN ('U', 'V') AND o.is_ms_shipped = 0
+    ORDER BY s.name, o.name
+"""
+_MSSQL_ROWS = "(SELECT SUM(p.rows) FROM sys.partitions p WHERE p.object_id = o.object_id AND p.index_id IN (0, 1))"
+
+
+def _mssql_objects(engine: sa.Engine) -> list[tuple]:
+    """SQL Server's tables and views, with row estimates where sys.partitions exists (Dataverse has none)."""
+    try:
+        with engine.connect() as conn:
+            return conn.execute(sa.text(_MSSQL_OBJECTS.format(rows=_MSSQL_ROWS))).all()
+    except entra.EntraSignInNeeded:
+        raise
+    except sa.exc.DBAPIError as exc:
+        if "partitions" not in str(exc):
+            raise
+    with engine.connect() as conn:  # a fresh connection: the failed one may have been closed
+        return conn.execute(sa.text(_MSSQL_OBJECTS.format(rows="NULL"))).all()
 
 
 def list_objects(engine: sa.Engine) -> list[dict[str, Any]]:
@@ -290,32 +317,27 @@ def list_objects(engine: sa.Engine) -> list[dict[str, Any]]:
     from eyetable.connectors.database import is_system_schema
     dialect = engine.dialect.name
     try:
-        with engine.connect() as conn:
-            if dialect == "mssql":
-                rows = conn.execute(sa.text("""
-                    SELECT s.name, o.name, CASE o.type WHEN 'V' THEN 'view' ELSE 'table' END,
-                           (SELECT SUM(p.rows) FROM sys.partitions p WHERE p.object_id = o.object_id AND p.index_id IN (0, 1))
-                    FROM sys.objects o JOIN sys.schemas s ON s.schema_id = o.schema_id
-                    WHERE o.type IN ('U', 'V') AND o.is_ms_shipped = 0
-                    ORDER BY s.name, o.name
-                """)).all()
-            elif dialect == "postgresql":
-                rows = conn.execute(sa.text("""
-                    SELECT n.nspname, c.relname, CASE c.relkind WHEN 'v' THEN 'view' WHEN 'm' THEN 'view' ELSE 'table' END,
-                           CASE WHEN c.relkind IN ('r', 'p') AND c.reltuples >= 0 THEN c.reltuples::bigint END
-                    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-                    WHERE c.relkind IN ('r', 'p', 'v', 'm') AND n.nspname NOT IN ('pg_catalog', 'information_schema')
-                      AND n.nspname NOT LIKE 'pg_toast%' AND n.nspname NOT LIKE 'pg_temp%'
-                    ORDER BY n.nspname, c.relname
-                """)).all()
-            else:
-                insp = sa.inspect(conn)
-                rows = []
-                for schema in insp.get_schema_names():
-                    if is_system_schema(schema):
-                        continue
-                    rows += [(schema, t, "table", None) for t in insp.get_table_names(schema=schema)]
-                    rows += [(schema, v, "view", None) for v in insp.get_view_names(schema=schema)]
+        if dialect == "mssql":
+            rows = _mssql_objects(engine)
+        else:
+            with engine.connect() as conn:
+                if dialect == "postgresql":
+                    rows = conn.execute(sa.text("""
+                        SELECT n.nspname, c.relname, CASE c.relkind WHEN 'v' THEN 'view' WHEN 'm' THEN 'view' ELSE 'table' END,
+                               CASE WHEN c.relkind IN ('r', 'p') AND c.reltuples >= 0 THEN c.reltuples::bigint END
+                        FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                        WHERE c.relkind IN ('r', 'p', 'v', 'm') AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+                          AND n.nspname NOT LIKE 'pg_toast%' AND n.nspname NOT LIKE 'pg_temp%'
+                        ORDER BY n.nspname, c.relname
+                    """)).all()
+                else:
+                    insp = sa.inspect(conn)
+                    rows = []
+                    for schema in insp.get_schema_names():
+                        if is_system_schema(schema):
+                            continue
+                        rows += [(schema, t, "table", None) for t in insp.get_table_names(schema=schema)]
+                        rows += [(schema, v, "view", None) for v in insp.get_view_names(schema=schema)]
     except entra.EntraSignInNeeded:
         raise
     except Exception as exc:

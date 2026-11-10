@@ -56,7 +56,10 @@ class DbTableConnector(DatabaseConnector):
         except EntraSignInNeeded:
             raise
         except Exception as exc:
-            raise ConnectionError_(f"couldn't read {schema}.{table}: {friendly(exc)}") from None
+            # no column catalog to read (Dataverse has no INFORMATION_SCHEMA.COLUMNS): ask the table itself
+            columns = self._columns_from_query(schema, table)
+            if columns is None:
+                raise ConnectionError_(f"couldn't read {schema}.{table}: {friendly(exc)}") from None
         if not columns:
             raise ConnectionError_(f"{schema}.{table} wasn't found (or has no columns visible to this login)")
         rows = self._count(schema, table) if item.get("kind") != "view" else None
@@ -64,12 +67,36 @@ class DbTableConnector(DatabaseConnector):
                            columns=columns, row_count=rows,
                            detail={"schema": schema, "table": table, "label": self.config.get("label")})
 
+    def _columns_from_query(self, schema: str, table: str) -> list[ColumnInfo] | None:
+        """A table's columns from an empty select of it, for databases without a column catalog."""
+        query = sa.select(sa.text("*")).select_from(sa.table(table, schema=schema)).limit(0)
+        try:
+            with self._engine.connect() as conn:
+                description = conn.execute(query).cursor.description
+        except EntraSignInNeeded:
+            raise
+        except sa.exc.SQLAlchemyError:
+            return None
+        return [ColumnInfo(d[0], getattr(d[1], "__name__", str(d[1])), True) for d in description]
+
     def read(self, key: str, batch_size: int = 1000):
         item = self._item(key)
+        schema, table = item["schema"], item["table"]
         try:
-            yield from super().read(f"{item['schema']}.{item['table']}", batch_size)
+            source = sa.Table(table, sa.MetaData(), schema=schema, autoload_with=self._engine)
+            query = sa.select(source)
+        except EntraSignInNeeded:
+            raise
+        except sa.exc.SQLAlchemyError:
+            # can't be described (Dataverse has no column catalog): take the rows as they come
+            query = sa.select(sa.text("*")).select_from(sa.table(table, schema=schema))
+        try:
+            with self._engine.connect() as conn:
+                result = conn.execution_options(stream_results=True, yield_per=batch_size).execute(query)
+                for part in result.mappings().partitions(batch_size):
+                    yield [dict(row) for row in part]
         except sa.exc.SQLAlchemyError as exc:
-            raise ConnectionError_(f"reading {item['schema']}.{item['table']} failed: {friendly(exc)}") from None
+            raise ConnectionError_(f"reading {schema}.{table} failed: {friendly(exc)}") from None
 
     def origin(self, key: str) -> str:
         item = self._item(key)

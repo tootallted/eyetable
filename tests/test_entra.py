@@ -98,18 +98,19 @@ def test_every_connection_gets_a_fresh_token(microsoft, monkeypatch):
     p = dbconnect.prepare(DATAVERSE, KEY)
     engine, _ = dbconnect.make_engine(p.config)
     cparams: dict = {}
+    dialect = type("Dialect", (), {"loaded_dbapi": FakeDbapi([])})()  # stands in for pyodbc
     with pytest.raises(entra.EntraSignInNeeded, match="sign in with Microsoft as ted.clark"):
         for listener in engine.dialect.dispatch.do_connect:
-            listener(engine.dialect, None, [], cparams)
+            listener(dialect, None, [], cparams)
     microsoft.accounts["ted.clark@healthhub.signetic.com"] = {"username": "ted.clark@healthhub.signetic.com"}
     for listener in engine.dialect.dispatch.do_connect:
-        listener(engine.dialect, None, [], cparams)
+        assert listener(dialect, None, [], cparams) is not None
     token = "token-for-ted.clark@healthhub.signetic.com-https://signetic-healthhub-prod.crm.dynamics.com/.default"
     assert cparams["attrs_before"] == {1256: entra.token_struct(token)}
     microsoft.expired = True
     with pytest.raises(entra.EntraSignInNeeded, match="has expired; sign in again .AADSTS700082"):
         for listener in engine.dialect.dispatch.do_connect:
-            listener(engine.dialect, None, [], cparams)
+            listener(dialect, None, [], cparams)
 
 
 def test_signing_in(store, microsoft):
@@ -160,3 +161,83 @@ def test_endpoints(store, microsoft):
     bad = {**detail["entra"], "authority": "https://evil.example.com/x"}
     assert web.post("/api/entra/sign-in", headers=AUTH, json=bad).status_code == 400
     assert web.post("/api/entra/sign-in", json=detail["entra"]).status_code == 401
+
+
+# -- what Dataverse's SQL endpoint needs ---------------------------------------------
+
+def test_dataverse_server_names_lose_tcp(microsoft):
+    pairs = dict(dbconnect.parse_odbc(dbconnect.prepare(DATAVERSE, KEY).config["odbc"]))
+    assert pairs["Server"] == "signetic-healthhub-prod.crm.dynamics.com,5558"
+    azure = DATAVERSE.replace("signetic-healthhub-prod.crm.dynamics.com,5558", "x.database.windows.net,1433")
+    assert dict(dbconnect.parse_odbc(dbconnect.prepare(azure, KEY).config["odbc"]))["Server"] == "tcp:x.database.windows.net,1433"
+    assert entra.is_dataverse("tcp:org.crm4.dynamics.com,5558") and not entra.is_dataverse("x.database.windows.net")
+
+
+class FakeDbapi:
+    """Stands in for pyodbc: each failure is (when, SQLSTATE), when being "connect" or "query"."""
+
+    class Error(Exception):
+        pass
+
+    def __init__(self, failures):
+        self.failures, self.calls, self.closed = list(failures), 0, 0
+
+    def connect(self, *args, **kwargs):
+        self.calls += 1
+        failure = self.failures.pop(0) if self.failures else None
+        if failure and failure[0] == "connect":
+            raise self.Error(failure[1], "[Microsoft][ODBC Driver 17 for SQL Server]Communication link failure")
+        dbapi = self
+
+        class Connection:
+            def cursor(self):
+                return self
+
+            def execute(self, query):
+                if failure and failure[0] == "query":
+                    raise dbapi.Error(failure[1], "[Microsoft][ODBC Driver 17 for SQL Server]Communication link failure")
+                return self
+
+            def fetchall(self):
+                return [(1,)]
+
+            def close(self):
+                dbapi.closed += 1
+
+        return Connection()
+
+
+def test_a_dropped_first_connection_is_tried_again():
+    dbapi = FakeDbapi([("query", "08S01")])  # how Dataverse does it
+    assert entra.connect_with_retry(dbapi, [], {}) is not None and dbapi.calls == 2 and dbapi.closed == 1
+    dbapi = FakeDbapi([("connect", "08S01")])
+    assert entra.connect_with_retry(dbapi, [], {}) is not None and dbapi.calls == 2
+    with pytest.raises(FakeDbapi.Error):
+        entra.connect_with_retry(FakeDbapi([("query", "08S01")] * 3), [], {})
+    other = FakeDbapi([("connect", "28000")])  # a login failure isn't retried
+    with pytest.raises(FakeDbapi.Error):
+        entra.connect_with_retry(other, [], {})
+    assert other.calls == 1
+
+
+def test_tables_without_a_column_catalog(store, tmp_path, monkeypatch):
+    import sqlite3
+
+    import sqlalchemy as sa
+
+    from eyetable.connectors.dbtable import DbTableConnector
+
+    path = tmp_path / "crm.db"
+    conn = sqlite3.connect(path)
+    conn.executescript("CREATE TABLE account (accountid TEXT, name TEXT); INSERT INTO account VALUES ('a1', 'Contoso'), ('a2', 'Fabrikam');")
+    conn.close()
+    source = DbTableConnector({"url": f"sqlite:///{path.as_posix()}", "schema": "main", "table": "account", "kind": "table"})
+
+    def no_catalog(*args, **kwargs):
+        raise sa.exc.ProgrammingError("SELECT ... INFORMATION_SCHEMA.COLUMNS", {}, Exception("Invalid table name COLUMNS"))
+
+    monkeypatch.setattr(sa.engine.reflection.Inspector, "get_columns", no_catalog)
+    [dataset] = source.discover()
+    assert [c.name for c in dataset.columns] == ["accountid", "name"] and dataset.row_count == 2
+    assert [r for batch in source.read("data") for r in batch] == [
+        {"accountid": "a1", "name": "Contoso"}, {"accountid": "a2", "name": "Fabrikam"}]
