@@ -325,3 +325,43 @@ def source_config(prepared: Prepared, schema: str, table: str, kind: str) -> dic
 
 def shorten_label(label: str) -> str:
     return shorten(label, 120)
+
+
+# -- the tables of a database source -----------------------------------------------------
+
+def db_tables(config: dict[str, Any]) -> list[dict[str, Any]]:
+    """The tables and views a database source loads: [{key, schema, table, kind, name}].
+
+    `key` names its dataset (runs and the catalog), `name` its table in core
+    storage (<source>__<name>). A source made with one table has key and name
+    "data", so its table and its queries by source name stay as they were.
+    """
+    if config.get("tables"):
+        return config["tables"]
+    return [{"key": DATASET_KEY, "schema": config["schema"], "table": config["table"],
+             "kind": config.get("kind", "table"), "name": DATASET_KEY}]
+
+
+def choose_tables(current: list[dict[str, Any]], chosen: list[dict[str, str]]) -> list[dict[str, Any]]:
+    """The new list of tables: chosen ones already there are kept as they were; new ones get a key and a name."""
+    by_object = {(i["schema"], i["table"]): i for i in current}
+    out: list[dict[str, Any]] = []
+    for c in chosen:
+        item = by_object.get((c["schema"], c["name"]))
+        if item and item not in out:
+            out.append(item)
+    names = {i["name"] for i in out} | {DATASET_KEY}
+    for c in chosen:
+        if (c["schema"], c["name"]) in by_object:
+            continue
+        name = sanitize(c["name"])
+        if name in names:
+            name = sanitize(f"{c['schema']}_{c['name']}")
+        base, n = name, 2
+        while name in names:
+            name, n = f"{base}_{n}", n + 1
+        names.add(name)
+        out.append({"key": f"{c['schema']}.{c['name']}", "schema": c["schema"], "table": c["name"],
+                    "kind": c.get("kind") or "table", "name": name})
+        by_object[(c["schema"], c["name"])] = out[-1]
+    return out

@@ -254,6 +254,13 @@
   .db-tools input[type=search] { flex: 1 1 180px; width: auto; }
   .db-tools select { width: auto; }
   .db-list { max-height: 380px; overflow: auto; }
+  .sources-table tr.sub td { background: var(--surface-2); font-size: 12.5px; padding-top: 5px; padding-bottom: 5px; }
+  .sources-table .sub-name { display: inline-block; padding-left: 18px; font-family: var(--mono); }
+  .tbl-count { display: inline-flex; align-items: center; gap: 6px; }
+  .tbl-count .caret { display: inline-block; transition: transform .12s; color: var(--muted); }
+  .tbl-count[aria-expanded=true] .caret { transform: rotate(90deg); }
+  .preview-pick { display: flex; gap: 8px; align-items: center; font-size: 13px; margin-bottom: 8px; }
+  .preview-pick select { width: auto; max-width: 100%; }
   .db-list td { vertical-align: middle; }
   .db-list input[type=text] { padding: 3px 6px; font-size: 12.5px; font-family: var(--mono); min-width: 180px; }
   .db-list input[type=text].bad { border-color: var(--err); }
@@ -310,10 +317,12 @@
     .sources-table tbody tr:last-child { border-bottom: 0; }
     .sources-table td, .sources-table td.num {
       display: grid; grid-template-columns: 88px minmax(0, 1fr); gap: 8px; align-items: start;
-      padding: 2px 0; border: 0; text-align: left; white-space: normal; background: none;
+      padding: 2px 0; border: 0; text-align: left; white-space: normal;
     }
     .sources-table td::before { content: attr(data-label); color: var(--muted); }
     .sources-table td > * { justify-self: start; }
+    .sources-table tr.sub { margin-left: 14px; border-left: 3px solid var(--border); }
+    .sources-table .sub-name { padding-left: 0; }
   }
   .tag { display: inline-block; padding: 1px 8px; border-radius: 999px; background: var(--surface-2); border: 1px solid var(--border); font-size: 12px; color: var(--muted); }
   .empty { padding: 28px 16px; text-align: center; color: var(--muted); }
@@ -666,6 +675,21 @@
         </div>
         <div id="ss-msg" role="status"></div>
       </div>
+      <div id="db-tables" hidden style="display:grid; gap:10px">
+        <h3 style="font-size:14px; margin:0">Tables and views</h3>
+        <p class="hint" id="dbt-summary" style="margin:0"></p>
+        <div><button class="btn" type="button" id="dbt-open">Choose tables and views&hellip;</button></div>
+        <div id="dbt-picker" hidden style="display:grid; gap:8px">
+          <input type="text" id="dbt-find" placeholder="Find a table or view" autocomplete="off" spellcheck="false" aria-label="Find a table or view">
+          <div class="row-inline" style="font-size:13px"><span id="dbt-count"></span></div>
+          <div class="table-wrap db-list" id="dbt-list"></div>
+          <div class="set-actions">
+            <button class="btn primary" type="button" id="dbt-save">Save and load</button>
+            <button class="btn" type="button" id="dbt-cancel">Cancel</button>
+          </div>
+        </div>
+        <div id="dbt-msg" role="status"></div>
+      </div>
       <div id="detail-request" hidden style="display:grid; gap:12px">
         <div>
           <h3 style="font-size:14px; margin:0 0 8px">Request</h3>
@@ -694,6 +718,7 @@
       </div>
       <div>
         <h3 style="font-size:14px; margin:0 0 8px">First rows</h3>
+        <div class="preview-pick" id="detail-preview-pick" hidden></div>
         <div class="table-wrap" id="detail-preview"></div>
       </div>
       <div>
@@ -825,7 +850,7 @@
     var ET_COLUMNS = ['ET_id', 'ET_timestamp', 'ET_source', 'ET_run_id'];
     var KEY_BASE = 'eyetable.apiBase', KEY_TOKEN = 'eyetable.apiToken';
 
-    var state = { base: '', token: '', connected: false, sources: [], file: null, dest: 'new', selected: null };
+    var state = { base: '', token: '', connected: false, sources: [], file: null, dest: 'new', selected: null, expanded: {} };
     var $ = function (id) { return document.getElementById(id); };
 
     // -- storage (each access guarded: private windows and blocked storage throw) --
@@ -1264,23 +1289,62 @@
       var shown = state.tagFilter
         ? state.sources.filter(function (s) { return (s.tags || []).indexOf(state.tagFilter) >= 0; })
         : state.sources;
-      var rows = shown.map(function (s) {
+      var rows = [];
+      shown.forEach(function (s) {
+        var several = s.tables && s.tables.length > 1;
+        var open = several && !!state.expanded[s.name];
         var tr = el('tr', { class: 'clickable' + (s.name === state.selected ? ' selected' : ''), tabindex: '0' }, [
           el('td', { class: 'wrap', 'data-label': 'Source' }, [el('strong', { text: s.name })]),
           el('td', { 'data-label': 'Tags' }, [tagsCell(s)]),
           el('td', { 'data-label': 'Type' }, [el('span', { class: 'tag', text: typeLabel(s.type) })]),
-          el('td', { class: 'mono wrap', 'data-label': 'Table', text: s.table ? 'eyetable_raw.' + s.table : s.datasets + ' dataset(s)' }),
+          s.tables ? tablesCell(s, open) : el('td', { class: 'mono wrap', 'data-label': 'Table', text: s.table ? 'eyetable_raw.' + s.table : s.datasets + ' dataset(s)' }),
           el('td', { class: 'num', 'data-label': 'Rows', text: s.table ? fmtInt(s.rows) : '—' }),
           el('td', { class: 'wrap', 'data-label': 'Last file', text: s.last_upload ? s.last_upload.filename : '—' }),
           el('td', { 'data-label': 'Last loaded', text: fmtTime(s.last_loaded_at || s.updated_at), title: s.last_loaded_at ? 'Last time data finished loading' : 'Not loaded yet' }),
           el('td', null, [reloadButton(s)])
         ]);
-        var pick = function () { unfold('detail'); selectSource(s.name); };
+        // a source with several tables opens to a row per table
+        var pick = function () {
+          if (several) state.expanded[s.name] = !state.expanded[s.name];
+          unfold('detail');
+          selectSource(s.name);
+        };
         tr.addEventListener('click', pick);
         tr.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); pick(); } });
-        return tr;
+        rows.push(tr);
+        if (open) s.tables.forEach(function (t) { rows.push(tableRow(t)); });
       });
       wrap.appendChild(el('table', { class: 'sources-table' }, [el('thead', null, [head]), el('tbody', null, rows)]));
+    }
+
+    // Up to three tables are named; more are counted, and the row opens to list them.
+    function tablesCell(s, open) {
+      var names = s.tables.map(function (t) { return t.name; });
+      var full = s.tables.map(function (t) { return 'eyetable_raw.' + t.table; }).join('\n');
+      if (s.tables.length <= 3) {
+        var text = names.join(', ');
+        if (s.tables.length === 1) text = 'eyetable_raw.' + s.tables[0].table;
+        var shown = el('span', { text: text });
+        if (s.tables.length > 1) shown.appendChild(el('span', { class: 'muted', text: open ? ' \u25be' : ' \u25b8' }));
+        return el('td', { class: 'mono wrap', 'data-label': 'Table', title: full }, [shown]);
+      }
+      return el('td', { 'data-label': 'Table', title: full }, [
+        el('span', { class: 'tbl-count', 'aria-expanded': String(open) }, [el('span', { class: 'caret', text: '\u25b8' }),
+          el('span', { text: plural(s.tables.length, 'table') + (open ? '' : ' \u2014 click to list them') })])
+      ]);
+    }
+
+    function tableRow(t) {
+      return el('tr', { class: 'sub' }, [
+        el('td', { class: 'wrap', 'data-label': 'Table' }, [el('span', { class: 'sub-name', text: t.schema + '.' + t.name })]),
+        el('td', { 'data-label': '' }),
+        el('td', { 'data-label': 'Type' }, [el('span', { class: 'tag', text: t.kind })]),
+        el('td', { class: 'mono wrap', 'data-label': 'Loaded into', text: 'eyetable_raw.' + t.table }),
+        el('td', { class: 'num', 'data-label': 'Rows', text: t.rows === null || t.rows === undefined ? '\u2014' : fmtInt(t.rows) }),
+        el('td', { 'data-label': 'Columns', text: t.columns ? plural(t.columns, 'column') : '' }),
+        el('td', { 'data-label': 'Last loaded', text: t.last_loaded_at ? fmtTime(t.last_loaded_at) : 'Not loaded yet' }),
+        el('td')
+      ]);
     }
 
     function selectSource(name) {
@@ -1298,6 +1362,109 @@
         $('detail').hidden = false;
         clear($('detail-preview')).appendChild(banner('err', err.message));
       });
+    }
+
+    // -- a database source's tables and views: choosing which to load --------------
+    var dbt = { source: null, objects: null, chosen: {}, open: false };
+
+    function dbtKey(o) { return o.schema + '.' + o.name; }
+    function tablesAndViews(n) { return n === 1 ? '1 table or view' : fmtInt(n) + ' tables and views'; }
+
+    function renderDbTables(src) {
+      $('db-tables').hidden = src.type !== 'dbtable';
+      if (src.type !== 'dbtable') { dbt.source = null; return; }
+      if (dbt.source !== src.name) { dbt = { source: src.name, objects: null, chosen: {}, open: false }; clear($('dbt-msg')); }
+      dbt.tables = src.tables || [];
+      var names = dbt.tables.map(function (t) { return t.schema + '.' + t.name; });
+      $('dbt-summary').textContent = 'This source loads ' + tablesAndViews(dbt.tables.length) +
+        (names.length <= 6 ? ': ' + names.join(', ') + '.' : '.') + ' Reload, and any group it is in, loads them all.';
+      $('dbt-picker').hidden = !dbt.open;
+      $('dbt-open').hidden = dbt.open;
+      if (dbt.open && dbt.objects) renderDbtList();
+    }
+
+    function openDbTables() {
+      var name = dbt.source, msg = clear($('dbt-msg'));
+      $('dbt-open').disabled = true;
+      $('dbt-open').textContent = 'Connecting\u2026';
+      api('/api/sources/' + encodeURIComponent(name) + '/objects').then(function (r) {
+        if (dbt.source !== name) return;
+        dbt.objects = r.objects;
+        dbt.chosen = {};
+        r.objects.forEach(function (o) { if (o.chosen) dbt.chosen[dbtKey(o)] = o; });
+        dbt.open = true;
+        $('dbt-find').value = '';
+        $('dbt-picker').hidden = false;
+        $('dbt-open').hidden = true;
+        renderDbtList();
+      }, function (err) { msg.appendChild(banner('err', 'Couldn\u2019t list the tables: ' + err.message)); })
+        .then(function () { $('dbt-open').disabled = false; $('dbt-open').innerHTML = 'Choose tables and views&hellip;'; });
+    }
+
+    function renderDbtList() {
+      var q = $('dbt-find').value.trim().toLowerCase();
+      var shown = dbt.objects.filter(function (o) { return !q || dbtKey(o).toLowerCase().indexOf(q) >= 0; });
+      var visible = shown.slice(0, DB_SHOW_MAX);
+      var count = Object.keys(dbt.chosen).length;
+      $('dbt-count').textContent = fmtInt(count) + ' chosen of ' + tablesAndViews(dbt.objects.length) +
+        (shown.length > visible.length ? '; showing the first ' + fmtInt(visible.length) + ' that match' : '');
+      var wrap = clear($('dbt-list'));
+      if (!shown.length) { wrap.appendChild(el('div', { class: 'empty', text: 'Nothing matches.' })); return; }
+      var head = el('tr', null, [el('th'), el('th', { text: 'Schema' }), el('th', { text: 'Name' }), el('th', { text: 'Type' }),
+        el('th', { class: 'num', text: 'Rows (est.)' }), el('th', { text: '' })]);
+      var loaded = {};
+      dbt.tables.forEach(function (t) { loaded[t.schema + '.' + t.name] = t; });
+      wrap.appendChild(el('table', null, [el('thead', null, [head]), el('tbody', null, visible.map(function (o) {
+        var key = dbtKey(o);
+        var box = el('input', { type: 'checkbox', 'aria-label': 'Load ' + key });
+        box.checked = !!dbt.chosen[key];
+        box.addEventListener('change', function () {
+          if (box.checked) dbt.chosen[key] = o; else delete dbt.chosen[key];
+          renderDbtList();
+        });
+        var note = loaded[key] ? (box.checked ? 'loaded' : 'will be removed') : (box.checked ? 'will be loaded' : '');
+        return el('tr', { class: box.checked ? 'picked' : '' }, [el('td', null, [box]), el('td', { class: 'mono', text: o.schema }),
+          el('td', { class: 'mono', text: o.name }), el('td', { text: o.kind }),
+          el('td', { class: 'num', text: o.rows === null || o.rows === undefined ? '\u2014' : fmtInt(o.rows) }),
+          el('td', { class: 'muted', text: note })]);
+      }))]));
+    }
+
+    function saveDbTables() {
+      var name = dbt.source, msg = clear($('dbt-msg'));
+      var chosen = Object.keys(dbt.chosen).map(function (k) { return dbt.chosen[k]; });
+      if (!chosen.length) { msg.appendChild(banner('warn', 'Choose at least one table or view.')); return; }
+      // the source's current tables first, in their order, then the new ones
+      var order = {};
+      dbt.tables.forEach(function (t, i) { order[t.schema + '.' + t.name] = i; });
+      chosen.sort(function (a, b) {
+        var x = order[dbtKey(a)], y = order[dbtKey(b)];
+        return (x === undefined ? 1e9 : x) - (y === undefined ? 1e9 : y);
+      });
+      var removed = dbt.tables.filter(function (t) { return !dbt.chosen[t.schema + '.' + t.name]; });
+      if (removed.length && !confirm('Remove ' + plural(removed.length, 'table') + ' from ' + name + '? Their loaded copies are deleted: ' +
+          removed.map(function (t) { return 'eyetable_raw.' + t.table; }).join(', ') + '. The tables in the database itself aren\u2019t touched.')) return;
+      $('dbt-save').disabled = true;
+      $('dbt-save').textContent = 'Loading\u2026';
+      api('/api/sources/' + encodeURIComponent(name) + '/tables', { method: 'PUT', headers: JSON_HEADERS,
+        body: JSON.stringify({ tables: chosen.map(function (o) { return { schema: o.schema, name: o.name, kind: o.kind }; }) }) })
+        .then(function (r) { return pollJob(r.job_id, function (job) {
+          $('dbt-save').textContent = 'Loading\u2026 (' + Math.round((Date.now() - Date.parse(job.started_at)) / 1000) + ' s)';
+        }); })
+        .then(function (job) {
+          if (job.status !== 'succeeded') throw new Error(job.error || 'the change failed');
+          var r = job.result, parts = [];
+          if (r.added.length) parts.push(plural(r.added.length, 'table') + ' added (' + plural(r.rows, 'row') + ' loaded)');
+          if (r.removed.length) parts.push(plural(r.removed.length, 'table') + ' removed');
+          var m = clear($('dbt-msg'));
+          m.appendChild(banner(r.failed.length ? 'warn' : 'ok', (parts.join(', ') || 'Nothing changed') + '.' +
+            (r.failed.length ? ' Not loaded: ' + r.failed.map(function (f) { return f.key + ' (' + f.error + ')'; }).join('; ') : '')));
+          dbt.open = false;
+          state.expanded[name] = true;
+          return refresh();
+        })
+        .catch(function (err) { clear($('dbt-msg')).appendChild(banner('err', 'Not changed: ' + err.message)); })
+        .then(function () { $('dbt-save').disabled = false; $('dbt-save').textContent = 'Save and load'; });
     }
 
     // -- a source's connection settings: shown, and changed in place ------------------
@@ -1358,7 +1525,7 @@
         i.table = ssInput('text', d.table);
         body.appendChild(setField('Connection string', i.connection,
           'Change the server, database or user here. The password is never shown: leave it out to keep the stored one.'));
-        body.appendChild(el('div', { class: 'curl-settings' }, [
+        body.appendChild(el('div', { class: 'curl-settings' }, d.tables > 1 ? [setField('Password', i.password)] : [
           setField('Password', i.password), setField('Schema', i.schema), setField((d.kind === 'view' ? 'View' : 'Table'), i.table)
         ]));
       } else if (d.type === 'curl') {
@@ -1713,9 +1880,10 @@
       var stat = function (k, v, mono) { stats.appendChild(el('div', { class: 'stat' }, [el('div', { class: 'k', text: k }), el('div', { class: 'v' + (mono ? ' mono' : ''), text: v })])); };
       if (src.table) {
         stat('Rows', fmtInt(src.rows));
-        stat('Columns', fmtInt(src.columns));
-        stat(src.type === 'gsheet' ? 'Times loaded' : 'Files loaded', fmtInt(src.uploads.length));
-        stat('Table', 'eyetable_raw.' + src.table, true);
+        if (!(src.tables && src.tables.length > 1)) stat('Columns', fmtInt(src.columns));
+        if (src.type !== 'dbtable') stat(src.type === 'gsheet' ? 'Times loaded' : 'Files loaded', fmtInt(src.uploads.length));
+        if (src.tables && src.tables.length > 1) stat('Tables', fmtInt(src.tables.length));
+        else stat('Table', 'eyetable_raw.' + src.table, true);
         if (src.statement_count !== undefined) stat('Statements', fmtInt(src.statement_count));
       } else {
         stat('Datasets', fmtInt(src.datasets));
@@ -1723,8 +1891,23 @@
       }
 
       loadSettings(src);
+      renderDbTables(src);
       renderRequest(src);
       var pv = clear($('detail-preview'));
+      var pickBox = clear($('detail-preview-pick'));
+      pickBox.hidden = !(src.tables && src.tables.length > 1);
+      if (!pickBox.hidden) {
+        var which = el('select', { 'aria-label': 'Table to preview' }, src.tables.map(function (t) {
+          return el('option', { value: t.table, text: t.schema + '.' + t.name });
+        }));
+        which.addEventListener('change', function () {
+          api('/api/sources/' + encodeURIComponent(src.name) + '/preview?limit=20&table=' + encodeURIComponent(which.value)).then(function (p) {
+            clear($('detail-preview')).appendChild(dataTable(p.columns, p.rows, { empty: 'The table is empty.' }));
+          }, function (err) { clear($('detail-preview')).appendChild(banner('err', err.message)); });
+        });
+        pickBox.appendChild(el('span', { text: 'Table' }));
+        pickBox.appendChild(which);
+      }
       if (preview) pv.appendChild(dataTable(preview.columns, preview.rows, { empty: 'The table is empty.' }));
       else pv.appendChild(el('div', { class: 'empty', text: 'Previews are shown for file sources. Use the CLI to ingest ' + src.type + ' sources.' }));
 
@@ -1960,7 +2143,7 @@
       });
     }
 
-    function tableEntry(name, table, columns) {
+    function tableEntry(name, table, columns, owner) {
       var cols = el('ul', { class: 'tbl-cols', hidden: '' }, columns.map(function (c) {
         var b = el('button', { type: 'button', title: 'Insert ' + quoteIdent(c.name) }, [
           el('span', { text: c.name }), el('span', { class: 't', text: c.type.toLowerCase() })
@@ -1988,8 +2171,8 @@
         table && table !== name ? el('div', { class: 'alias', text: 'eyetable_raw.' + table, title: 'Also queryable by this table name' }) : null,
         cols
       ]);
-      entry.searchText = (name + ' ' + (table || '')).toLowerCase();
-      var source = state.sources.filter(function (s) { return s.name === name; })[0];
+      entry.searchText = (name + ' ' + (table || '') + ' ' + (owner || '')).toLowerCase();
+      var source = state.sources.filter(function (s) { return s.name === (owner || name); })[0];
       entry.tags = source ? source.tags || [] : [];
       return entry;
     }
@@ -2063,7 +2246,7 @@
       schema.tables.forEach(function (t) { byTable[t.table] = t.columns; });
       var files = schema.sources.filter(function (s) { return s.table && byTable[s.table]; });
       var named = {};
-      files.forEach(function (s) { named[s.table] = true; });
+      files.forEach(function (s) { named[s.table] = true; (s.tables || []).forEach(function (t) { named[t] = true; }); });
       var others = schema.tables.filter(function (t) { return !named[t.table]; });
       if (!files.length && !others.length) {
         nav.appendChild(el('div', { class: 'none', text: 'Nothing to query yet. Load a file above.' }));
@@ -2071,7 +2254,12 @@
       }
       if (files.length) {
         nav.appendChild(el('h3', { text: 'Sources' }));
-        files.forEach(function (s) { nav.appendChild(tableEntry(s.name, s.table, byTable[s.table])); });
+        files.forEach(function (s) {
+          nav.appendChild(tableEntry(s.name, s.table, byTable[s.table]));
+          (s.tables || []).forEach(function (t) {  // a database source's other tables, by their own names
+            if (t !== s.table && byTable[t]) nav.appendChild(tableEntry(t, null, byTable[t], s.name));
+          });
+        });
       }
       if (others.length) {
         nav.appendChild(el('h3', { text: 'Other tables' }));
@@ -3272,6 +3460,10 @@
 
     // -- wiring ------------------------------------------------------------
     $('ss-save').addEventListener('click', function () { saveSettings(false); });
+    $('dbt-open').addEventListener('click', openDbTables);
+    $('dbt-find').addEventListener('input', function () { if (dbt.objects) renderDbtList(); });
+    $('dbt-save').addEventListener('click', saveDbTables);
+    $('dbt-cancel').addEventListener('click', function () { dbt.open = false; $('dbt-picker').hidden = true; $('dbt-open').hidden = false; });
     $('ss-save-reload').addEventListener('click', function () { saveSettings(true); });
     $('q-find').value = query.filter.text;
     $('q-find').addEventListener('input', function () { query.filter.text = $('q-find').value; saveTableFilter(); filterTables(); });

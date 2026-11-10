@@ -623,6 +623,21 @@ class CoreStore:
             out.append((Upload(**data), status))
         return out
 
+    def table_loads(self, source: str) -> dict[str, tuple[dt.datetime, int, str]]:
+        """The latest successful load of each dataset of a source: key -> (finished, rows written, mode)."""
+        latest = (sa.select(self.runs.c.dataset_key, sa.func.max(self.runs.c.id).label("id"))
+                  .where(self.runs.c.source == source, self.runs.c.status == "succeeded")
+                  .group_by(self.runs.c.dataset_key).subquery())
+        query = sa.select(self.runs.c.dataset_key, self.runs.c.finished_at, self.runs.c.rows_written, self.runs.c.mode) \
+            .join(latest, self.runs.c.id == latest.c.id)
+        with self.db.connect() as conn:
+            return {r.dataset_key: (r.finished_at, r.rows_written, r.mode) for r in conn.execute(query).all()}
+
+    def drop_table(self, table: str) -> None:
+        """Delete a table of loaded data (a database source's table that was unchosen)."""
+        with self.db.begin() as conn:
+            conn.execute(sa.text(f"DROP TABLE IF EXISTS {self.qualified(table)}"))
+
     def last_loaded(self, source: str) -> dt.datetime | None:
         """When data last finished loading into this source successfully."""
         query = sa.select(sa.func.max(self.runs.c.finished_at)).where(

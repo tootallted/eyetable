@@ -301,6 +301,27 @@ optional `page_size`, `next_field`, `records_field` and `all_pages`),
 `PUT` and `DELETE /api/sources/<name>/statements`, and
 `POST /api/sources/<name>/run` to reload in the background.
 
+### Several tables in one database source
+
+A database source can load any number of its database's tables and views, each
+into its own table. Click the source, and under **Preview Data → Tables and
+views** use **Choose tables and views…**: it lists everything the login can see,
+with a filter, and ticks what the source loads now. **Save and load** loads the
+newly ticked ones straight away; unticked ones are taken out of the source and
+their loaded copies deleted (the page asks first, and the database itself is
+never touched). Every chosen table must be readable before anything changes.
+
+**Reload**, and any group the source is in, loads all of its tables; one failing
+doesn't stop the rest. In **Sources**, the **Table** column names up to three
+tables, and counts more; click the source to open a row per table with its
+rows, columns and when it last loaded. **Rows** is the total. **First rows** has
+a picker for which table to preview.
+
+The table a source was made with keeps its name (`eyetable_raw.<source>__data`),
+so queries by the source's name still read it; the others are
+`eyetable_raw.<source>__<table>`, listed under the source in the query window.
+API: `GET /api/sources/<name>/objects`, `PUT /api/sources/<name>/tables` (a job).
+
 ### Changing a source's connection
 
 Click a source and open **Preview Data**: **Connection settings** shows how it

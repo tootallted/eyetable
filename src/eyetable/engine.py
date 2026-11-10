@@ -304,14 +304,20 @@ class Engine:
             fresh = dict(prepared.config)
             if "password" not in fresh and config.get("password"):
                 fresh["password"] = config["password"]
-            config = {**fresh, "schema": config["schema"], "table": config["table"],
-                      "kind": config.get("kind", "table"), "label": prepared.label}
+            kept = {k: config[k] for k in ("schema", "table", "kind", "tables") if k in config}
+            config = {**fresh, **kept, "label": prepared.label}
         if password:
             config["password"] = encrypt_secret(password, self.secret_key)
-        if schema and schema.strip():
-            config["schema"] = schema.strip()
-        if table and table.strip():
-            config["table"] = table.strip()
+        if (schema and schema.strip()) or (table and table.strip()):
+            items = dbconnect.db_tables(config)
+            if len(items) > 1:
+                raise ValueError("this source loads several tables; choose them under Tables instead")
+            item = {**items[0]}
+            item["schema"] = schema.strip() if schema and schema.strip() else item["schema"]
+            item["table"] = table.strip() if table and table.strip() else item["table"]
+            config.update(schema=item["schema"], table=item["table"])
+            if config.get("tables"):
+                config["tables"] = [item]
         if test:
             with self._open("dbtable", config) as conn:
                 conn.discover()
@@ -322,6 +328,36 @@ class Engine:
         else:
             warnings.append("Saved without checking the connection; the next load will show whether it works.")
         return warnings
+
+    def set_db_tables(self, name: str, chosen: list[dict[str, str]]) -> dict[str, Any]:
+        """Make a database source load exactly the `chosen` tables and views ({schema, name, kind}).
+
+        New ones are loaded now; ones no longer chosen are taken out, and their
+        loaded tables deleted. Every chosen one must be readable before anything
+        changes. Returns what was added and removed, and the new ones' load results.
+        """
+        from eyetable import dbconnect
+
+        src = self.store.get_source(name)
+        if src.type != "dbtable":
+            raise ValueError(f"{name} isn't a database table source")
+        if not chosen:
+            raise ValueError("choose at least one table or view")
+        current = dbconnect.db_tables(src.config)
+        items = dbconnect.choose_tables(current, chosen)
+        keys = {i["key"] for i in items}
+        removed = [i for i in current if i["key"] not in keys]
+        added = [i for i in items if i not in current]
+        config = {**src.config, "tables": items, "schema": items[0]["schema"], "table": items[0]["table"],
+                  "kind": items[0]["kind"]}
+        with self._open("dbtable", config) as conn:
+            datasets = conn.discover()  # all of them must be readable
+        self.store.save_source(name, "dbtable", config)
+        self.store.save_catalog(name, datasets)
+        for item in removed:
+            self.store.drop_table(table_name(name, item["name"]))
+        results = self.ingest(name, keys=[i["key"] for i in added]) if added else []
+        return {"added": [i["key"] for i in added], "removed": [i["key"] for i in removed], "results": results}
 
     def update_curl_source(
         self,

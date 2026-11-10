@@ -108,6 +108,16 @@ class CertificateIn(BaseModel):
                            self.passphrase, self.host, self.port)
 
 
+class TableChoiceIn(BaseModel):
+    schema_: str = Field(alias="schema", max_length=256)
+    name: str = Field(max_length=256)
+    kind: str = "table"
+
+
+class TablesIn(BaseModel):
+    tables: list[TableChoiceIn] = Field(max_length=2000)
+
+
 class SettingsIn(BaseModel):
     """Changes to a source's connection; what's left out stays as it is."""
     model_config = {"populate_by_name": True}
@@ -267,6 +277,27 @@ def create_app(
 
     auth = [Depends(authorized)]
 
+    def db_source_tables(src, datasets) -> list[dict[str, Any]]:
+        """Each table a database source loads, with its rows and when it last loaded."""
+        loads = store.table_loads(src.name)
+        catalog = {d.key: d for d in datasets}
+        out = []
+        for item in dbconnect.db_tables(src.config):
+            table = table_name(src.name, item["name"])
+            finished, written, mode = loads.get(item["key"], (None, None, None))
+            # a replace writes the whole table, so its count is the table's; otherwise count it
+            rows = written if mode == "replace" else store.count_rows(table)
+            out.append({"key": item["key"], "schema": item["schema"], "name": item["table"], "kind": item.get("kind", "table"),
+                        "table": table, "rows": rows, "last_loaded_at": finished,
+                        "columns": len(catalog[item["key"]].columns) if item["key"] in catalog else None})
+        return out
+
+    def main_table(src) -> str:
+        """The table a single-table source's name stands for in queries."""
+        if src.type == "dbtable":
+            return table_name(src.name, dbconnect.db_tables(src.config)[0]["name"])
+        return table_name(src.name, DATASET_KEY)
+
     def source_summary(src, tags: dict[str, list[str]] | None = None) -> dict[str, Any]:
         datasets = [d for _, d in store.list_datasets(src.name)]
         summary: dict[str, Any] = {
@@ -278,7 +309,17 @@ def create_app(
             "last_loaded_at": store.last_loaded(src.name),
             "datasets": len(datasets),
         }
-        if src.type in SINGLE_TABLE_TYPES:
+        if src.type == "dbtable":
+            tables = db_source_tables(src, datasets)
+            counted = [t["rows"] for t in tables if t["rows"] is not None]
+            summary.update(
+                table=tables[0]["table"],
+                rows=sum(counted) if counted else None,
+                columns=tables[0]["columns"] if len(tables) == 1 else None,
+                last_upload=None,
+                tables=tables,
+            )
+        elif src.type in SINGLE_TABLE_TYPES:
             table = table_name(src.name, DATASET_KEY)
             uploads = store.list_uploads(src.name, limit=1)
             summary.update(
@@ -366,7 +407,7 @@ def create_app(
         if src.type == "dbtable":
             out.update(format="odbc" if "odbc" in c else "url", connection=c.get("odbc") or c.get("url"),
                        has_password=bool(c.get("password")), schema=c.get("schema"), table=c.get("table"),
-                       kind=c.get("kind"), label=c.get("label"))
+                       kind=c.get("kind"), label=c.get("label"), tables=len(dbconnect.db_tables(c)))
         elif src.type == "curl":
             cert = c.get("client_cert")
             identity = None
@@ -410,6 +451,44 @@ def create_app(
             raise HTTPException(400, str(exc).strip("'\"")) from None
         return jsonable_encoder({**settings_of(store.get_source(name)), "warnings": warnings, "tested": body.test})
 
+    def db_source(name: str):
+        src = get_source(name)
+        if src.type != "dbtable":
+            raise HTTPException(400, f"{name} isn't a database source")
+        return src
+
+    @app.get("/api/sources/{name}/objects", dependencies=auth)
+    def source_objects(name: str) -> dict[str, Any]:
+        """Every table and view in a database source's database, and which the source loads."""
+        src = db_source(name)
+        try:
+            with engine._open("dbtable", src.config) as conn:
+                objects = conn.objects()
+        except ValueError as exc:
+            raise HTTPException(400, str(exc).strip("'\"")) from None
+        chosen = {(i["schema"], i["table"]) for i in dbconnect.db_tables(src.config)}
+        for obj in objects:
+            obj["chosen"] = (obj["schema"], obj["name"]) in chosen
+        return jsonable_encoder({"label": src.config.get("label"), "objects": objects})
+
+    @app.put("/api/sources/{name}/tables", dependencies=auth, status_code=202)
+    def choose_source_tables(name: str, body: TablesIn) -> dict[str, Any]:
+        """Load exactly these tables and views from the source's database, in the background."""
+        db_source(name)
+        chosen = [{"schema": t.schema_, "name": t.name, "kind": t.kind} for t in body.tables]
+        if not chosen:
+            raise HTTPException(400, "choose at least one table or view")
+
+        def work() -> dict[str, Any]:
+            done = engine.set_db_tables(name, chosen)
+            failed = [r for r in done["results"] if r.status != "succeeded"]
+            return {"added": done["added"], "removed": done["removed"],
+                    "failed": [{"key": r.dataset_key, "error": r.error} for r in failed],
+                    "rows": sum(r.rows for r in done["results"]),
+                    "source": source_summary(store.get_source(name))}
+
+        return {"job_id": start_job("tables", work)}
+
     def curl_source(name: str):
         src = get_source(name)
         if src.type != "curl":
@@ -444,11 +523,15 @@ def create_app(
         return jsonable_encoder(source_summary(store.get_source(name)))
 
     @app.get("/api/sources/{name}/preview", dependencies=auth)
-    def preview(name: str, limit: int = 20) -> dict[str, Any]:
+    def preview(name: str, limit: int = 20, table: str | None = None) -> dict[str, Any]:
         src = get_source(name)
         if src.type not in SINGLE_TABLE_TYPES:
             raise HTTPException(400, "preview is available for file and Google Sheet sources")
-        table = table_name(name, DATASET_KEY)
+        if src.type == "dbtable" and table:
+            if table not in [table_name(name, i["name"]) for i in dbconnect.db_tables(src.config)]:
+                raise HTTPException(404, f"{name} has no table {table}")
+        else:
+            table = main_table(src)
         if not store.table_exists(table):
             return {"table": table, "columns": [], "rows": []}
         rows = store.read_table(table, limit=max(1, min(limit, 500)))
@@ -460,7 +543,7 @@ def create_app(
         })
 
     def file_aliases() -> dict[str, str]:
-        return {s.name: table_name(s.name, DATASET_KEY) for s in store.list_sources() if s.type in SINGLE_TABLE_TYPES}
+        return {s.name: main_table(s) for s in store.list_sources() if s.type in SINGLE_TABLE_TYPES}
 
     @app.get("/api/schema", dependencies=auth)
     def schema() -> dict[str, Any]:
@@ -469,7 +552,9 @@ def create_app(
         for src in store.list_sources():
             entry: dict[str, Any] = {"name": src.name, "type": src.type}
             if src.type in SINGLE_TABLE_TYPES:
-                entry["table"] = table_name(src.name, DATASET_KEY)
+                entry["table"] = main_table(src)
+            if src.type == "dbtable":
+                entry["tables"] = [table_name(src.name, i["name"]) for i in dbconnect.db_tables(src.config)]
             sources.append(entry)
         return {"sources": sources, "tables": queries.tables()}
 
@@ -645,8 +730,8 @@ def create_app(
         except (ValueError, KeyError) as exc:
             raise HTTPException(400, str(exc).strip("'\"")) from None
         loaded = {
-            (s.config.get("label"), s.config.get("schema"), s.config.get("table")): s.name
-            for s in store.list_sources() if s.type == "dbtable"
+            (s.config.get("label"), item["schema"], item["table"]): s.name
+            for s in store.list_sources() if s.type == "dbtable" for item in dbconnect.db_tables(s.config)
         }
         for obj in objects:
             obj["suggested_name"] = dbconnect.suggested_name(prepared.database, obj["schema"], obj["name"])
