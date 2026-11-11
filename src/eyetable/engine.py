@@ -48,6 +48,7 @@ class RunResult:
     since: Any = None  # an incremental load's starting point: the largest value loaded before it
     replaced: int = 0  # older copies of rows an incremental load replaced (by natural key)
     detail: str | None = None  # a failure's full traceback, for the load queue's details
+    note: str | None = None  # how it was read, when that's worth saying (in parts, say)
 
 
 class UnknownDataset(KeyError):
@@ -612,13 +613,20 @@ class Engine:
         run_id = self.store.start_run(source, DATASET_KEY, table, "incremental")
         origin = f"{source} - {book.title} / {tab.title}"
         return self._write_increment(run_id, tab.title, table, origin, p,
-                                     lambda: incremental.newer([tab.records], p.column, p.since, p.inclusive))
+                                     lambda split=None: incremental.newer([tab.records], p.column, p.since, p.inclusive))
 
     def _write_increment(self, run_id: int, key: str, table: str, origin: str, p: "incremental.Plan",
-                         batches: Callable[[], Any]) -> RunResult:
+                         batches: Callable[..., Any], retry: tuple | None = None) -> RunResult:
         """Append an incremental load's rows; with a natural key, they replace their older copies."""
+        def write(split):
+            return self.store.write(table, self._counted(table, batches(split)), "append", run_id, origin=origin)
+
+        note = None
         try:
-            rows = self.store.write(table, self._counted(table, batches()), "append", run_id, origin=origin)
+            if retry:
+                rows, note = self._write_or_split(*retry, write, undo=lambda: self.store.delete_run_rows(table, run_id))
+            else:
+                rows = write(None)
             replaced = self.store.replace_older(table, p.key, run_id) if p.key and rows else 0
         except Exception as exc:
             self.store.delete_run_rows(table, run_id)  # all or nothing, like a replace
@@ -629,7 +637,62 @@ class Engine:
         self.store.finish_run(run_id, "succeeded", rows)
         if rows:
             self.scan_keys(table)
-        return RunResult(run_id, key, table, "succeeded", rows, mode="incremental", since=p.since, replaced=replaced)
+        return RunResult(run_id, key, table, "succeeded", rows, mode="incremental", since=p.since, replaced=replaced,
+                         note=note)
+
+    # -- big tables: reading in parts -----------------------------------------------------
+
+    def _write_or_split(self, conn: Connector, source: str, key: str, dataset: DatasetInfo,
+                        write: Callable[[str | None], int], undo: Callable[[], None] | None = None) -> tuple[int, str | None]:
+        """Write a dataset; if reading it in one query times out, read it in parts instead.
+
+        `write(split)` loads it (split: the column to read it in parts by, or None). A table
+        that times out in one query is switched to parts by its best column (a creation time,
+        say) and keeps loading that way. Returns (rows, a note on how it was read).
+        """
+        from eyetable.connectors.dbtable import is_timeout, split_candidates
+
+        parts_by = None
+        if getattr(conn, "reads_in_parts", False):
+            parts_by = (conn._item(key).get("split") or {}).get("column")
+        try:
+            rows = write(None)
+        except Exception as exc:
+            if parts_by or not getattr(conn, "reads_in_parts", False) or not is_timeout(exc):
+                raise
+            choices = split_candidates(dataset.columns) or conn.split_columns(key)
+            if not choices:
+                raise
+            if undo:
+                undo()
+            column = choices[0]
+            log.warning("%s/%s timed out in one query; reading it in parts by %s", source, key, column)
+            rows = write(column)
+            self.set_split(source, key, column, auto=True)
+            return rows, (f"reading it in one query timed out, so it was read in {conn.parts_read.get(key, 0):,} parts "
+                          f"by {column}; it loads in parts from now on")
+        if parts_by:
+            return rows, f"read in {conn.parts_read.get(key, 0):,} parts by {parts_by}"
+        return rows, None
+
+    def set_split(self, source: str, key: str, column: str | None, auto: bool = False) -> None:
+        """Read a database source's table in parts by `column` from now on (None: in one query)."""
+        from eyetable import dbconnect
+
+        src = self.store.get_source(source)
+        if src.type != "dbtable":
+            raise ValueError(f"{source} isn't a database source")
+        items = [dict(i) for i in dbconnect.db_tables(src.config)]
+        found = [i for i in items if i["key"] == key]
+        if not found:
+            raise ValueError(f"{source} has no table {key}")
+        if column:
+            found[0]["split"] = {"column": column, "auto": auto}
+        else:
+            found[0].pop("split", None)
+        config = {**src.config, "tables": items, "schema": items[0]["schema"], "table": items[0]["table"],
+                  "kind": items[0]["kind"]}
+        self.store.save_source(source, "dbtable", config)
 
     def discover(self, source: str) -> list[DatasetInfo]:
         """Walk the source's metadata, record every dataset found in the catalog."""
@@ -675,18 +738,22 @@ class Engine:
                         continue
                     # an empty (or missing) table: there is nothing to go on, so load it all
                 run_id = self.store.start_run(source, key, table, "replace" if mode == "incremental" else mode)
+                write_mode = "replace" if mode == "incremental" else mode
+
+                def write(split, key=key, table=table, run_id=run_id, write_mode=write_mode):
+                    read = conn.read(key, batch_size, split=split) if split else conn.read(key, batch_size)
+                    return self.store.write(table, self._counted(table, read), write_mode, run_id,
+                                            origin=f"{source} - {conn.origin(key)}")
+
                 try:
-                    origin = f"{source} - {conn.origin(key)}"
-                    rows = self.store.write(table, self._counted(table, conn.read(key, batch_size)),
-                                            "replace" if mode == "incremental" else mode,
-                                            run_id, origin=origin)
+                    rows, note = self._write_or_split(conn, source, key, catalog[key], write)
                 except Exception as exc:
                     error = f"{type(exc).__name__}: {exc}"
                     self.store.finish_run(run_id, "failed", 0, error)
                     results.append(RunResult(run_id, key, table, "failed", 0, error, detail=traceback.format_exc()))
                 else:
                     self.store.finish_run(run_id, "succeeded", rows)
-                    results.append(RunResult(run_id, key, table, "succeeded", rows))
+                    results.append(RunResult(run_id, key, table, "succeeded", rows, note=note))
                     self.scan_keys(table)
         return results
 
@@ -697,12 +764,13 @@ class Engine:
         column = incremental.source_key([c.name for c in dataset.columns], p.column) \
             if getattr(conn, "reads_since", False) else None
 
-        def batches():
+        def batches(split=None):
             if column is not None:  # the database is asked for just the newer rows
-                return conn.read(key, batch_size, since=(column, p.since, p.inclusive))
+                more = {"split": split} if split else {}
+                return conn.read(key, batch_size, since=(column, p.since, p.inclusive), **more)
             return incremental.newer(conn.read(key, batch_size), p.column, p.since, p.inclusive)
 
-        return self._write_increment(run_id, key, table, origin, p, batches)
+        return self._write_increment(run_id, key, table, origin, p, batches, retry=(conn, source, key, dataset))
 
 
 def incremental_problem(message: str) -> Exception:

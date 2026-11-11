@@ -416,6 +416,49 @@ again; **Last loaded** shows when data last finished loading.
 Each reload is an ingestion run, so rows get a new `ET_timestamp` and
 `ET_run_id`, and `ET_id` starts again at 1. API: `POST /api/sources/<name>/reload`.
 
+### Big tables: loading in parts
+
+A database table can be too big to read in one query before the database
+gives up on it. Dataverse, for one, stops a `SELECT *` after two minutes and any
+other query after five.
+
+**Naming the columns.** eyetable always names the columns it reads, so a query
+is never `SELECT *`. On Dataverse, which can't describe its tables, the column
+names come from an empty `SELECT TOP 0`.
+
+**Reading in parts.** A big table can also be read as a series of ranges of
+one column, with each range its own query. All the parts load into the same
+table, so the whole table still arrives in one load. How it works:
+
+* Each part aims at about a million values (rows × columns). That is about
+  2,100 rows of a 467-column Dataverse table, or up to 50,000 rows of a narrow
+  one.
+* The first range is narrow, and each next one is sized from how many rows the
+  last one held.
+* A part that still times out is halved and tried again.
+* Rows with no value in the column are read last.
+* Each part is read in full before it's written, so a part tried again never
+  writes a row twice.
+* An incremental load reads only its newer rows, in parts as well.
+
+**Switching on its own.** If a full read in one query times out, eyetable
+switches that table to parts by its best column and loads it again. It keeps
+loading that table in parts from then on, and the Load queue says so on the
+item.
+
+**The best column.** A creation time is best (`createdon`, `created_at`, …),
+because rows never move between parts while the table is read. After that come
+an ID that only grows, then other date and time columns. A modified time can
+move a row changed during the load into a later part, so that row could be
+read twice.
+
+**Choosing it yourself.** **Preview Data → Big tables: loading in parts**
+shows how a database table loads. You can pick a column to read it in parts
+by, or go back to **In one query**.
+
+API: `GET` and `PUT /api/tables/<table>/split` with `{"column": "createdon"}`;
+send `null` to read the table in one query.
+
 ### Load queue
 
 On the page, **Reload** and **Incremental** don't hold the page up while a

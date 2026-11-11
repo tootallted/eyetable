@@ -804,6 +804,11 @@
         <div id="key-body" style="display:grid; gap:10px"></div>
         <div id="key-msg" role="status"></div>
       </div>
+      <div id="detail-split" hidden style="display:grid; gap:10px">
+        <h3 style="font-size:14px; margin:0">Big tables: loading in parts</h3>
+        <div id="split-body" style="display:grid; gap:10px"></div>
+        <div id="split-msg" role="status"></div>
+      </div>
       <div id="detail-incr" hidden style="display:grid; gap:10px">
         <h3 style="font-size:14px; margin:0">Incremental loads</h3>
         <div id="incr-body" style="display:grid; gap:10px"></div>
@@ -2362,6 +2367,7 @@
     function renderKeys(table, loadedAt, src) {
       keyView = { table: table, info: null, chosen: {}, waits: 0, loadedAt: loadedAt, src: src, sf: null };
       $('detail-keys').hidden = $('detail-incr').hidden = !table;
+      renderSplit(table, src);
       clear($('key-msg'));
       clear($('incr-msg'));
       clear($('incr-body'));
@@ -2681,6 +2687,57 @@
         loadButton(src, target, false, 'Full load'),
         loadButton(src, target, true, 'Incremental load')
       ]));
+    }
+
+    // -- big tables: reading a database table in parts ------------------------------
+    // A table too big to read in one query before the database gives up is read as a series
+    // of ranges of one column (a creation time, best). eyetable switches to this by itself
+    // when a one-query read times out; it can also be chosen (or turned off) here.
+    function renderSplit(table, src) {
+      var box = $('detail-split'), body = clear($('split-body'));
+      clear($('split-msg'));
+      box.hidden = !(table && src && src.type === 'dbtable');
+      if (box.hidden) return;
+      body.appendChild(el('div', { class: 'muted', text: 'Loading\u2026' }));
+      api('/api/tables/' + encodeURIComponent(table) + '/split').then(function (info) {
+        if (keyView.table !== table) return;
+        showSplit(info);
+      }, function (err) { clear(body).appendChild(banner('err', err.message)); });
+    }
+
+    function showSplit(info) {
+      var body = clear($('split-body'));
+      var now = info.column
+        ? 'This table loads in parts by ' + info.column + (info.auto ? ' (switched on by itself after reading it in one query timed out)' : '') +
+          ': each part is its own query over a range of ' + info.column + ', sized to a few thousand rows, and all of them make up the table.'
+        : 'This table loads in one query. If that query times out, eyetable switches it to parts by ' +
+          (info.candidates.length ? info.candidates[0] : 'a date or number column') + ' by itself and keeps loading it that way.';
+      body.appendChild(el('p', { style: 'margin:0', text: now }));
+      if (!info.candidates.length && !info.column) {
+        body.appendChild(el('p', { class: 'hint', style: 'margin:0', text: 'It has no date, time or ID column to split it by, so it can only load in one query.' }));
+        return;
+      }
+      var pick = el('select', { 'aria-label': 'How this table loads' }, [el('option', { value: '', text: 'In one query' })]
+        .concat(info.candidates.concat(info.column && info.candidates.indexOf(info.column) < 0 ? [info.column] : []).map(function (c, i) {
+          return el('option', { value: c, text: 'In parts by ' + c + (i === 0 ? ' (best)' : '') });
+        })));
+      pick.value = info.column || '';
+      var save = el('button', { type: 'button', class: 'btn', text: 'Save' });
+      save.disabled = true;
+      pick.addEventListener('change', function () { save.disabled = (pick.value || null) === (info.column || null); });
+      save.addEventListener('click', function () {
+        var msg = clear($('split-msg'));
+        save.disabled = true;
+        api('/api/tables/' + encodeURIComponent(info.table) + '/split', { method: 'PUT', headers: JSON_HEADERS,
+          body: JSON.stringify({ column: pick.value || null }) }).then(function (r) {
+          showSplit(r);
+          $('split-msg').appendChild(banner('ok', r.column ? 'From now on it loads in parts by ' + r.column + '.' : 'From now on it loads in one query.'));
+          refreshSourcesOnly();
+        }, function (err) { msg.appendChild(banner('err', 'Not saved: ' + err.message)); save.disabled = false; });
+      });
+      body.appendChild(el('div', { class: 'set-actions' }, [pick, save]));
+      body.appendChild(el('p', { class: 'hint', style: 'margin:0', text: 'A creation time is best: rows never move between parts while ' +
+        'the table is read. A modified time can move a row changed during the load into a later part, so it could be read twice.' }));
     }
 
     // Re-read the sources list without re-opening Preview Data (which would reset what is being edited).
@@ -3815,9 +3872,11 @@
         if (t.mode === 'incremental') {
           if (!rows) return 'Done: nothing new after ' + fmtValue(t.since);
           return 'Done: ' + plural(rows, 'row') + ' from ' + fmtValue(t.since) + ' on' +
-            (t.replaced ? ' (' + fmtInt(rows - t.replaced) + ' new, ' + fmtInt(t.replaced) + ' replacing older copies)' : '');
+            (t.replaced ? ' (' + fmtInt(rows - t.replaced) + ' new, ' + fmtInt(t.replaced) + ' replacing older copies)' : '') +
+            (t.note ? '; ' + t.note : '');
         }
-        return 'Done: ' + plural(rows, 'row') + ' loaded' + (t.before !== null && t.before !== undefined ? ' (it had ' + fmtInt(t.before) + ')' : '');
+        return 'Done: ' + plural(rows, 'row') + ' loaded' + (t.before !== null && t.before !== undefined ? ' (it had ' + fmtInt(t.before) + ')' : '') +
+          (t.note ? '; ' + t.note : '');
       }
       // loading
       var text = t.expected ? fmtInt(rows) + ' of ' + fmtInt(t.expected) + ' rows' + (rows <= t.expected ? ' (' + Math.floor(100 * rows / t.expected) + '%)' : '')

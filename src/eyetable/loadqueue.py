@@ -195,7 +195,7 @@ class LoadQueue:
                     rows = r.rows + (entry["rows"] if r.table in seen and r.status == "succeeded" else 0)
                     seen.add(r.table)
                     entry.update(status=r.status, rows=rows if r.status == "succeeded" else entry["rows"], mode=r.mode,
-                                 since=r.since, replaced=r.replaced, error=r.error, finished_at=_now())
+                                 since=r.since, replaced=r.replaced, error=r.error, note=r.note, finished_at=_now())
                     if r.status != "succeeded":
                         cancelled = item["cancel"] and "LoadCancelled" in (r.error or "")
                         entry["status"] = "cancelled" if cancelled else "failed"

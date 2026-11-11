@@ -185,6 +185,10 @@ class QueueIn(BaseModel):
     google_token: str | None = Field(default=None, max_length=4096)  # a private Google Sheet
 
 
+class SplitIn(BaseModel):
+    column: str | None = Field(default=None, max_length=128)  # None: read in one query
+
+
 class IncrementIn(BaseModel):
     column: str = Field(min_length=1, max_length=128)
 
@@ -319,6 +323,7 @@ def create_app(
             rows = written if mode == "replace" else store.count_rows(table)
             out.append({"key": item["key"], "schema": item["schema"], "name": item["table"], "kind": item.get("kind", "table"),
                         "table": table, "rows": rows, "last_loaded_at": finished, "incremental": increments.get(table),
+                        "split": (item.get("split") or {}).get("column"),
                         "columns": len(catalog[item["key"]].columns) if item["key"] in catalog else None})
         return out
 
@@ -818,6 +823,47 @@ def create_app(
             return jsonable_encoder(keys.choose_key(store, loaded_table(table), body.columns))
         except keys.KeyProblem as exc:
             raise HTTPException(400, str(exc)) from None
+
+    # -- big tables read in parts (connectors/dbtable.py read_in_parts) ----------
+    def db_table_item(table: str):
+        """The database source and table entry that load `table`."""
+        for src in store.list_sources():
+            if src.type == "dbtable":
+                for item in dbconnect.db_tables(src.config):
+                    if table_name(src.name, item["name"]) == table:
+                        return src, item
+        raise HTTPException(404, f"{table} isn't loaded from a database, so it has no parts setting")
+
+    def split_info(table: str) -> dict[str, Any]:
+        from eyetable.connectors.dbtable import split_candidates
+
+        src, item = db_table_item(table)
+        catalog = {d.key: d for _, d in store.list_datasets(src.name)}
+        columns = catalog[item["key"]].columns if item["key"] in catalog else []
+        split = item.get("split") or {}
+        return {"table": table, "source": src.name, "column": split.get("column"), "auto": bool(split.get("auto")),
+                "candidates": split_candidates(columns)}
+
+    @app.get("/api/tables/{table}/split", dependencies=auth)
+    def get_split(table: str) -> dict[str, Any]:
+        """Whether a database table loads in one query or in parts, and the columns it could be split by."""
+        return split_info(table)
+
+    @app.put("/api/tables/{table}/split", dependencies=auth)
+    def put_split(table: str, body: SplitIn) -> dict[str, Any]:
+        """Load this table in parts by `column` from now on, or (no column) in one query."""
+        from eyetable.connectors.dbtable import _kind
+
+        src, item = db_table_item(table)
+        if body.column:
+            catalog = {d.key: d for _, d in store.list_datasets(src.name)}
+            types = {c.name: c.type for c in (catalog[item["key"]].columns if item["key"] in catalog else [])}
+            if body.column not in types:
+                raise HTTPException(400, f"{table} has no column {body.column}")
+            if _kind(types[body.column]) is None:
+                raise HTTPException(400, f"{body.column} holds {types[body.column]} values; choose a date, time or number column")
+        engine.set_split(src.name, item["key"], body.column or None)
+        return split_info(table)
 
     @app.put("/api/tables/{table}/incremental", dependencies=auth)
     def set_table_increment(table: str, body: IncrementIn) -> dict[str, Any]:
