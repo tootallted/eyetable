@@ -207,7 +207,8 @@ def test_endpoints(store, api, tmp_path):
     assert jobs["certificate"] is None and "tok_old" not in str(jobs) and "key_1" not in str(jobs)
     people = web.get("/api/sources/people/settings", headers=AUTH).json()
     assert people["format"] == "url" and people["table"] == "people" and people["has_password"] is False
-    assert web.get("/api/sources/plain/settings", headers=AUTH).json() == {"type": "file"}
+    assert web.get("/api/sources/plain/settings", headers=AUTH).json() == {
+        "type": "file", "name": "plain", "folder": None, "pattern": None, "filename": "p.csv"}
 
     api.token = "tok_new"
     r = web.put("/api/sources/jobs/settings", headers=AUTH, json={"secrets": {"secret_2": "Bearer nope"}})
@@ -220,5 +221,7 @@ def test_endpoints(store, api, tmp_path):
     assert r.status_code == 400 and "wasn't found" in r.json()["detail"]
     r = web.put("/api/sources/people/settings", headers=AUTH, json={"schema": "main", "table": "people"})
     assert r.status_code == 200 and r.json()["schema"] == "main"
-    assert web.put("/api/sources/plain/settings", headers=AUTH, json={}).status_code == 400
+    unchanged = web.put("/api/sources/plain/settings", headers=AUTH, json={})  # a file source: nothing asked, nothing changed
+    assert unchanged.status_code == 200 and unchanged.json()["name"] == "plain" and unchanged.json()["pattern"] is None
+    assert web.put("/api/sources/plain/settings", headers=AUTH, json={"folder": "C:\nowhere\at\all", "pattern": "a_*.csv"}).status_code == 400
     assert web.put("/api/sources/jobs/settings", json={}).status_code == 401

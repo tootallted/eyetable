@@ -710,6 +710,33 @@ class CoreStore:
         """Set (or, with None, clear) the natural key of a table."""
         self._upsert_key_row(table, key_columns=columns, key_set_at=_now() if columns else None)
 
+    # -- renaming a source ---------------------------------------------------------
+
+    def rename_source(self, old: str, new: str, tables: list[tuple[str, str]]) -> None:
+        """Rename a source everywhere: its config, catalog, runs, files, tags, groups, and its tables
+        (`tables`: (old table, new table) pairs) with their keys, incremental columns and hidden flags."""
+        if self.source_exists(new):
+            raise ValueError(f"there is already a source named {new}")
+        for _, t in tables:
+            if self.table_exists(t):
+                raise ValueError(f"there is already a table named {t}")
+        prep = self.db.dialect.identifier_preparer
+        with self.db.begin() as conn:
+            for table in (self.sources, ):
+                conn.execute(sa.update(table).where(table.c.name == old).values(name=new))
+            for table in (self.datasets, self.runs, self.uploads, self.source_tags):
+                conn.execute(sa.update(table).where(table.c.source == old).values(source=new))
+            for old_t, new_t in tables:
+                conn.execute(sa.update(self.runs).where(self.runs.c.target_table == old_t).values(target_table=new_t))
+                for table in (self.table_keys, self.table_increments, self.hidden_tables):
+                    conn.execute(sa.update(table).where(table.c.table_name == old_t).values(table_name=new_t))
+                if sa.inspect(conn).has_table(old_t, schema=self.data_schema):
+                    conn.execute(sa.text(f"ALTER TABLE {self.qualified(old_t)} RENAME TO {prep.quote(new_t)}"))
+            for row in conn.execute(sa.select(self.groups.c.id, self.groups.c.members)).all():
+                if old in row.members:
+                    conn.execute(sa.update(self.groups).where(self.groups.c.id == row.id)
+                                 .values(members=[new if m == old else m for m in row.members]))
+
     # -- hidden tables -----------------------------------------------------------
 
     def hidden(self) -> set[str]:
@@ -829,7 +856,7 @@ class CoreStore:
         rows = 0
         try:
             for batch in batches:
-                meta = {TIMESTAMP_COLUMN: _now(), SOURCE_COLUMN: origin, RUN_ID_COLUMN: run_id}
+                meta = {TIMESTAMP_COLUMN: _now(), SOURCE_COLUMN: origin() if callable(origin) else origin, RUN_ID_COLUMN: run_id}
                 rows += writer.write(batch, meta)
             writer.finish(reorder=(mode == "replace"))
         except BaseException:

@@ -36,7 +36,7 @@ from eyetable.engine import SINGLE_TABLE_TYPES, Engine
 from eyetable.gsheets import SheetError, fetch_workbook, fetch_workbook_signed_in
 from eyetable.identifiers import SOURCE_NAME, normalize_tag, table_name
 from eyetable.query import MAX_LIMIT, QueryError, QueryRunner
-from eyetable import dbconnect, entra, keys
+from eyetable import dbconnect, entra, filesets, keys
 from eyetable.loadqueue import LoadQueue
 from eyetable.curl import auth_scheme, clean_statements, components, parse_curl, preview_statements, secret_places, stored_request
 from eyetable.curl import plan as curl_plan
@@ -139,6 +139,9 @@ class SettingsIn(BaseModel):
     secrets: dict[str, str] | None = None  # curl: secret_N -> new value
     certificate: CertificateIn | None = None  # curl: a new client certificate
     remove_certificate: bool = False
+    folder: str | None = Field(default=None, max_length=1000)  # file: the folder on the server holding its files
+    pattern: str | None = Field(default=None, max_length=260)  # file: a file name or pattern (ledger_*.csv); "" = uploads
+    name: str | None = Field(default=None, max_length=64)  # a new name for the source (and its table)
     test: bool = True  # check the connection before saving
 
 
@@ -187,6 +190,11 @@ class QueueIn(BaseModel):
 
 class HiddenIn(BaseModel):
     hidden: bool
+
+
+class FilesIn(BaseModel):
+    folder: str = Field(max_length=1000)
+    pattern: str = Field(max_length=260)
 
 
 class SplitIn(BaseModel):
@@ -363,6 +371,8 @@ def create_app(
         elif src.type in SINGLE_TABLE_TYPES:
             table = table_name(src.name, DATASET_KEY)
             uploads = store.list_uploads(src.name, limit=1)
+            if src.type == "file" and src.config.get("pattern"):
+                summary["file_set"] = {"folder": src.config.get("folder"), "pattern": src.config["pattern"]}
             summary.update(
                 table=table,
                 hidden=table in store.hidden(),
@@ -489,6 +499,17 @@ def create_app(
             out.update(secrets=secrets, certificate=identity, request=components(c))
         elif src.type == "gsheet":
             out.update(url=c.get("url"), tab=c.get("tab_title"), file=c.get("file_title"))
+        elif src.type == "file":
+            uploads = store.list_uploads(src.name, limit=1)
+            out.update(folder=c.get("folder"), pattern=c.get("pattern"),
+                       filename=uploads[0].filename if uploads else None)
+            if c.get("pattern"):
+                try:
+                    files = filesets.matching_files(c.get("folder", ""), c["pattern"])
+                    out.update(files=filesets.describe_files(files), file_count=len(files), files_error=None)
+                except filesets.FileSetProblem as exc:
+                    out.update(files=[], file_count=0, files_error=str(exc))
+        out["name"] = src.name
         return out
 
     @app.get("/api/sources/{name}/settings", dependencies=auth)
@@ -507,6 +528,8 @@ def create_app(
                 certificate = body.certificate.read() if body.certificate else None
                 warnings = engine.update_curl_source(name, body.command, body.secrets, certificate,
                                                      body.remove_certificate, body.test)
+            elif src.type == "file":
+                name, warnings = engine.update_file_source(name, body.folder, body.pattern, body.name, body.test)
             else:
                 raise HTTPException(400, f"a {src.type} source's settings can't be changed here")
         except ValueError as exc:
@@ -829,6 +852,17 @@ def create_app(
             return jsonable_encoder(keys.choose_key(store, loaded_table(table), body.columns))
         except keys.KeyProblem as exc:
             raise HTTPException(400, str(exc)) from None
+
+    # -- file sets: a file source reading every matching file in a server folder ------
+    @app.post("/api/files/match", dependencies=auth)
+    def match_files(body: FilesIn) -> dict[str, Any]:
+        """The files in a folder on the server that match a pattern (before saving it to a source)."""
+        try:
+            files = filesets.matching_files(body.folder, body.pattern)
+        except filesets.FileSetProblem as exc:
+            raise HTTPException(400, str(exc)) from None
+        return jsonable_encoder({"files": filesets.describe_files(files), "count": len(files),
+                                 "suggested_name": filesets.name_for(body.pattern) if filesets.is_pattern(body.pattern) else None})
 
     # -- hiding a table in Sources ("commenting it out"): every load skips it --------
     @app.put("/api/tables/{table}/hidden", dependencies=auth)

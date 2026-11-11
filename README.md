@@ -149,6 +149,51 @@ only call the API from the origins in `EYETABLE_CORS_ORIGINS` (default
 `https://tootallted.github.io`). Uploads are limited to 50 MB
 (`EYETABLE_MAX_UPLOAD_MB`). API docs: `/api/docs`.
 
+### A set of files from a server folder
+
+A file source can read a whole set of files instead of one uploaded file. It
+reads every file matching a pattern, such as `ledger_*.csv`, from a folder on
+the eyetable server, each time it loads (Reload, groups and schedules). New
+files dropped in the folder are picked up by the next load.
+
+To set one up, open the file source in **Preview Data → Connection
+settings**:
+
+1. Fill in **Folder on the eyetable server**, for example `C:\data\ledgers`. On
+   a service, use `\\server\share\…` rather than a mapped drive letter.
+2. Change **File name or pattern** from the uploaded name to a pattern. `*`
+   stands for any characters and `?` for one, so `ledger_2026-01-02.csv`
+   becomes `ledger_*.csv`.
+3. **Source name** suggests a name for the set: `ledger_*.csv` gives
+   `ledger_aggregated`, whose table is `eyetable_raw.ledger_aggregated__data`.
+   Renaming moves the source's table, runs, tags, groups, keys and settings to
+   the new name.
+4. Use **Show matching files** to check what will load, then **Save and
+   reload**.
+
+How the files load:
+
+* Every matching file loads into the one table, read in name order.
+* A column found in any file becomes a column. Rows from files without it get
+  NULL there. The same heading in different case (`Amount` / `amount`) is one
+  column.
+* Each row's `ET_source` names the file it came from.
+* A file that can't be read fails the load with its name in the error, and the
+  table keeps its previous contents.
+* Only the folder itself is read, not its subfolders.
+* Only CSV, TSV and text files are read.
+* Uploading a file into a set source is refused; the file goes in the folder
+  instead.
+* **Stop reading the folder** goes back to uploaded files.
+
+By default any folder the eyetable service can see may be used.
+`EYETABLE_FILE_FOLDERS` in `.env` (folders separated by `;`) limits it to those
+folders and the folders under them.
+
+API: `POST /api/files/match` with `{"folder", "pattern"}` lists the matching
+files. `PUT /api/sources/<name>/settings` with `{"folder", "pattern", "name"}`
+saves them; send `"pattern": ""` to go back to uploads.
+
 ### Google Sheets
 
 Paste a Google Sheets link into **Google Sheet link** (or drag the link onto

@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
-from eyetable import gsheets, incremental, keys
+from eyetable import filesets, gsheets, incremental, keys
 from eyetable.connectors import Connector, build_connector
 from eyetable.connectors.file import DATASET_KEY, FileConnector
 from eyetable.credentials import decrypt_secrets, resolve_env
@@ -199,6 +199,9 @@ class Engine:
             if src.type != "file":
                 raise ValueError(f"{source!r} is a {src.type} source; files can only be loaded into file sources")
             config = src.config
+            if config.get("pattern") and keep_file:
+                raise ValueError(f"{source} reads {config['pattern']} from {config.get('folder')} on the server; "
+                                 "put the file in that folder and reload, rather than uploading it")
         conn = FileConnector(resolve_env(config, self._environ), content=content, filename=filename)
         [dataset] = conn.discover()  # parses, raising on an unreadable file
         if create:
@@ -587,6 +590,8 @@ class Engine:
                 return skipped
         elif table_name(source, DATASET_KEY) in hidden:
             return [RunResult(0, DATASET_KEY, table_name(source, DATASET_KEY), "skipped", 0, "hidden in Sources")]
+        if src.type == "file" and src.config.get("pattern"):
+            return [self._load_file_set(source, src.config)]
         if src.type == "file":
             history = [u for u, status in self.store.load_history(source) if status == "succeeded"]
             if not history:
@@ -656,6 +661,105 @@ class Engine:
             self.scan_keys(table)
         return RunResult(run_id, key, table, "succeeded", rows, mode="incremental", since=p.since, replaced=replaced,
                          note=note)
+
+    # -- file sets: every file matching a pattern in a server folder (filesets.py) -------------
+
+    def _load_file_set(self, source: str, config: dict[str, Any]) -> RunResult:
+        """Load every file in the folder that matches the pattern into the source's one table (a replace).
+        A column in any file becomes a column; rows from files without it are NULL. Each row's
+        ET_source names its file."""
+        table = table_name(source, DATASET_KEY)
+        files = filesets.matching_files(config.get("folder", ""), config["pattern"])
+        if not files:
+            raise filesets.FileSetProblem(f"no file in {config.get('folder')} matches {config['pattern']}")
+        run_id = self.store.start_run(source, DATASET_KEY, table, "replace")
+        current = {"origin": source}
+        columns: dict[str, str] = {}  # every column seen, in order, with its kind
+        canon: dict[str, str] = {}  # a column's table name -> the heading first seen for it
+
+        def batches():
+            from eyetable.identifiers import column_name
+
+            for f in files:
+                try:
+                    conn = FileConnector(resolve_env(config, self._environ), content=f.read_bytes(), filename=f.name)
+                    [dataset] = conn.discover()
+                except Exception as exc:
+                    raise ValueError(f"{f.name}: {exc}") from None
+                for c in dataset.columns:
+                    columns.setdefault(canon.setdefault(column_name(c.name), c.name), c.type)
+                # the same heading in two files (even spelled Amount and amount) is one column
+                rename = {c.name: canon[column_name(c.name)] for c in dataset.columns if canon[column_name(c.name)] != c.name}
+                current["origin"] = f"{source} - {f.name}"
+                for batch in conn.read(DATASET_KEY):
+                    yield [{rename.get(k, k): v for k, v in r.items()} for r in batch] if rename else batch
+
+        try:
+            rows = self.store.write(table, self._counted(table, batches()), "replace", run_id,
+                                    origin=lambda: current["origin"])
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            self.store.finish_run(run_id, "failed", 0, error)
+            return RunResult(run_id, DATASET_KEY, table, "failed", 0, error, detail=traceback.format_exc())
+        self.store.finish_run(run_id, "succeeded", rows)
+        self.store.save_catalog(source, [DatasetInfo(
+            key=DATASET_KEY, name=DATASET_KEY, kind="file", columns=[ColumnInfo(n, k) for n, k in columns.items()],
+            row_count=rows, detail={"folder": config.get("folder"), "pattern": config["pattern"],
+                                    "files": [f.name for f in files]})])
+        self.scan_keys(table)
+        return RunResult(run_id, DATASET_KEY, table, "succeeded", rows,
+                         note=f"{len(files):,} file{'s' if len(files) != 1 else ''} matching {config['pattern']}")
+
+    def update_file_source(self, name: str, folder: str | None, pattern: str | None, new_name: str | None,
+                           test: bool = True) -> tuple[str, list[str]]:
+        """Point a file source at the files matching `pattern` in `folder` on the server (an empty
+        pattern goes back to uploaded files), and rename it if `new_name` differs. Returns
+        (its name now, warnings). With `test`, nothing changes unless a matching file reads."""
+        src = self.store.get_source(name)
+        if src.type != "file":
+            raise ValueError(f"{name} isn't a file source")
+        config = dict(src.config)
+        warnings: list[str] = []
+        if pattern is not None:
+            if pattern.strip():
+                files = filesets.matching_files(folder or config.get("folder", ""), pattern)
+                if test:
+                    if not files:
+                        raise filesets.FileSetProblem(f"no file in {folder or config.get('folder')} matches {pattern.strip()}")
+                    first = files[0]
+                    try:
+                        FileConnector(resolve_env(config, self._environ), content=first.read_bytes(), filename=first.name).discover()
+                    except Exception as exc:
+                        raise ValueError(f"{first.name} can't be read: {exc}") from None
+                elif not files:
+                    warnings.append("No file matches yet; the next load fails until one does.")
+                config.update(folder=str(filesets.check_folder(folder or config.get("folder", ""))), pattern=pattern.strip())
+            else:
+                config.pop("pattern", None)
+                config.pop("folder", None)
+        elif folder is not None and config.get("pattern"):
+            config["folder"] = str(filesets.check_folder(folder))
+            if test and not filesets.matching_files(config["folder"], config["pattern"]):
+                raise filesets.FileSetProblem(f"no file in {config['folder']} matches {config['pattern']}")
+        if config != src.config:
+            self.store.save_source(name, "file", config)
+        if new_name and new_name != name:
+            self.rename_source(name, new_name)
+            name = new_name
+        return name, warnings
+
+    def rename_source(self, old: str, new: str) -> None:
+        """Rename a source, and its tables with it (<old>__x becomes <new>__x)."""
+        if not SOURCE_NAME.match(new):
+            raise ValueError("source names are lowercase letters, digits and _, starting with a letter")
+        src = self.store.get_source(old)
+        if src.type == "dbtable":
+            from eyetable import dbconnect
+
+            names = [i["name"] for i in dbconnect.db_tables(src.config)]
+        else:
+            names = [DATASET_KEY]
+        self.store.rename_source(old, new, [(table_name(old, n), table_name(new, n)) for n in names])
 
     # -- big tables: reading in parts -----------------------------------------------------
 

@@ -1489,7 +1489,8 @@
       { key: 'rows', label: 'Rows', num: true, numeric: true, firstDir: -1,
         value: function (s) { return s.rows === null || s.rows === undefined ? null : s.rows; },
         text: function (s) { return s.rows === null || s.rows === undefined ? '' : fmtInt(s.rows) + ' ' + s.rows; } },
-      { key: 'file', label: 'Last file', value: function (s) { return s.last_upload ? s.last_upload.filename : ''; } },
+      { key: 'file', label: 'Last file', value: function (s) { return s.file_set ? s.file_set.pattern : s.last_upload ? s.last_upload.filename : ''; },
+        text: function (s) { return s.file_set ? s.file_set.pattern + ' ' + s.file_set.folder : s.last_upload ? s.last_upload.filename : ''; } },
       { key: 'loaded', label: 'Last loaded', firstDir: -1, value: sourceTimeValue,
         text: function (s) { return sourceTimeValue(s) ? fmtTime(sourceTimeValue(s)) : 'Not loaded yet'; } },
       { key: 'actions', label: '', sort: false, filter: false }
@@ -1683,7 +1684,8 @@
           el('td', { 'data-label': 'Type' }, [el('span', { class: 'tag', text: typeLabel(s.type) })]),
           s.tables ? tablesCell(s, open) : el('td', { class: 'mono wrap', 'data-label': 'Table' }, s.table ? breakable('eyetable_raw.' + s.table) : [s.datasets + ' dataset(s)']),
           el('td', { class: 'num', 'data-label': 'Rows', text: s.table ? fmtInt(s.rows) : '—' }),
-          el('td', { class: 'wrap', 'data-label': 'Last file', text: s.last_upload ? s.last_upload.filename : '—' }),
+          el('td', { class: 'wrap', 'data-label': 'Last file', title: s.file_set ? 'Every file matching ' + s.file_set.pattern + ' in ' + s.file_set.folder : '',
+            text: s.file_set ? s.file_set.pattern : s.last_upload ? s.last_upload.filename : '—' }),
           el('td', { 'data-label': 'Last loaded', text: fmtTime(s.last_loaded_at || s.updated_at), title: s.last_loaded_at ? 'Last time data finished loading' : 'Not loaded yet' }),
           el('td', { class: 'actions' }, s.hidden ? [] : [loadButtons(s)])
         ]);
@@ -1951,7 +1953,7 @@
     function renderSettings() {
       var d = ss.data, body = clear($('ss-body'));
       ss.inputs = {};
-      var editable = d.type === 'dbtable' || d.type === 'curl';
+      var editable = d.type === 'dbtable' || d.type === 'curl' || d.type === 'file';
       $('src-settings').hidden = ['dbtable', 'curl', 'gsheet', 'file'].indexOf(d.type) < 0;
       $('ss-actions').hidden = !editable;
       $('ss-test').checked = true;
@@ -2016,7 +2018,77 @@
         body.appendChild(el('dl', { class: 'kv' }, [el('dt', { text: 'Sheet' }), el('dd', null, [link]), el('dt', { text: 'Tab' }), el('dd', { text: d.tab || '' })]));
         body.appendChild(el('p', { class: 'hint', text: 'Reload reads this tab again. To read a different sheet, load its link under Load data.' }));
       } else if (d.type === 'file') {
-        body.appendChild(el('p', { class: 'hint', text: 'A file source has no connection: drop a new version of the file under Load data to replace or add to it.' }));
+        renderFileSettings(d, body, i);
+      }
+    }
+
+    // -- a file source: one uploaded file, or every file matching a pattern in a server folder --
+    function suggestName(pattern) {
+      var name = sanitize(pattern.replace(/\[[^\]]*\]/g, '*').replace(/[*?]+/g, ' aggregated '));
+      return name.replace(/aggregated(_aggregated)+/g, 'aggregated');
+    }
+
+    function fileList(files, count) {
+      if (!count) return el('div', { class: 'empty', text: 'No file matches.' });
+      var rows = files.map(function (f) { return [f.name, fmtBytes(f.size), fmtTime(f.modified)]; });
+      var box = el('div', { class: 'table-wrap db-list' }, [dataTable(['File', 'Size', 'Modified'], rows)]);
+      return count > files.length ? el('div', null, [box, el('p', { class: 'hint', text: 'Showing the first ' + fmtInt(files.length) + ' of ' + fmtInt(count) + '.' })]) : box;
+    }
+
+    function renderFileSettings(d, body, i) {
+      i.folder = ssInput('text', d.folder, 'C:\\data\\ledgers');
+      i.pattern = ssInput('text', d.pattern || d.filename || '', 'ledger_*.csv');
+      i.name = ssInput('text', d.name);
+      var nameNote = el('span', { class: 'note' });
+      var setNameNote = function () {
+        var n = i.name.value.trim();
+        nameNote.textContent = n && n !== d.name ? 'Renames the source, and its table to eyetable_raw.' + n + '__data (its groups, tags and settings follow).'
+          : 'Its table is eyetable_raw.' + d.name + '__data.';
+      };
+      var nameTouched = false;
+      i.name.addEventListener('input', function () { nameTouched = true; setNameNote(); });
+      var files = el('div', { style: 'display:grid; gap:6px' });
+      var check = el('button', { type: 'button', class: 'btn small', text: 'Show matching files' });
+      var showMatches = function () {
+        var folder = i.folder.value.trim(), pattern = i.pattern.value.trim();
+        clear(files);
+        if (!folder || !pattern) { files.appendChild(el('p', { class: 'hint', style: 'margin:0', text: 'Give the folder and the file name or pattern first.' })); return; }
+        check.disabled = true;
+        api('/api/files/match', { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify({ folder: folder, pattern: pattern }) }).then(function (r) {
+          clear(files);
+          files.appendChild(el('p', { style: 'margin:0', text: plural(r.count, 'file') + ' in ' + folder + ' match ' + pattern +
+            (r.count ? '. Reload loads all of them into one table: a column found in any file becomes a column, empty for rows from files without it.' : '.') }));
+          files.appendChild(fileList(r.files, r.count));
+        }, function (err) { clear(files).appendChild(banner('err', err.message)); }).then(function () { check.disabled = false; });
+      };
+      check.addEventListener('click', showMatches);
+      i.pattern.addEventListener('input', function () {
+        var p = i.pattern.value.trim();
+        if (!nameTouched && /[*?\[]/.test(p)) { i.name.value = suggestName(p); setNameNote(); }
+      });
+      setNameNote();
+
+      body.appendChild(el('p', { class: 'hint', style: 'margin:0', text: d.pattern
+        ? 'This source reads every file matching ' + d.pattern + ' in ' + d.folder + ' on the eyetable server, each time it loads (Reload, groups and schedules).'
+        : 'This source holds the file' + (d.filename ? ' ' + d.filename : '') + ' uploaded through this page. To read a set of files instead, give the folder ' +
+          'they are in on the eyetable server and a pattern, for example ledger_*.csv (* stands for any characters, ? for one).' }));
+      body.appendChild(el('div', { class: 'curl-settings' }, [
+        setField('Folder on the eyetable server', i.folder, 'A full path, like C:\\data\\ledgers or \\\\server\\share\\ledgers. Only the folder itself is read, not its subfolders.'),
+        setField('File name or pattern', i.pattern, 'Change ledger_2026-01-02.csv to ledger_*.csv to read every ledger file. CSV, TSV and text files only.'),
+        setField('Source name', i.name, null)
+      ]));
+      body.lastChild.lastChild.appendChild(nameNote);
+      body.appendChild(el('div', { class: 'set-actions' }, [check]));
+      body.appendChild(files);
+      if (d.pattern) {
+        if (d.files_error) files.appendChild(banner('err', d.files_error));
+        else {
+          files.appendChild(el('p', { style: 'margin:0', text: plural(d.file_count, 'file') + ' match now:' }));
+          files.appendChild(fileList(d.files, d.file_count));
+        }
+        i.toUploads = el('input', { type: 'checkbox' });
+        i.toUploads.addEventListener('change', ssChanged);
+        body.appendChild(el('label', { class: 'check' }, [i.toUploads, ' Stop reading the folder: go back to files uploaded through this page']));
       }
     }
 
@@ -2028,6 +2100,11 @@
         out.password = i.password.value || null;
         out.schema = changed(i.schema, d.schema);
         out.table = changed(i.table, d.table);
+      } else if (d.type === 'file') {
+        var folder = i.folder.value.trim(), pattern = i.pattern.value.trim();
+        if (i.toUploads && i.toUploads.checked) out.pattern = '';
+        else if (folder && (folder !== (d.folder || '') || pattern !== (d.pattern || ''))) { out.folder = folder; out.pattern = pattern; }
+        out.name = changed(i.name, d.name);
       } else {
         var secrets = {};
         Object.keys(i.secrets).forEach(function (k) { if (i.secrets[k].value) secrets[k] = i.secrets[k].value; });
@@ -2052,6 +2129,10 @@
       $('ss-save').textContent = changes.test ? 'Checking\u2026' : 'Saving\u2026';
       api('/api/sources/' + encodeURIComponent(name) + '/settings', { method: 'PUT', headers: JSON_HEADERS, body: JSON.stringify(changes) })
         .then(function (d) {
+          if (d.name && d.name !== name) {  // renamed: the source (and its table) go by the new name now
+            if (state.selected === name) state.selected = d.name;
+            name = d.name;
+          }
           ss = { source: name, data: d, dirty: false, files: {} };
           renderSettings();
           var m = clear($('ss-msg'));
