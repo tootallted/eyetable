@@ -346,7 +346,7 @@ whichever source loads them. A table that a source holds alongside others
 says so ("loaded by source …"). Each table row has its own **Reload** and
 **Incremental** buttons, and clicking it opens that table in Preview Data.
 
-**Hiding a source ("commenting it out").** Every row has a **Hide** button.
+**Hiding a source ("commenting it out").** Every row has a **Hide** button at its left.
 A hidden table drops out of the list, and every load skips it: **Reload**,
 the load queue, groups, tag runs and schedules. A group's run lists it as
 *skipped (hidden)*, which doesn't count as a failure. Its data stays in

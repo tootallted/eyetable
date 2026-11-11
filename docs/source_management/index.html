@@ -296,14 +296,24 @@
   .incr-list { display: grid; gap: 6px; }
   .incr-list label { display: flex; gap: 8px; align-items: baseline; font-size: 14px; cursor: pointer; }
   .incr-list label .why { color: var(--muted); font-size: 13px; }
-  .load-btns { display: inline-flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+  /* Reload and Incremental: two fixed slots side by side, never wrapped; a blank slot when there's no incremental load */
+  .load-btns { display: inline-flex; gap: 6px; flex-wrap: nowrap; white-space: nowrap; align-items: center; }
+  .load-btns > .btn, .load-btns > .load-slot { flex: none; width: 112px; box-sizing: border-box; justify-content: center; padding-left: 6px; padding-right: 6px; }
+  .load-btns > .load-slot { display: inline-block; }
+  .sources-table td.actions { white-space: nowrap; width: 1%; }
+  .sources-table th.hide-col, .sources-table td.hide-col { width: 1%; padding-right: 4px; white-space: nowrap; }
+  @media (min-width: 901px) {  /* names may wrap, but not down to a few letters a line */
+    .sources-table th, .sources-table td { padding-left: 7px; padding-right: 7px; }
+    .sources-table td.wrap { min-width: 9.5em; }
+    .sources-table td.mono.wrap { min-width: 12.5em; }
+  }
   .key-cols tr.chosen td { background: var(--accent-soft); }
   .sources-table tr.conn td { background: var(--surface-2); font-weight: 600; }
-  .sources-table tr.conn td:first-child { white-space: normal; }
+  .sources-table tr.conn td:nth-child(2) { white-space: normal; }
   .conn-caret { display: inline-block; width: 16px; color: var(--muted); transition: transform .12s; }
   .sources-table tr.conn.open .conn-caret { transform: rotate(90deg); }
   @media (prefers-reduced-motion: reduce) { .conn-caret { transition: none; } }
-  .sources-table tr.member > td:first-child { padding-left: 32px; }
+  .sources-table tr.member > td:nth-child(2) { padding-left: 18px; }
   .sources-table tr.sub td { background: var(--surface-2); font-size: 12.5px; padding-top: 5px; padding-bottom: 5px; }
   .sources-table .sub-name { display: inline-block; padding-left: 18px; font-family: var(--mono); }
   .tbl-count { display: inline-flex; align-items: center; gap: 6px; }
@@ -386,7 +396,10 @@
     .sources-table td > * { justify-self: start; }
     .sources-table tr.sub { margin-left: 14px; border-left: 3px solid var(--border); }
     .sources-table tr.member { margin-left: 10px; border-left: 3px solid var(--accent-soft); }
-    .sources-table tr.member > td:first-child { padding-left: 0; }
+    .sources-table tr.member > td:nth-child(2) { padding-left: 0; }
+    /* the Hide and load-button cells have no label: they take the whole width */
+    .sources-table td.actions, .sources-table td.hide-col { display: block; width: auto; padding: 4px 0; }
+    .sources-table td.actions::before, .sources-table td.hide-col::before { content: none; }
     .sources-table tr.conn td { font-weight: 400; }
     .sources-table tr.conn td:empty { display: none; }
     .sources-table .sub-name { padding-left: 0; }
@@ -1422,7 +1435,7 @@
     // The two header rows: a sort button per column, then a filter box per column.
     function sfHead(cols, view, onSort, onFilter) {
       var heads = cols.map(function (c) {
-        var th = el('th', { class: c.num ? 'num' : '', scope: 'col' });
+        var th = el('th', { class: (c.num ? 'num' : '') + (c.cls ? ' ' + c.cls : ''), scope: 'col' });
         if (c.sort === false || !c.label) { th.textContent = c.label || ''; return th; }
         var on = view.sort === c.key;
         th.setAttribute('aria-sort', on ? (view.dir > 0 ? 'ascending' : 'descending') : 'none');
@@ -1440,7 +1453,7 @@
         return th;
       });
       var filters = cols.map(function (c) {
-        var th = el('th', { class: c.num ? 'num' : '' });
+        var th = el('th', { class: (c.num ? 'num' : '') + (c.cls ? ' ' + c.cls : '') });
         if (c.filter === false || !c.label) return th;
         var box = el('input', { type: 'search', class: 'sf-filter', placeholder: 'Filter ' + c.label.toLowerCase(), 'aria-label': 'Filter by ' + c.label,
           title: c.numeric ? 'Part of the value, or a comparison such as >100, <=5 or =0' : 'Shows rows whose ' + c.label + ' contains this', spellcheck: 'false', autocomplete: 'off' });
@@ -1465,6 +1478,7 @@
 
     function sourceTimeValue(s) { return s.last_loaded_at || s.updated_at || ''; }
     var SOURCE_COLS = [
+      { key: 'hide', label: '', sort: false, filter: false, cls: 'hide-col' },
       { key: 'name', label: 'Source', value: function (s) { return s.name; },
         text: function (s) { return s.name + ' ' + (s.source || '') + ' ' + (s.connection ? s.connection.label : ''); } },
       { key: 'tags', label: 'Tags', value: function (s) { return (s.tags || []).join(' '); },
@@ -1561,6 +1575,17 @@
       rows.forEach(function (r) { body.appendChild(r); });
     }
 
+    // A name as text with line-break chances after each _ and . (copying it still gives the plain name).
+    function breakable(text) {
+      var out = [];
+      String(text).split(/([_.])/).forEach(function (part) {
+        if (!part) return;
+        out.push(part);
+        if (part === '_' || part === '.') out.push(el('wbr'));
+      });
+      return out;
+    }
+
     // One table of a database source, shaped like a source so it sorts and filters with the others.
     function dbTableEntry(s, t) {
       return { name: t.name, source: s.name, tags: s.tags, type: s.type, table: t.table, schema: t.schema, hidden: !!t.hidden,
@@ -1572,18 +1597,19 @@
       var s = e._src, t = e._t;
       var picked = state.pickedTable[s.name] || s.tables[0].table;
       var selected = s.name === state.selected && picked === t.table;
-      var name = [el('strong', { text: t.name })];
+      var name = [el('strong', null, breakable(t.name))];
       if (t.name !== s.name) name.push(el('div', { class: 'muted', style: 'font-size:12px; font-weight:400', text: 'loaded by source ' + s.name }));
       var tr = el('tr', { class: 'clickable' + (member ? ' member' : '') + (selected ? ' selected' : ''), tabindex: '0',
         title: t.schema + '.' + t.name + (t.name !== s.name ? ', one of the tables of source ' + s.name : '') }, [
+        hideCell(s, t),
         el('td', { class: 'wrap', 'data-label': 'Table' }, name),
         el('td', { 'data-label': 'Tags' }, [tagsCell(s)]),
         el('td', { 'data-label': 'Type' }, [el('span', { class: 'tag', text: typeLabel(s.type) })]),
-        el('td', { class: 'mono wrap', 'data-label': 'Loaded into', text: 'eyetable_raw.' + t.table }),
+        el('td', { class: 'mono wrap', 'data-label': 'Loaded into' }, breakable('eyetable_raw.' + t.table)),
         el('td', { class: 'num', 'data-label': 'Rows', text: t.rows === null || t.rows === undefined ? '\u2014' : fmtInt(t.rows) }),
         el('td', { 'data-label': 'Columns', text: t.columns ? plural(t.columns, 'column') : '\u2014' }),
         el('td', { 'data-label': 'Last loaded', text: t.last_loaded_at ? fmtTime(t.last_loaded_at) : 'Not loaded yet' }),
-        el('td', null, [rowActions(s, s.tables.length > 1 ? t : null, t)])
+        el('td', { class: 'actions' }, t.hidden ? [] : [loadButtons(s, s.tables.length > 1 ? t : null)])
       ]);
       var pick = function () {
         state.pickedTable[s.name] = t.table;
@@ -1623,6 +1649,7 @@
       var caret = el('span', { class: 'conn-caret', 'aria-hidden': 'true', text: '\u25b8' });
       var tr = el('tr', { class: 'clickable conn' + (open ? ' open' : ''), tabindex: '0', 'aria-expanded': String(open),
         title: (open ? 'Close ' : 'Open ') + connection.label + ' to ' + (open ? 'hide' : 'show') + ' its ' + plural(members.length, allTables ? 'table' : 'source') }, [
+        el('td', { class: 'hide-col' }),
         el('td', { class: 'wrap', 'data-label': 'Connection' }, [el('span', null, [caret, el('strong', { text: connection.label })])]),
         el('td', { 'data-label': '' }),
         el('td', { 'data-label': 'Type' }, types.map(function (t) { return el('span', { class: 'tag', text: t }); })),
@@ -1650,14 +1677,15 @@
         var several = s.tables && s.tables.length > 1;
         var open = several && !!state.expanded[s.name];
         var tr = el('tr', { class: 'clickable' + (member ? ' member' : '') + (s.name === state.selected ? ' selected' : ''), tabindex: '0' }, [
-          el('td', { class: 'wrap', 'data-label': 'Source' }, [el('strong', { text: s.name })]),
+          hideCell(s, null),
+          el('td', { class: 'wrap', 'data-label': 'Source' }, [el('strong', null, breakable(s.name))]),
           el('td', { 'data-label': 'Tags' }, [tagsCell(s)]),
           el('td', { 'data-label': 'Type' }, [el('span', { class: 'tag', text: typeLabel(s.type) })]),
-          s.tables ? tablesCell(s, open) : el('td', { class: 'mono wrap', 'data-label': 'Table', text: s.table ? 'eyetable_raw.' + s.table : s.datasets + ' dataset(s)' }),
+          s.tables ? tablesCell(s, open) : el('td', { class: 'mono wrap', 'data-label': 'Table' }, s.table ? breakable('eyetable_raw.' + s.table) : [s.datasets + ' dataset(s)']),
           el('td', { class: 'num', 'data-label': 'Rows', text: s.table ? fmtInt(s.rows) : '—' }),
           el('td', { class: 'wrap', 'data-label': 'Last file', text: s.last_upload ? s.last_upload.filename : '—' }),
           el('td', { 'data-label': 'Last loaded', text: fmtTime(s.last_loaded_at || s.updated_at), title: s.last_loaded_at ? 'Last time data finished loading' : 'Not loaded yet' }),
-          el('td', null, [rowActions(s, null, null)])
+          el('td', { class: 'actions' }, s.hidden ? [] : [loadButtons(s)])
         ]);
         // a source with several tables opens to a row per table
         var pick = function () {
@@ -1692,10 +1720,11 @@
 
     function tableRow(s, t, member) {
       return el('tr', { class: 'sub' + (member ? ' member' : '') }, [
+        el('td', { class: 'hide-col' }),
         el('td', { class: 'wrap', 'data-label': 'Table' }, [el('span', { class: 'sub-name', text: t.schema + '.' + t.name })]),
         el('td', { 'data-label': '' }),
         el('td', { 'data-label': 'Type' }, [el('span', { class: 'tag', text: t.kind })]),
-        el('td', { class: 'mono wrap', 'data-label': 'Loaded into', text: 'eyetable_raw.' + t.table }),
+        el('td', { class: 'mono wrap', 'data-label': 'Loaded into' }, breakable('eyetable_raw.' + t.table)),
         el('td', { class: 'num', 'data-label': 'Rows', text: t.rows === null || t.rows === undefined ? '\u2014' : fmtInt(t.rows) }),
         el('td', { 'data-label': 'Columns', text: t.columns ? plural(t.columns, 'column') : '' }),
         el('td', { 'data-label': 'Last loaded', text: t.last_loaded_at ? fmtTime(t.last_loaded_at) : 'Not loaded yet' }),
@@ -3777,14 +3806,13 @@
       return s.incremental ? [{ table: s.table, incremental: s.incremental }] : [];
     }
 
-    // A row's actions: Reload / Incremental and Hide; in the hidden view, Unhide.
-    function rowActions(s, target, t) {
+    // The first cell of a row: Hide, or (in the hidden view) Unhide.
+    function hideCell(s, t) {
       var table = t ? t.table : s.table;
       var what = t ? t.name : s.name;
       var hidden = t ? !!t.hidden : !!s.hidden;
-      var box = el('span', { class: 'load-btns' });
-      if (!hidden) box.appendChild(loadButtons(s, target));
-      if (!table) return box;
+      var cell = el('td', { class: 'hide-col', 'data-label': '' });
+      if (!table) return cell;
       var b = el('button', { type: 'button', class: 'btn small' + (hidden ? ' primary' : ' hide-btn'), text: hidden ? 'Unhide' : 'Hide',
         title: hidden ? 'Show ' + what + ' in Sources again, and load it again with groups and schedules'
           : 'Hide ' + what + ' from Sources (comment it out): Reload, groups and schedules skip it until you unhide it',
@@ -3794,8 +3822,8 @@
         setHidden(table, what, !hidden);
       });
       b.addEventListener('keydown', function (e) { e.stopPropagation(); });
-      box.appendChild(b);
-      return box;
+      cell.appendChild(b);
+      return cell;
     }
 
     function setHidden(table, what, hide) {
@@ -3814,7 +3842,9 @@
     function loadButtons(s, t) {
       var target = t ? { table: t.table, incremental: t.incremental, label: t.schema + '.' + t.name } : null;
       var box = el('span', { class: 'load-btns' }, [loadButton(s, target, false)]);
-      if (s.type !== 'file') box.appendChild(loadButton(s, target, true));
+      var tables = incrementalTables(s, target);
+      var queued = queuedLoad(s.name, target && s.tables && s.tables.length > 1 ? target.table : null, true);
+      box.appendChild(tables && (tables.length || queued) ? loadButton(s, target, true) : el('span', { class: 'load-slot', 'aria-hidden': 'true' }));
       return box;
     }
 
