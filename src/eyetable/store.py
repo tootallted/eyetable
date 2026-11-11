@@ -309,6 +309,13 @@ class CoreStore:
             sa.Column("column_name", sa.Text, nullable=False),
             sa.Column("set_at", UTCDateTime(), nullable=False),
         )
+        # Tables hidden in Sources ("commented out"): every load skips them (see Engine.reload_source).
+        self.hidden_tables = sa.Table(
+            "hidden_tables",
+            self.metadata,
+            sa.Column("table_name", sa.Text, primary_key=True),
+            sa.Column("hidden_at", UTCDateTime(), nullable=False),
+        )
         self.uploads = sa.Table(
             "uploads",
             self.metadata,
@@ -678,6 +685,7 @@ class CoreStore:
             conn.execute(sa.text(f"DROP TABLE IF EXISTS {self.qualified(table)}"))
             conn.execute(sa.delete(self.table_keys).where(self.table_keys.c.table_name == table))
             conn.execute(sa.delete(self.table_increments).where(self.table_increments.c.table_name == table))
+            conn.execute(sa.delete(self.hidden_tables).where(self.hidden_tables.c.table_name == table))
 
     # -- key scans and natural keys ------------------------------------------
 
@@ -701,6 +709,19 @@ class CoreStore:
     def save_table_key(self, table: str, columns: list[str] | None) -> None:
         """Set (or, with None, clear) the natural key of a table."""
         self._upsert_key_row(table, key_columns=columns, key_set_at=_now() if columns else None)
+
+    # -- hidden tables -----------------------------------------------------------
+
+    def hidden(self) -> set[str]:
+        """The tables hidden in Sources, which loads skip."""
+        with self.db.connect() as conn:
+            return set(conn.execute(sa.select(self.hidden_tables.c.table_name)).scalars())
+
+    def set_hidden(self, table: str, hidden: bool) -> None:
+        with self.db.begin() as conn:
+            conn.execute(sa.delete(self.hidden_tables).where(self.hidden_tables.c.table_name == table))
+            if hidden:
+                conn.execute(sa.insert(self.hidden_tables).values(table_name=table, hidden_at=_now()))
 
     # -- incremental loads ----------------------------------------------------
 

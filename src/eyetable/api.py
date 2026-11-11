@@ -185,6 +185,10 @@ class QueueIn(BaseModel):
     google_token: str | None = Field(default=None, max_length=4096)  # a private Google Sheet
 
 
+class HiddenIn(BaseModel):
+    hidden: bool
+
+
 class SplitIn(BaseModel):
     column: str | None = Field(default=None, max_length=128)  # None: read in one query
 
@@ -314,6 +318,7 @@ def create_app(
         """Each table a database source loads, with its rows and when it last loaded."""
         loads = store.table_loads(src.name)
         increments = store.increments()
+        hidden = store.hidden()
         catalog = {d.key: d for d in datasets}
         out = []
         for item in dbconnect.db_tables(src.config):
@@ -323,7 +328,7 @@ def create_app(
             rows = written if mode == "replace" else store.count_rows(table)
             out.append({"key": item["key"], "schema": item["schema"], "name": item["table"], "kind": item.get("kind", "table"),
                         "table": table, "rows": rows, "last_loaded_at": finished, "incremental": increments.get(table),
-                        "split": (item.get("split") or {}).get("column"),
+                        "split": (item.get("split") or {}).get("column"), "hidden": table in hidden,
                         "columns": len(catalog[item["key"]].columns) if item["key"] in catalog else None})
         return out
 
@@ -360,6 +365,7 @@ def create_app(
             uploads = store.list_uploads(src.name, limit=1)
             summary.update(
                 table=table,
+                hidden=table in store.hidden(),
                 incremental=store.get_increment(table),
                 rows=store.count_rows(table),
                 columns=len(datasets[0].columns) if datasets else None,
@@ -824,6 +830,18 @@ def create_app(
         except keys.KeyProblem as exc:
             raise HTTPException(400, str(exc)) from None
 
+    # -- hiding a table in Sources ("commenting it out"): every load skips it --------
+    @app.put("/api/tables/{table}/hidden", dependencies=auth)
+    def set_hidden(table: str, body: HiddenIn) -> dict[str, Any]:
+        """Hide a source's table from Sources and from every load (groups, schedules, Reload), or bring it back."""
+        for src in store.list_sources():
+            tables = [table_name(src.name, i["name"]) for i in dbconnect.db_tables(src.config)] if src.type == "dbtable" \
+                else [table_name(src.name, DATASET_KEY)] if src.type in SINGLE_TABLE_TYPES else []
+            if table in tables:
+                store.set_hidden(table, body.hidden)
+                return jsonable_encoder({"table": table, "source": src.name, "hidden": body.hidden})
+        raise HTTPException(404, f"no source loads a table named {table}")
+
     # -- big tables read in parts (connectors/dbtable.py read_in_parts) ----------
     def db_table_item(table: str):
         """The database source and table entry that load `table`."""
@@ -1015,7 +1033,7 @@ def create_app(
             raise sheet_error(exc) from None
         except (ValueError, KeyError) as exc:
             raise HTTPException(400, str(exc).strip("'\"")) from None
-        failed = [r for r in results if r.status != "succeeded"]
+        failed = [r for r in results if r.status == "failed"]
         if failed:
             raise HTTPException(500, "; ".join(f"{r.dataset_key}: {r.error}" for r in failed))
         return jsonable_encoder({
@@ -1032,7 +1050,7 @@ def create_app(
 
         def work() -> dict[str, Any]:
             results = engine.reload_source(name, incremental=incremental_)
-            failed = [r for r in results if r.status != "succeeded"]
+            failed = [r for r in results if r.status == "failed"]
             if failed:
                 raise RuntimeError("; ".join(r.error or r.status for r in failed))
             return jsonable_encoder({"source": source_summary(store.get_source(name)), "rows": sum(r.rows for r in results),

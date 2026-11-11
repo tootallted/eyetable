@@ -346,6 +346,18 @@ whichever source loads them. A table that a source holds alongside others
 says so ("loaded by source …"). Each table row has its own **Reload** and
 **Incremental** buttons, and clicking it opens that table in Preview Data.
 
+**Hiding a source ("commenting it out").** Every row has a **Hide** button.
+A hidden table drops out of the list, and every load skips it: **Reload**,
+the load queue, groups, tag runs and schedules. A group's run lists it as
+*skipped (hidden)*, which doesn't count as a failure. Its data stays in
+`eyetable_raw` and stays queryable.
+
+Hiding works per table, so one table of a database source can be hidden while
+the source's other tables keep loading. When something is hidden, **Show hidden
+(N)** at the top of Sources switches the list to the hidden tables, each with
+**Unhide**. **Back to sources** returns to the list. API:
+`PUT /api/tables/<table>/hidden` with `{"hidden": true}` (or `false`).
+
 **Sorting.** Click a column header to sort by it. Click again to reverse the
 order, and a third time to go back to the usual order. Rows and Last loaded
 sort high-to-low first. Blank values always sort last, and the browser

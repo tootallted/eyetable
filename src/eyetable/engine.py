@@ -40,7 +40,7 @@ class RunResult:
     run_id: int
     dataset_key: str
     table: str
-    status: str  # "succeeded" | "failed"
+    status: str  # "succeeded" | "failed" | "skipped" (the table is hidden in Sources)
     rows: int
     error: str | None = None
     upload_id: int | None = None
@@ -570,6 +570,23 @@ class Engine:
                     raise ValueError(f"{source} has no table {table}")
             elif table != table_name(source, DATASET_KEY):
                 raise ValueError(f"{source} has no table {table}")
+        # Tables hidden in Sources are skipped by every load: groups, schedules, the queue.
+        hidden = self.store.hidden()
+        skipped: list[RunResult] = []
+        if src.type == "dbtable":
+            from eyetable import dbconnect
+
+            items = dbconnect.db_tables(src.config)
+            wanted = keys_ if keys_ is not None else [i["key"] for i in items]
+            for i in items:
+                t = table_name(source, i["name"])
+                if i["key"] in wanted and t in hidden:
+                    skipped.append(RunResult(0, i["key"], t, "skipped", 0, "hidden in Sources"))
+            keys_ = [k for k in wanted if k not in {r.dataset_key for r in skipped}]
+            if not keys_:
+                return skipped
+        elif table_name(source, DATASET_KEY) in hidden:
+            return [RunResult(0, DATASET_KEY, table_name(source, DATASET_KEY), "skipped", 0, "hidden in Sources")]
         if src.type == "file":
             history = [u for u, status in self.store.load_history(source) if status == "succeeded"]
             if not history:
@@ -603,7 +620,7 @@ class Engine:
             if incremental:
                 return [self._sheet_increment(book, tab, source, target)]
             return [self._load_sheet_tab(book, tab, source, target, "replace")]
-        return self.ingest(source, keys=keys_, mode="incremental" if incremental else "replace")
+        return skipped + self.ingest(source, keys=keys_, mode="incremental" if incremental else "replace")
 
     def _sheet_increment(self, book: gsheets.Workbook, tab: gsheets.Tab, source: str, table: str) -> RunResult:
         """Add the tab's rows past the incremental column (the whole tab is fetched; sheets can't be asked for less)."""

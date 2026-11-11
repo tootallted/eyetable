@@ -200,6 +200,11 @@
   .st.succeeded { background: var(--ok-soft); color: var(--ok); }
   .st.partial { background: var(--warn-soft); color: var(--warn); }
   .st.failed { background: var(--err-soft); color: var(--err); }
+  .st.skipped { background: var(--surface-2); color: var(--muted); }
+  .hide-btn { color: var(--muted); }
+  .hidden-note { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; font-size: 13px; padding: 8px 12px; margin-bottom: 8px;
+    border-radius: 8px; background: var(--warn-soft); color: var(--warn); }
+  .toggle-hidden[aria-pressed="true"] { background: var(--warn-soft); color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, transparent); }
   .st.running { background: var(--accent-soft); color: var(--accent); }
   .muted { color: var(--muted); }
   .editor { border: 1px solid var(--accent); border-radius: 12px; padding: 16px; display: grid; gap: 16px; }
@@ -730,6 +735,7 @@
   <section class="card" data-fold="sources" aria-labelledby="sources-title">
     <div class="card-head">
       <h2 id="sources-title"><button class="fold" type="button" aria-expanded="true" aria-controls="sources-body"><span class="tri"></span>Sources</button></h2>
+      <button class="btn small toggle-hidden" id="toggle-hidden" type="button" aria-pressed="false" hidden>Show hidden</button>
       <button class="btn small" id="refresh" type="button">Refresh</button>
     </div>
     <div class="card-body" id="sources-body">
@@ -1507,9 +1513,21 @@
         if (s.tables && s.tables.length) s.tables.forEach(function (t) { flat.push(dbTableEntry(s, t)); });
         else flat.push(s);
       });
+      var hiddenCount = flat.filter(function (e) { return e.hidden; }).length;
+      var toggle = $('toggle-hidden');
+      if (!hiddenCount) state.showHidden = false;
+      toggle.hidden = !hiddenCount && !state.showHidden;
+      toggle.textContent = state.showHidden ? 'Back to sources' : 'Show hidden (' + fmtInt(hiddenCount) + ')';
+      toggle.setAttribute('aria-pressed', String(!!state.showHidden));
+      flat = flat.filter(function (e) { return !!e.hidden === !!state.showHidden; });
       var shown = sfApply(flat, SOURCE_COLS, view);
       clear(note);
-      note.hidden = !filtering;
+      note.hidden = !filtering && !state.showHidden;
+      if (state.showHidden) {
+        note.appendChild(el('div', { class: 'hidden-note' }, [
+          el('span', { text: 'Hidden sources: ' + fmtInt(hiddenCount) + '. They stay out of the list, and every load skips them: ' +
+            'Reload, groups, tags and schedules. Their data stays queryable. Unhide one to bring it back.' })]));
+      }
       if (filtering) {
         note.appendChild(el('span', { text: fmtInt(shown.length) + ' of ' + fmtInt(flat.length) + (shown.length === 1 ? ' matches' : ' match') + ' the filters.' }));
         var reset = el('button', { type: 'button', class: 'link', text: 'Clear filters' });
@@ -1538,13 +1556,14 @@
         }
       });
       clear(body);
-      if (!rows.length) rows.push(el('tr', null, [el('td', { colspan: String(SOURCE_COLS.length), class: 'empty', text: 'No source matches the filters.' })]));
+      if (!rows.length) rows.push(el('tr', null, [el('td', { colspan: String(SOURCE_COLS.length), class: 'empty',
+        text: state.showHidden && !filtering ? 'Nothing is hidden.' : 'No source matches the filters.' })]));
       rows.forEach(function (r) { body.appendChild(r); });
     }
 
     // One table of a database source, shaped like a source so it sorts and filters with the others.
     function dbTableEntry(s, t) {
-      return { name: t.name, source: s.name, tags: s.tags, type: s.type, table: t.table, schema: t.schema,
+      return { name: t.name, source: s.name, tags: s.tags, type: s.type, table: t.table, schema: t.schema, hidden: !!t.hidden,
         rows: t.rows === undefined ? null : t.rows, last_upload: null, last_loaded_at: t.last_loaded_at, updated_at: s.updated_at,
         connection: s.connection, _src: s, _t: t };
     }
@@ -1564,7 +1583,7 @@
         el('td', { class: 'num', 'data-label': 'Rows', text: t.rows === null || t.rows === undefined ? '\u2014' : fmtInt(t.rows) }),
         el('td', { 'data-label': 'Columns', text: t.columns ? plural(t.columns, 'column') : '\u2014' }),
         el('td', { 'data-label': 'Last loaded', text: t.last_loaded_at ? fmtTime(t.last_loaded_at) : 'Not loaded yet' }),
-        el('td', null, [loadButtons(s, s.tables.length > 1 ? t : null)])
+        el('td', null, [rowActions(s, s.tables.length > 1 ? t : null, t)])
       ]);
       var pick = function () {
         state.pickedTable[s.name] = t.table;
@@ -1638,7 +1657,7 @@
           el('td', { class: 'num', 'data-label': 'Rows', text: s.table ? fmtInt(s.rows) : '—' }),
           el('td', { class: 'wrap', 'data-label': 'Last file', text: s.last_upload ? s.last_upload.filename : '—' }),
           el('td', { 'data-label': 'Last loaded', text: fmtTime(s.last_loaded_at || s.updated_at), title: s.last_loaded_at ? 'Last time data finished loading' : 'Not loaded yet' }),
-          el('td', null, [loadButtons(s)])
+          el('td', null, [rowActions(s, null, null)])
         ]);
         // a source with several tables opens to a row per table
         var pick = function () {
@@ -3334,7 +3353,8 @@
 
     function runSummary(run) {
       var ok = run.results.filter(function (r) { return r.status === 'succeeded'; }).length;
-      return ok + ' of ' + run.results.length + ' reloaded';
+      var skipped = run.results.filter(function (r) { return r.status === 'skipped'; }).length;
+      return ok + ' of ' + (run.results.length - skipped) + ' reloaded' + (skipped ? ', ' + skipped + ' skipped (hidden)' : '');
     }
 
     // A tag's run state, shaped like a group so running and progress work the same way.
@@ -3439,7 +3459,7 @@
           renderGroups();
           if (g.running) { setTimeout(tick, 1500); return; }
           delete groupsState.polling[g.id];
-          var failed = run.results.filter(function (r) { return r.status !== 'succeeded'; });
+          var failed = run.results.filter(function (r) { return r.status === 'failed'; });
           var text = g.name + ': ' + runSummary(run) + '.';
           if (failed.length) text += ' ' + failed.map(function (r) { return r.source + ' (' + (r.error || r.status) + ')'; }).join('; ');
           var b = banner(run.status === 'succeeded' ? 'ok' : run.status === 'partial' ? 'warn' : 'err', text);
@@ -3757,6 +3777,40 @@
       return s.incremental ? [{ table: s.table, incremental: s.incremental }] : [];
     }
 
+    // A row's actions: Reload / Incremental and Hide; in the hidden view, Unhide.
+    function rowActions(s, target, t) {
+      var table = t ? t.table : s.table;
+      var what = t ? t.name : s.name;
+      var hidden = t ? !!t.hidden : !!s.hidden;
+      var box = el('span', { class: 'load-btns' });
+      if (!hidden) box.appendChild(loadButtons(s, target));
+      if (!table) return box;
+      var b = el('button', { type: 'button', class: 'btn small' + (hidden ? ' primary' : ' hide-btn'), text: hidden ? 'Unhide' : 'Hide',
+        title: hidden ? 'Show ' + what + ' in Sources again, and load it again with groups and schedules'
+          : 'Hide ' + what + ' from Sources (comment it out): Reload, groups and schedules skip it until you unhide it',
+        'aria-label': (hidden ? 'Unhide ' : 'Hide ') + what });
+      b.addEventListener('click', function (e) {
+        e.stopPropagation();
+        setHidden(table, what, !hidden);
+      });
+      b.addEventListener('keydown', function (e) { e.stopPropagation(); });
+      box.appendChild(b);
+      return box;
+    }
+
+    function setHidden(table, what, hide) {
+      var msg = clear($('sources-msg'));
+      api('/api/tables/' + encodeURIComponent(table) + '/hidden', { method: 'PUT', headers: JSON_HEADERS, body: JSON.stringify({ hidden: hide }) })
+        .then(function () {
+          var undo = el('button', { type: 'button', class: 'link', text: 'Undo' });
+          undo.addEventListener('click', function () { setHidden(table, what, !hide); });
+          msg.appendChild(el('div', { class: 'banner ok' }, [hide
+            ? what + ' is hidden: Reload, groups and schedules skip it. Show hidden lists it again. '
+            : what + ' is back in Sources and loads with its groups and schedules again. ', undo]));
+          return refreshSourcesOnly();
+        }, function (err) { msg.appendChild(banner('err', err.message)); });
+    }
+
     function loadButtons(s, t) {
       var target = t ? { table: t.table, incremental: t.incremental, label: t.schema + '.' + t.name } : null;
       var box = el('span', { class: 'load-btns' }, [loadButton(s, target, false)]);
@@ -3960,6 +4014,12 @@
       }
       return box;
     }
+
+    state.showHidden = false;
+    $('toggle-hidden').addEventListener('click', function () {
+      state.showHidden = !state.showHidden;
+      renderSources();
+    });
 
     $('queue-clear').addEventListener('click', function () {
       api('/api/queue', { method: 'DELETE' }).then(loadQueue, function () { loadQueue(); });

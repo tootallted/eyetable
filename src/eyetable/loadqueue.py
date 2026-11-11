@@ -75,6 +75,10 @@ class LoadQueue:
             planned = [p for p in planned if p["table"] == table]
             if not planned:
                 raise ValueError(f"{source} has no table {table}")
+        hidden = self.store.hidden()
+        if all(p["table"] in hidden for p in planned):
+            raise ValueError(f"{planned[0]['label'] if table else source} is hidden in Sources; unhide it to load it")
+        planned = [p for p in planned if p["table"] not in hidden]  # every load skips hidden tables
         if incremental:
             chosen = self.store.increments()
             planned = [p for p in planned if p["table"] in chosen]
@@ -190,12 +194,16 @@ class LoadQueue:
             with self._lock:
                 seen: set[str] = set()
                 for r in results:
+                    if r.status == "skipped" and not any(e["table"] == r.table for e in item["tables"]):
+                        continue  # a hidden table that wasn't planned
                     entry = self._entry(item, r.table)
                     # a file source's stored files all build one table: their rows add up
                     rows = r.rows + (entry["rows"] if r.table in seen and r.status == "succeeded" else 0)
                     seen.add(r.table)
                     entry.update(status=r.status, rows=rows if r.status == "succeeded" else entry["rows"], mode=r.mode,
                                  since=r.since, replaced=r.replaced, error=r.error, note=r.note, finished_at=_now())
+                    if r.status == "skipped":
+                        continue
                     if r.status != "succeeded":
                         cancelled = item["cancel"] and "LoadCancelled" in (r.error or "")
                         entry["status"] = "cancelled" if cancelled else "failed"

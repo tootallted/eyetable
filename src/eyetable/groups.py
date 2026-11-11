@@ -182,14 +182,16 @@ class GroupRunner:
                 except Exception as exc:  # one source failing must not stop the rest
                     entry.update(status="failed", error=str(exc).strip("'\"") or type(exc).__name__)
                 else:
-                    failed = [r for r in loads if r.status != "succeeded"]
+                    failed = [r for r in loads if r.status == "failed"]
+                    hidden = loads and all(r.status == "skipped" for r in loads)
                     entry.update(
-                        status="failed" if failed else "succeeded",
+                        status="failed" if failed else "skipped" if hidden else "succeeded",
                         rows=sum(r.rows for r in loads),
-                        error="; ".join(f"{r.dataset_key}: {r.error}" for r in failed) or None,
+                        error="; ".join(f"{r.dataset_key}: {r.error}" for r in failed) or
+                              ("hidden in Sources, so not loaded" if hidden else None),
                     )
                 self.store.update_group_run(run_id, results)
-            ok = sum(1 for r in results if r["status"] == "succeeded")
+            ok = sum(1 for r in results if r["status"] in ("succeeded", "skipped"))  # a hidden source isn't a failure
             status = "succeeded" if ok == len(results) else "failed" if ok == 0 else "partial"
             self.store.update_group_run(run_id, results, status)
             log.info("group %s run %s (%s): %s", name, run_id, status, [r["source"] for r in results])
