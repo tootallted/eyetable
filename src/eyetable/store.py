@@ -806,10 +806,16 @@ class CoreStore:
         target = f"{table}__stg" if mode == "replace" else table
         writer = _TableWriter(self, target, fresh=(mode == "replace"))
         rows = 0
-        for batch in batches:
-            meta = {TIMESTAMP_COLUMN: _now(), SOURCE_COLUMN: origin, RUN_ID_COLUMN: run_id}
-            rows += writer.write(batch, meta)
-        writer.finish(reorder=(mode == "replace"))
+        try:
+            for batch in batches:
+                meta = {TIMESTAMP_COLUMN: _now(), SOURCE_COLUMN: origin, RUN_ID_COLUMN: run_id}
+                rows += writer.write(batch, meta)
+            writer.finish(reorder=(mode == "replace"))
+        except BaseException:
+            if mode == "replace":  # don't leave a half-built staging table behind
+                with self.db.begin() as conn:
+                    conn.execute(sa.text(f"DROP TABLE IF EXISTS {self.qualified(target)}"))
+            raise
         if mode == "replace":
             prep = self.db.dialect.identifier_preparer
             with self.db.begin() as conn:

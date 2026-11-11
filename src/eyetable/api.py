@@ -37,6 +37,7 @@ from eyetable.gsheets import SheetError, fetch_workbook, fetch_workbook_signed_i
 from eyetable.identifiers import SOURCE_NAME, normalize_tag, table_name
 from eyetable.query import MAX_LIMIT, QueryError, QueryRunner
 from eyetable import dbconnect, entra, keys
+from eyetable.loadqueue import LoadQueue
 from eyetable.curl import auth_scheme, clean_statements, components, parse_curl, preview_statements, secret_places, stored_request
 from eyetable.curl import plan as curl_plan
 from eyetable.google_auth import GoogleAuthError, GoogleConnection
@@ -177,6 +178,13 @@ class ReloadIn(BaseModel):
     table: str | None = Field(default=None, max_length=128)  # just this one of a database source's tables
 
 
+class QueueIn(BaseModel):
+    source: str = Field(min_length=1, max_length=64)
+    table: str | None = Field(default=None, max_length=128)  # one of a database source's tables
+    incremental: bool = False
+    google_token: str | None = Field(default=None, max_length=4096)  # a private Google Sheet
+
+
 class IncrementIn(BaseModel):
     column: str = Field(min_length=1, max_length=128)
 
@@ -234,6 +242,8 @@ def create_app(
                 return fetch_workbook_signed_in(url, google_token, max_bytes=max_upload_bytes)
             return fetch_workbook(url, max_bytes=max_upload_bytes)
     app = FastAPI(title="eyetable", version=__version__, docs_url="/api/docs", openapi_url="/api/openapi.json")
+    load_queue = LoadQueue(engine, sheet_fetch)
+    app.state.load_queue = load_queue
 
     requests_limit = SlidingWindow(requests_per_minute, 60)
     uploads_limit = SlidingWindow(uploads_per_hour, 3600)
@@ -744,6 +754,43 @@ def create_app(
             if found is None:
                 raise HTTPException(404, "no such job (eyetable may have restarted)")
             return jsonable_encoder(dict(found))
+
+    # -- the load queue (loadqueue.py): reloads in the background, with progress ----
+    @app.post("/api/queue", dependencies=auth, status_code=202)
+    def queue_load(body: QueueIn) -> dict[str, Any]:
+        """Queue a full or incremental reload of a source, or of one of its tables."""
+        get_source(body.source)
+        try:
+            item, added = load_queue.add(body.source, body.table, body.incremental, body.google_token)
+        except ValueError as exc:  # includes IncrementalProblem
+            raise HTTPException(400, str(exc).strip("'\"")) from None
+        return jsonable_encoder({"item": item, "added": added})
+
+    @app.get("/api/queue", dependencies=auth)
+    def list_queue() -> dict[str, Any]:
+        return jsonable_encoder({"items": load_queue.list()})
+
+    @app.post("/api/queue/{item_id}/cancel", dependencies=auth)
+    def cancel_load(item_id: str) -> dict[str, Any]:
+        try:
+            return jsonable_encoder(load_queue.cancel(item_id))
+        except KeyError as exc:
+            raise HTTPException(404, str(exc).strip("'\"")) from None
+
+    @app.delete("/api/queue/{item_id}", dependencies=auth)
+    def dismiss_load(item_id: str) -> dict[str, Any]:
+        try:
+            load_queue.dismiss(item_id)
+        except KeyError as exc:
+            raise HTTPException(404, str(exc).strip("'\"")) from None
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from None
+        return {"ok": True}
+
+    @app.delete("/api/queue", dependencies=auth)
+    def clear_queue() -> dict[str, Any]:
+        """Take every finished load off the list."""
+        return {"cleared": load_queue.clear_finished()}
 
     # -- key candidates and natural keys (keys.py) ------------------------------
     TABLE_NAME = re.compile(r"^[A-Za-z0-9_]{1,63}$")

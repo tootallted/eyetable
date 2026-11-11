@@ -158,6 +158,36 @@
   .reload svg { flex: none; }
   .reload.busy svg { animation: spin 1s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
+  /* the load queue */
+  .q-list { display: grid; gap: 10px; }
+  .q-item { border: 1px solid var(--border); border-left: 4px solid var(--accent); border-radius: 8px; padding: 10px 12px; display: grid; gap: 8px; background: var(--surface); }
+  .q-item.q-queued { border-left-color: var(--muted); }
+  .q-item.q-succeeded { border-color: color-mix(in srgb, var(--ok) 40%, transparent); border-left-color: var(--ok); background: var(--ok-soft); }
+  .q-item.q-failed { border-color: color-mix(in srgb, var(--err) 40%, transparent); border-left-color: var(--err); background: var(--err-soft); }
+  .q-item.q-cancelled { border-left-color: var(--muted); opacity: .85; }
+  .q-head { display: flex; gap: 8px 12px; align-items: baseline; flex-wrap: wrap; }
+  .q-head .q-title { font-weight: 600; overflow-wrap: anywhere; }
+  .q-head .q-when { color: var(--muted); font-size: 13px; }
+  .q-head .q-actions { margin-left: auto; display: inline-flex; gap: 6px; }
+  .q-status { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; background: var(--surface-2); color: var(--muted); }
+  .q-running .q-status { background: var(--accent-soft); color: var(--accent); }
+  .q-succeeded .q-status { background: var(--ok); color: #fff; }
+  .q-failed .q-status { background: var(--err); color: #fff; }
+  .q-table { display: grid; grid-template-columns: minmax(120px, 260px) minmax(0, 1fr); gap: 4px 12px; align-items: center; font-size: 13px; }
+  .q-table .q-name { font-family: var(--mono); overflow-wrap: anywhere; }
+  .q-bar { height: 8px; border-radius: 999px; background: color-mix(in srgb, var(--border) 70%, transparent); overflow: hidden; position: relative; }
+  .q-bar > span { position: absolute; inset: 0 auto 0 0; background: var(--accent); border-radius: 999px; transition: width .4s; }
+  .q-succeeded .q-bar > span { background: var(--ok); }
+  .q-failed .q-bar > span { background: var(--err); }
+  .q-bar.unknown > span { width: 30% !important; animation: qslide 1.4s ease-in-out infinite; }
+  @keyframes qslide { from { left: -30%; } to { left: 100%; } }
+  @media (prefers-reduced-motion: reduce) { .q-bar.unknown > span { animation: none; left: 0; } }
+  .q-text { grid-column: 2; color: var(--muted); }
+  .q-errors { display: grid; gap: 6px; }
+  .q-error { background: var(--surface); border: 1px solid color-mix(in srgb, var(--err) 35%, transparent); border-radius: 6px; padding: 6px 10px; color: var(--err); font-size: 13px; overflow-wrap: anywhere; }
+  .q-error details { color: var(--text); margin-top: 4px; }
+  .q-error pre { white-space: pre-wrap; font-size: 12px; max-height: 260px; overflow: auto; margin: 6px 0 0; }
+  @media (max-width: 600px) { .q-table { grid-template-columns: 1fr; } .q-text { grid-column: 1; } }
   @media (prefers-reduced-motion: reduce) { .reload.busy svg { animation: none; } }
   .groups-table td { white-space: normal; }
   .groups-table td.nowrap { white-space: nowrap; }
@@ -684,6 +714,19 @@
     </div>
   </section>
 
+  <section class="card" id="queue-card" data-fold="queue" hidden aria-labelledby="queue-title">
+    <div class="card-head">
+      <h2 id="queue-title"><button class="fold" type="button" aria-expanded="true" aria-controls="queue-body"><span class="tri"></span>Load queue</button></h2>
+      <span class="muted" id="queue-summary" style="font-size:13px"></span>
+      <button class="btn small" id="queue-clear" type="button" hidden>Clear finished</button>
+    </div>
+    <div class="card-body" id="queue-body">
+      <p class="hint" style="margin:0">Reloads run here in the background, so the page stays usable while big tables load. Each shows
+        its rows so far against the table&rsquo;s row count before the load.</p>
+      <div class="q-list" id="queue-list" aria-live="polite"></div>
+    </div>
+  </section>
+
   <section class="card" data-fold="sources" aria-labelledby="sources-title">
     <div class="card-head">
       <h2 id="sources-title"><button class="fold" type="button" aria-expanded="true" aria-controls="sources-body"><span class="tri"></span>Sources</button></h2>
@@ -1207,6 +1250,7 @@
         loadSchema();
         loadGroups();
         loadGoogleConnection();
+        loadQueue();
         if (groupsState.editing) renderEditor();
         if (state.selected) selectSource(state.selected);
       }, function (err) {
@@ -3636,7 +3680,6 @@
 
     // -- reloading a source ----------------------------------------------------
     var RELOAD_ICON = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 4v5h-5"/></svg>';
-    var reloading = {};
 
     function reloadPrompt(s) {
       if (s.type === 'file') return null;  // replays the stored files: the table comes back as it was
@@ -3665,8 +3708,8 @@
     }
 
     function loadButton(s, target, incremental, text) {
-      var busyKey = s.name + (target && s.tables && s.tables.length > 1 ? '/' + target.table : '');
-      var busy = reloading[busyKey] === (incremental ? 'inc' : 'full');
+      var queued = queuedLoad(s.name, target && s.tables && s.tables.length > 1 ? target.table : null, incremental);
+      var busy = !!queued;
       var what = target ? (target.label || target.table) : s.name;
       var tables = incremental ? incrementalTables(s, target) : null;
       var b = el('button', { type: 'button', class: 'btn small reload' + (busy ? ' busy' : ''), 'aria-label': (incremental ? 'Incremental load of ' : 'Reload ') + what });
@@ -3678,8 +3721,9 @@
           : target ? 'Load this table again in full' : 'Pull the data from the source again';
       }
       b.innerHTML = RELOAD_ICON;
-      b.appendChild(document.createTextNode(busy ? (incremental ? 'Loading new\u2026' : 'Reloading\u2026') : text || (incremental ? 'Incremental' : 'Reload')));
-      b.disabled = !!reloading[busyKey] || (incremental && !tables.length);
+      b.appendChild(document.createTextNode(busy ? (queued.status === 'queued' ? 'Queued' : 'Loading\u2026') : text || (incremental ? 'Incremental' : 'Reload')));
+      if (busy) b.title = 'In the load queue above';
+      b.disabled = busy || (incremental && !tables.length);
       b.addEventListener('click', function (e) {
         e.stopPropagation();  // the row itself opens the source's details
         reloadSource(s, false, { incremental: incremental, table: target ? target.table : null,
@@ -3689,63 +3733,178 @@
       return b;
     }
 
-    function loadSummary(s, r, opts) {
-      var res = r.results || [];
-      if (!opts.incremental) return (opts.label ? opts.label + ' of ' : '') + s.name + ' reloaded: ' +
-        plural(opts.label && res.length ? res.reduce(function (n, x) { return n + x.rows; }, 0)
-          : r.source.rows !== undefined && r.source.rows !== null ? r.source.rows : r.rows, 'row') + ' at ' + fmtTime(r.source.last_loaded_at) + '.';
-      var parts = res.map(function (x) {
-        if (x.mode !== 'incremental') return x.table + ': the table was empty, so it was loaded in full (' + plural(x.rows, 'row') + ')';
-        if (!x.rows) return x.table + ': nothing new after ' + fmtValue(x.since);
-        if (x.rows === x.replaced) return x.table + ': no new rows (' + plural(x.rows, 'row') + ' at ' + fmtValue(x.since) +
-          ' fetched again, replacing ' + (x.rows === 1 ? 'its older copy' : 'their older copies') + ')';
-        return x.table + ': ' + plural(x.rows, 'row') + ' from ' + fmtValue(x.since) + ' on' + (x.replaced
-          ? ' — ' + fmtInt(x.rows - x.replaced) + ' new, ' + fmtInt(x.replaced) + ' replacing ' + (x.replaced === 1 ? 'its older copy' : 'their older copies')
-          : '');
-      });
-      return 'Incremental load of ' + (opts.label || s.name) + ' done. ' + parts.join('; ') + '.';
-    }
-
     function reloadSource(s, confirmed, opts) {
       opts = opts || {};
-      var busyKey = s.name + (opts.table && s.tables && s.tables.length > 1 ? '/' + opts.table : '');
-      var prompt = opts.incremental ? null : opts.table && s.tables ? 'Reload ' + (opts.label || opts.table) + ' of ' + s.name + '? It is read again in full and replaces what is here.' : reloadPrompt(s);
+      var prompt = opts.incremental ? null : opts.table && s.tables && s.tables.length > 1
+        ? 'Reload ' + (opts.label || opts.table) + ' of ' + s.name + '? It is read again in full and replaces what is here.' : reloadPrompt(s);
       if (prompt && !confirmed && !confirm(prompt)) return;
-      reloading[busyKey] = opts.incremental ? 'inc' : 'full';
-      renderSources();
       var msg = clear($('sources-msg'));
-      var payload = {};
+      var payload = { source: s.name };
       if (s.type === 'gsheet' && googleToken()) payload.google_token = googleToken();
       if (opts.incremental) payload.incremental = true;
       if (opts.table && s.tables && s.tables.length > 1) payload.table = opts.table;
-      var body = JSON.stringify(payload);
-      var path = '/api/sources/' + encodeURIComponent(s.name);
-      var post = { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: body };
-      // A set can outlast a web request, so it runs in the background.
-      (s.statement_count !== undefined
-        ? api(path + '/run', post).then(function (r) { return pollJob(r.job_id); }).then(function (job) {
-            if (job.status !== 'succeeded') throw new Error(job.error || 'the run failed');
-            return job.result;
-          })
-        : api(path + '/reload', post)
-      ).then(function (r) {
-        var text = loadSummary(s, r, opts);
-        msg.appendChild(banner('ok', text));
-        if (state.selected === s.name && $('incr-msg')) { clear($('incr-msg')); }
-        return text;
+      var what = (opts.incremental ? 'Incremental load of ' : 'Reload of ') + (opts.label ? opts.label + ' (' + s.name + ')' : s.name);
+      return api('/api/queue', { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify(payload) }).then(function (r) {
+        upsertQueueItem(r.item);
+        msg.appendChild(banner('ok', r.added ? what + ' is in the load queue.' : what + ' was already in the load queue.'));
+        setTimeout(function () { if (msg.firstChild && /load queue/.test(msg.textContent)) clear(msg); }, 6000);
       }, function (err) {
-        var what = (opts.incremental ? 'The incremental load of ' : '') + (opts.label ? opts.label + ' of ' : '') + s.name + (opts.incremental ? ' failed: ' : ' was not reloaded: ');
         msg.appendChild(s.type === 'gsheet'
-          ? sheetErrorBanner(what, err, function () { reloadSource(s, true, opts); }, 'sources-msg')
-          : banner('err', what + err.message));
-      }).then(function (text) {
-        delete reloading[busyKey];
-        return refresh().catch(function () {}).then(function () {
-          // say it in Preview Data too, when the load was started from there
-          if (text && opts.fromPanel && $('incr-msg')) setTimeout(function () { clear($('incr-msg')).appendChild(banner('ok', text)); }, 600);
-        });
+          ? sheetErrorBanner(what + ' couldn\u2019t start: ', err, function () { reloadSource(s, true, opts); }, 'sources-msg')
+          : banner('err', what + ' couldn\u2019t start: ' + err.message));
       });
     }
+
+    // -- the load queue: reloads run in the background on the server ---------------
+    var queueState = { items: [], timer: null, statuses: null, signature: '' };
+    var QUEUE_ACTIVE = { queued: 1, running: 1 };
+
+    function queuedLoad(source, table, incremental) {
+      return queueState.items.filter(function (i) {
+        return QUEUE_ACTIVE[i.status] && i.source === source && (i.table || null) === (table || null) && !!i.incremental === !!incremental;
+      })[0] || null;
+    }
+
+    function loadQueue() {
+      if (!state.connected) return Promise.resolve();
+      return api('/api/queue').then(function (r) { setQueue(r.items); }, function () {
+        if (queueState.items.some(function (i) { return QUEUE_ACTIVE[i.status]; })) scheduleQueuePoll(5000);
+      });
+    }
+
+    function scheduleQueuePoll(ms) {
+      clearTimeout(queueState.timer);
+      queueState.timer = setTimeout(loadQueue, ms);
+    }
+
+    function upsertQueueItem(item) {
+      var items = queueState.items.filter(function (i) { return i.id !== item.id; });
+      items.unshift(item);
+      setQueue(items);
+    }
+
+    function setQueue(items) {
+      var before = queueState.statuses;
+      var finishedNow = before !== null && items.some(function (i) { return before[i.id] && QUEUE_ACTIVE[before[i.id]] && !QUEUE_ACTIVE[i.status]; });
+      queueState.items = items;
+      queueState.statuses = {};
+      items.forEach(function (i) { queueState.statuses[i.id] = i.status; });
+      renderQueue();
+      // the Sources buttons show Queued / Loading; redraw them only when that changes (typing in a filter keeps its place)
+      var signature = items.filter(function (i) { return QUEUE_ACTIVE[i.status]; }).map(function (i) { return i.id + i.status; }).join(',');
+      if (signature !== queueState.signature) { queueState.signature = signature; if (!finishedNow) renderSources(); }
+      if (finishedNow) refresh().catch(function () {});  // new row counts and load times
+      if (items.some(function (i) { return QUEUE_ACTIVE[i.status]; })) scheduleQueuePoll(1500);
+    }
+
+    function fmtDuration(ms) {
+      var sec = Math.max(0, Math.round(ms / 1000));
+      if (sec < 60) return sec + ' s';
+      var min = Math.floor(sec / 60);
+      if (min < 60) return min + ' min ' + (sec % 60) + ' s';
+      return Math.floor(min / 60) + ' h ' + (min % 60) + ' min';
+    }
+
+    function queueTableText(item, t) {
+      var rows = t.rows || 0;
+      if (t.status === 'waiting') return item.status === 'queued' ? 'Waiting its turn' : 'Waiting';
+      if (t.status === 'skipped') return 'Not loaded';
+      if (t.status === 'failed') return 'Failed' + (rows ? ' after ' + plural(rows, 'row') : '') + '; the table is as it was before (the error is below)';
+      if (t.status === 'cancelled') return 'Cancelled' + (rows ? ' after ' + plural(rows, 'row') : '') + '; the table is as it was before';
+      if (t.status === 'succeeded') {
+        if (t.mode === 'incremental') {
+          if (!rows) return 'Done: nothing new after ' + fmtValue(t.since);
+          return 'Done: ' + plural(rows, 'row') + ' from ' + fmtValue(t.since) + ' on' +
+            (t.replaced ? ' (' + fmtInt(rows - t.replaced) + ' new, ' + fmtInt(t.replaced) + ' replacing older copies)' : '');
+        }
+        return 'Done: ' + plural(rows, 'row') + ' loaded' + (t.before !== null && t.before !== undefined ? ' (it had ' + fmtInt(t.before) + ')' : '');
+      }
+      // loading
+      var text = t.expected ? fmtInt(rows) + ' of ' + fmtInt(t.expected) + ' rows' + (rows <= t.expected ? ' (' + Math.floor(100 * rows / t.expected) + '%)' : '')
+        : item.incremental ? fmtInt(rows) + ' new or changed rows so far' : fmtInt(rows) + ' rows so far (no earlier count to compare with)';
+      if (t.started_at && rows) {
+        var secs = (new Date(t.updated_at || Date.now()) - new Date(t.started_at)) / 1000;
+        var rate = secs > 0 ? rows / secs : 0;
+        if (rate) text += ' \u00b7 ' + fmtInt(Math.round(rate)) + ' rows/s';
+        if (rate && t.expected && rows < t.expected) text += ' \u00b7 about ' + fmtDuration((t.expected - rows) / rate * 1000) + ' left';
+      }
+      return text;
+    }
+
+    function renderQueue() {
+      var items = queueState.items;
+      $('queue-card').hidden = !items.length;
+      var active = items.filter(function (i) { return QUEUE_ACTIVE[i.status]; });
+      var running = active.filter(function (i) { return i.status === 'running'; }).length;
+      var parts = [];
+      if (running) parts.push(fmtInt(running) + ' loading');
+      if (active.length - running) parts.push(fmtInt(active.length - running) + ' waiting');
+      if (items.length - active.length) parts.push(fmtInt(items.length - active.length) + ' finished');
+      $('queue-summary').textContent = parts.join(', ');
+      $('queue-clear').hidden = items.length === active.length;
+      var list = clear($('queue-list'));
+      items.forEach(function (item) { list.appendChild(queueItem(item)); });
+    }
+
+    var QUEUE_STATUS = { queued: 'Waiting', running: 'Loading', succeeded: 'Done', failed: 'Failed', cancelled: 'Cancelled' };
+
+    function queueItem(item) {
+      var title = (item.incremental ? 'Incremental load' : 'Full load') + ' \u00b7 ' + item.label + (item.table ? ' (' + item.source + ')' : '');
+      var when = item.status === 'queued' ? 'added ' + fmtTime(item.created_at)
+        : item.finished_at ? 'took ' + fmtDuration(new Date(item.finished_at) - new Date(item.started_at || item.created_at)) + ', finished ' + fmtTime(item.finished_at)
+        : 'running for ' + fmtDuration(Date.now() - new Date(item.started_at));
+      var actions = el('span', { class: 'q-actions' });
+      if (QUEUE_ACTIVE[item.status]) {
+        var stop = el('button', { type: 'button', class: 'btn small danger', text: item.cancelling ? 'Cancelling\u2026' : 'Cancel' });
+        stop.disabled = !!item.cancelling;
+        stop.addEventListener('click', function () {
+          stop.disabled = true;
+          api('/api/queue/' + item.id + '/cancel', { method: 'POST' }).then(upsertQueueItem, function (err) { alert(err.message); });
+        });
+        actions.appendChild(stop);
+      } else {
+        var dismiss = el('button', { type: 'button', class: 'btn small', text: 'Dismiss' });
+        dismiss.addEventListener('click', function () {
+          api('/api/queue/' + item.id, { method: 'DELETE' }).then(loadQueue, function () { loadQueue(); });
+        });
+        actions.appendChild(dismiss);
+      }
+      var box = el('div', { class: 'q-item q-' + item.status }, [
+        el('div', { class: 'q-head' }, [
+          el('span', { class: 'q-status', text: QUEUE_STATUS[item.status] || item.status }),
+          el('span', { class: 'q-title', text: title }),
+          el('span', { class: 'q-when', text: when }),
+          actions
+        ])
+      ]);
+      item.tables.forEach(function (t) {
+        var known = t.expected && t.status !== 'waiting';
+        var pct = t.status === 'succeeded' ? 100 : known ? Math.min(100, 100 * (t.rows || 0) / t.expected) : 0;
+        var bar = el('div', { class: 'q-bar' + (t.status === 'loading' && !known ? ' unknown' : ''), role: 'progressbar',
+          'aria-label': t.label, 'aria-valuemin': '0', 'aria-valuemax': '100' });
+        if (known || t.status === 'succeeded') bar.setAttribute('aria-valuenow', String(Math.round(pct)));
+        var fill = el('span');
+        fill.style.width = (t.status === 'failed' || t.status === 'cancelled' ? Math.max(pct, 2) : pct) + '%';
+        bar.appendChild(fill);
+        box.appendChild(el('div', { class: 'q-table' }, [
+          el('span', { class: 'q-name', text: t.label }), bar,
+          el('span', { class: 'q-text', text: queueTableText(item, t) })
+        ]));
+      });
+      if (item.errors.length) {
+        box.appendChild(el('div', { class: 'q-errors' }, item.errors.map(function (e) {
+          var who = e.table ? (item.tables.filter(function (t) { return t.table === e.table; })[0] || { label: e.table }).label + ': ' : '';
+          var parts = [el('div', { text: who + String(e.message).replace(/^(\w+)_: /, '$1: ') })];
+          if (e.detail) parts.push(el('details', null, [el('summary', { text: 'Technical details' }), el('pre', { text: e.detail })]));
+          return el('div', { class: 'q-error' }, parts);
+        })));
+      }
+      return box;
+    }
+
+    $('queue-clear').addEventListener('click', function () {
+      api('/api/queue', { method: 'DELETE' }).then(loadQueue, function () { loadQueue(); });
+    });
 
 
     // -- curl commands ------------------------------------------------------------

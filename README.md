@@ -416,6 +416,38 @@ again; **Last loaded** shows when data last finished loading.
 Each reload is an ingestion run, so rows get a new `ET_timestamp` and
 `ET_run_id`, and `ET_id` starts again at 1. API: `POST /api/sources/<name>/reload`.
 
+### Load queue
+
+On the page, **Reload** and **Incremental** don't hold the page up while a
+table loads. The load goes into the **Load queue** panel, just above
+**Sources**, and runs in the background on the server. You can carry on with
+the page meanwhile, and the source's buttons show **Queued** or **Loading…**.
+
+Each queue item shows each of its tables with a progress bar. For a full
+load it reads like "15,000 of 30,000 rows (50%)", measured against the table's
+row count before the load, with rows per second and about how long is left.
+An incremental load counts its new or changed rows instead.
+
+How items run:
+
+* Up to two loads run at once. Two loads of the same source never overlap:
+  the second waits its turn. The same reload asked for twice is queued once.
+* **Cancel** stops a waiting load before it starts. A running load stops at its
+  next batch and leaves the table as it was: a full load's half-built copy is
+  dropped, and an incremental load's rows are taken back out.
+* A finished item turns **green** when everything loaded and **red** when
+  anything failed. Every error is listed against its table, with **Technical
+  details** (the full traceback). **Dismiss** removes one item, and **Clear
+  finished** removes all finished items.
+
+The queue lives in the API process, so it starts empty when the service
+restarts; each load is still recorded in `eyetable.runs`. Group runs and
+schedules don't go through the queue.
+
+API: `POST /api/queue` with `{"source", "table"?, "incremental"?}`, `GET /api/queue`,
+`POST /api/queue/<id>/cancel`, `DELETE /api/queue/<id>`, and `DELETE /api/queue`
+(clear finished).
+
 ### Key candidates and natural keys
 
 After every load, eyetable scans the table it loaded. The scan counts each

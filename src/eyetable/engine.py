@@ -5,6 +5,9 @@ import datetime as dt
 import io
 import logging
 import os
+import threading
+import traceback
+from contextlib import contextmanager
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -20,6 +23,10 @@ from eyetable.store import CoreStore, SourceNotFound
 from eyetable.types import infer_columns
 
 log = logging.getLogger(__name__)
+
+# The progress callback of the load running on this thread (see Engine.reporting).
+_local = threading.local()
+Progress = Callable[[str, int], None]  # (table, rows written so far)
 
 # Source types whose data is one table, <source>__data, loaded by pushing data in
 # (a dropped file, a Google Sheet tab) rather than by a connector pulling it.
@@ -40,6 +47,7 @@ class RunResult:
     mode: str = "replace"  # "replace" | "append" | "incremental"
     since: Any = None  # an incremental load's starting point: the largest value loaded before it
     replaced: int = 0  # older copies of rows an incremental load replaced (by natural key)
+    detail: str | None = None  # a failure's full traceback, for the load queue's details
 
 
 class UnknownDataset(KeyError):
@@ -93,6 +101,33 @@ class Engine:
         self._environ = environ
         self._scan_keys = scan_keys
         self._scans: ThreadPoolExecutor | None = None
+
+    @contextmanager
+    def reporting(self, progress: "Progress | None"):
+        """While inside, every load on this thread calls progress(table, rows so far): 0 as a
+        table starts, then after each batch. The callback may raise to stop the load."""
+        previous = getattr(_local, "progress", None)
+        _local.progress = progress
+        try:
+            yield
+        finally:
+            _local.progress = previous
+
+    @staticmethod
+    def _counted(table: str, batches):
+        progress = getattr(_local, "progress", None)
+        if progress is None:
+            return batches
+
+        def counted():
+            rows = 0
+            progress(table, 0)
+            for batch in batches:
+                rows += len(batch)
+                yield batch
+                progress(table, rows)
+
+        return counted()
 
     def scan_keys(self, table: str) -> None:
         """Scan a just-loaded table for the columns that could be its key (see keys.py)."""
@@ -176,12 +211,12 @@ class Engine:
             self.store.link_upload(upload_id, run_id)
         try:
             rows = self.store.write(
-                table, conn.read(DATASET_KEY), mode, run_id, origin=f"{source} - {conn.origin(DATASET_KEY)}"
+                table, self._counted(table, conn.read(DATASET_KEY)), mode, run_id, origin=f"{source} - {conn.origin(DATASET_KEY)}"
             )
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
             self.store.finish_run(run_id, "failed", 0, error)
-            return RunResult(run_id, DATASET_KEY, table, "failed", 0, error, upload_id)
+            return RunResult(run_id, DATASET_KEY, table, "failed", 0, error, upload_id, detail=traceback.format_exc())
         self.store.finish_run(run_id, "succeeded", rows)
         self.store.save_catalog(source, [dataset])
         self.scan_keys(table)
@@ -256,11 +291,11 @@ class Engine:
         self.store.link_upload(upload_id, run_id)
         batches = (tab.records[i : i + 1000] for i in range(0, len(tab.records), 1000))
         try:
-            rows = self.store.write(table, batches, mode, run_id, origin=f"{source} - {label}")
+            rows = self.store.write(table, self._counted(table, batches), mode, run_id, origin=f"{source} - {label}")
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
             self.store.finish_run(run_id, "failed", 0, error)
-            return RunResult(run_id, tab.title, table, "failed", 0, error, upload_id)
+            return RunResult(run_id, tab.title, table, "failed", 0, error, upload_id, detail=traceback.format_exc())
         self.store.finish_run(run_id, "succeeded", rows)
         self.scan_keys(table)
         kinds = infer_columns(tab.records)
@@ -540,12 +575,18 @@ class Engine:
                 raise ValueError(f"no file has been loaded into {source!r} yet")
             start = max((i for i, u in enumerate(history) if u.mode == "replace"), default=0)
             results = []
+            outer = getattr(_local, "progress", None)
+            done = 0
             for i, upload in enumerate(history[start:]):
-                result = self.ingest_upload(
-                    source, upload.filename, self.store.upload_content(upload.id),
-                    mode="replace" if i == 0 else "append", keep_file=False,
-                )
+                # the files build one table, so progress counts across all of them
+                inner = (lambda t, n, base=done: outer(t, base + n)) if outer else None
+                with self.reporting(inner):
+                    result = self.ingest_upload(
+                        source, upload.filename, self.store.upload_content(upload.id),
+                        mode="replace" if i == 0 else "append", keep_file=False,
+                    )
                 results.append(result)
+                done += result.rows
                 if result.status != "succeeded":
                     break
             return results
@@ -577,13 +618,14 @@ class Engine:
                          batches: Callable[[], Any]) -> RunResult:
         """Append an incremental load's rows; with a natural key, they replace their older copies."""
         try:
-            rows = self.store.write(table, batches(), "append", run_id, origin=origin)
+            rows = self.store.write(table, self._counted(table, batches()), "append", run_id, origin=origin)
             replaced = self.store.replace_older(table, p.key, run_id) if p.key and rows else 0
         except Exception as exc:
             self.store.delete_run_rows(table, run_id)  # all or nothing, like a replace
             error = f"{type(exc).__name__}: {exc}"
             self.store.finish_run(run_id, "failed", 0, error)
-            return RunResult(run_id, key, table, "failed", 0, error, mode="incremental", since=p.since)
+            return RunResult(run_id, key, table, "failed", 0, error, mode="incremental", since=p.since,
+                             detail=traceback.format_exc())
         self.store.finish_run(run_id, "succeeded", rows)
         if rows:
             self.scan_keys(table)
@@ -635,12 +677,13 @@ class Engine:
                 run_id = self.store.start_run(source, key, table, "replace" if mode == "incremental" else mode)
                 try:
                     origin = f"{source} - {conn.origin(key)}"
-                    rows = self.store.write(table, conn.read(key, batch_size), "replace" if mode == "incremental" else mode,
+                    rows = self.store.write(table, self._counted(table, conn.read(key, batch_size)),
+                                            "replace" if mode == "incremental" else mode,
                                             run_id, origin=origin)
                 except Exception as exc:
                     error = f"{type(exc).__name__}: {exc}"
                     self.store.finish_run(run_id, "failed", 0, error)
-                    results.append(RunResult(run_id, key, table, "failed", 0, error))
+                    results.append(RunResult(run_id, key, table, "failed", 0, error, detail=traceback.format_exc()))
                 else:
                     self.store.finish_run(run_id, "succeeded", rows)
                     results.append(RunResult(run_id, key, table, "succeeded", rows))
