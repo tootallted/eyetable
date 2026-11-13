@@ -92,3 +92,66 @@ def name_for(pattern: str) -> str:
     if not name[0].isalpha():
         name = "s" + name if name[0] == "_" else "s_" + name
     return name[:64].rstrip("_")
+
+
+# -- finding where an uploaded file came from ------------------------------------------
+# A browser never tells a page which folder an uploaded file was in, only its name. The
+# eyetable server usually runs on the same PC, so it looks for a file with the same name,
+# size and contents (SHA-256) in the usual places: Desktop, Downloads, Documents.
+
+SKIP_DIRS = {"appdata", "node_modules", "__pycache__", ".git", ".venv", "venv", "$recycle.bin"}
+SEARCH_DEPTH = 4
+SEARCH_MAX_DIRS = 20_000
+
+
+def search_roots() -> list[Path]:
+    """Where to look: the allowed folders if EYETABLE_FILE_FOLDERS is set, else the usual user folders."""
+    roots = allowed_folders()
+    if roots:
+        return [r for r in roots if r.is_dir()]
+    home = Path.home()
+    found = []
+    for rel in ("Desktop", "OneDrive/Desktop", "Downloads", "Documents", "OneDrive/Documents", "OneDrive", "."):
+        p = (home / rel).resolve()
+        if p.is_dir() and p not in found:
+            found.append(p)
+    return found
+
+
+def _sha256(path: Path) -> str:
+    import hashlib
+
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def find_upload(filename: str, size: int, sha256: str, roots: list[Path] | None = None) -> Path | None:
+    """The file on this machine an upload came from: same name, size and contents. None if not found."""
+    roots = search_roots() if roots is None else roots
+    target = filename.lower()
+    seen = 0
+    for root in roots:
+        depth = 1 if root == Path.home().resolve() else SEARCH_DEPTH  # the home folder itself: just its top level
+        stack = [(root, 0)]
+        while stack:
+            folder, level = stack.pop()
+            seen += 1
+            if seen > SEARCH_MAX_DIRS:
+                return None
+            try:
+                entries = list(os.scandir(folder))
+            except OSError:
+                continue
+            for e in entries:
+                try:
+                    if e.is_file() and e.name.lower() == target and e.stat().st_size == size and _sha256(Path(e.path)) == sha256:
+                        return Path(e.path)
+                    if e.is_dir(follow_symlinks=False) and level + 1 < depth and e.name.lower() not in SKIP_DIRS \
+                            and not e.name.startswith("."):
+                        stack.append((Path(e.path), level + 1))
+                except OSError:
+                    continue
+    return None

@@ -156,7 +156,23 @@ reads every file matching a pattern, such as `ledger_*.csv`, from a folder on
 the eyetable server, each time it loads (Reload, groups and schedules). New
 files dropped in the folder are picked up by the next load.
 
-To set one up, open the file source in **Preview Data → Connection
+**From the Sources panel.** A file source's **Last file** has an edit button
+(✎). It opens the full path of the uploaded file, for example
+`C:\Users\Ted\Desktop\a_20261105.csv`.
+
+A browser never tells a page which folder an uploaded file came from. The
+eyetable server, running on the same PC, finds it by looking for a file with
+the same name, size and contents in your Desktop, Downloads and Documents
+(including OneDrive's). If `EYETABLE_FILE_FOLDERS` is set, it looks in those
+folders instead. If the file can't be found, type the folder in front of the
+name.
+
+Change the name to a pattern (`a_*.csv`). Each keystroke shows which files
+match. Then **Save and load** reads `a_20261105.csv`, `a_20261106.csv` and
+`a_20261107.csv` into the source's one table. A plain file name (no `*`) reads
+just that file from the folder on each load.
+
+**From Connection settings.** You can also open the file source in **Preview Data → Connection
 settings**:
 
 1. Fill in **Folder on the eyetable server**, for example `C:\data\ledgers`. On

@@ -149,3 +149,37 @@ def test_the_api(store, folder):
     assert src["file_set"] == {"folder": str(folder.resolve()), "pattern": "ledger_*.csv"}
     body = client.post("/api/sources/ledger_aggregated/reload", headers=AUTH, json={}).json()
     assert body["rows"] == 4 and body["source"]["table"] == "ledger_aggregated__data"
+
+
+def test_an_uploaded_files_folder_is_found_by_name_and_contents(tmp_path, monkeypatch):
+    import hashlib
+
+    desk = tmp_path / "Desktop"
+    (desk / "reports").mkdir(parents=True)
+    content = b"account,amount\nRent,100\n"
+    (desk / "a_20261105.csv").write_bytes(b"account,amount\nRent,999\n")  # same name, other contents
+    (desk / "reports" / "a_20261105.csv").write_bytes(content)
+    sha, size = hashlib.sha256(content).hexdigest(), len(content)
+    assert filesets.find_upload("A_20261105.csv", size, sha, roots=[desk]) == desk / "reports" / "a_20261105.csv"
+    assert filesets.find_upload("a_20261105.csv", size, "0" * 64, roots=[desk]) is None
+    monkeypatch.setenv("EYETABLE_FILE_FOLDERS", str(desk))
+    assert filesets.search_roots() == [desk.resolve()]
+
+
+def test_the_file_location_api(store, tmp_path, monkeypatch):
+    desk = tmp_path / "Desktop"
+    desk.mkdir()
+    for day in ("05", "06", "07"):
+        (desk / f"a_202611{day}.csv").write_text(f"n,day\n1,{day}\n")
+    monkeypatch.setenv("EYETABLE_FILE_FOLDERS", str(desk))
+    client = TestClient(create_app(Engine(store), TOKEN))
+    client.post("/api/sources/a_20261105/uploads", headers=AUTH, data={"create": "true"},
+                files={"file": ("a_20261105.csv", (desk / "a_20261105.csv").read_bytes(), "text/csv")})
+    where = client.get("/api/sources/a_20261105/file-location", headers=AUTH).json()
+    assert (where["folder"], where["pattern"], where["found"]) == (str(desk.resolve()), "a_20261105.csv", True)
+    # the Sources panel's edit: a_20261105.csv -> a_*.csv, same folder, same table
+    r = client.put("/api/sources/a_20261105/settings", headers=AUTH, json={"folder": where["folder"], "pattern": "a_*.csv"})
+    assert r.status_code == 200 and r.json()["file_count"] == 3
+    body = client.post("/api/sources/a_20261105/reload", headers=AUTH, json={}).json()
+    assert body["rows"] == 3 and body["source"]["table"] == "a_20261105__data"
+    assert client.get("/api/sources/a_20261105/file-location", headers=AUTH).json()["found"] == "set"

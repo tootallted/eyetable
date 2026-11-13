@@ -864,6 +864,23 @@ def create_app(
         return jsonable_encoder({"files": filesets.describe_files(files), "count": len(files),
                                  "suggested_name": filesets.name_for(body.pattern) if filesets.is_pattern(body.pattern) else None})
 
+    @app.get("/api/sources/{name}/file-location", dependencies=auth)
+    def file_location(name: str) -> dict[str, Any]:
+        """Where a file source's files are: its folder and pattern, or, for an uploaded file, the folder
+        it was found in on this machine (same name, size and contents), if it can be found."""
+        src = get_source(name)
+        if src.type != "file":
+            raise HTTPException(400, f"{name} isn't a file source")
+        if src.config.get("pattern"):
+            return {"folder": src.config.get("folder"), "pattern": src.config["pattern"], "found": "set"}
+        uploads = store.list_uploads(name, limit=1)
+        if not uploads:
+            return {"folder": None, "pattern": None, "found": False, "searched": []}
+        up = uploads[0]
+        path = filesets.find_upload(up.filename, up.size_bytes, up.sha256)
+        return {"folder": str(path.parent) if path else None, "pattern": path.name if path else up.filename,
+                "found": bool(path), "searched": [str(r) for r in filesets.search_roots()]}
+
     # -- hiding a table in Sources ("commenting it out"): every load skips it --------
     @app.put("/api/tables/{table}/hidden", dependencies=auth)
     def set_hidden(table: str, body: HiddenIn) -> dict[str, Any]:

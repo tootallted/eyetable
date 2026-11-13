@@ -63,7 +63,8 @@ function Start-Tunnel {
         Start-Sleep -Seconds 1
         foreach ($f in @($log, "$log.err")) {
             if (-not $url -and (Test-Path $f)) {
-                $m = Select-String -Path $f -Pattern "https://[a-zA-Z0-9\-]+\.trycloudflare\.com" | Select-Object -First 1
+                # not api.trycloudflare.com: cloudflared's own service, named in its errors when a tunnel can't start
+                $m = Select-String -Path $f -Pattern "https://(?!api\.)[a-zA-Z0-9\-]+\.trycloudflare\.com" | Select-Object -First 1
                 if ($m) { $url = $m.Matches[0].Value }
             }
         }

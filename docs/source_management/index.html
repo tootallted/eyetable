@@ -266,6 +266,14 @@
     background: var(--accent-soft); color: var(--accent); border: 1px solid transparent; cursor: pointer; font-family: var(--mono); }
   .hash:hover, .hash[aria-pressed=true] { border-color: var(--accent); }
   .tags-cell { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; min-width: 120px; }
+  .file-cell { display: flex; gap: 4px; align-items: center; }
+  .file-cell .edit { border: 0; background: none; color: var(--muted); cursor: pointer; padding: 0 4px; font-size: 13px; }
+  .file-cell .edit:hover { color: var(--accent); }
+  .sources-table tr.path-edit td { background: var(--accent-soft); white-space: normal; }
+  .path-editor { display: grid; gap: 8px; padding: 4px 0; }
+  .path-editor input { width: 100%; box-sizing: border-box; font-family: var(--mono); font-size: 13px; }
+  .path-editor .matches { font-size: 13px; color: var(--muted); overflow-wrap: anywhere; }
+  .path-editor .matches.bad { color: var(--err); }
   .tags-cell .add { border: 1px dashed var(--border); background: none; color: var(--muted); border-radius: 999px; padding: 0 8px;
     font-size: 12px; cursor: pointer; line-height: 20px; }
   .tags-cell .add:hover { border-color: var(--accent); color: var(--accent); }
@@ -400,6 +408,8 @@
     /* the Hide and load-button cells have no label: they take the whole width */
     .sources-table td.actions, .sources-table td.hide-col { display: block; width: auto; padding: 4px 0; }
     .sources-table td.actions::before, .sources-table td.hide-col::before { content: none; }
+    .sources-table tr.path-edit td { display: block; }
+    .sources-table tr.path-edit td::before { content: none; }
     .sources-table tr.conn td { font-weight: 400; }
     .sources-table tr.conn td:empty { display: none; }
     .sources-table .sub-name { padding-left: 0; }
@@ -1684,8 +1694,8 @@
           el('td', { 'data-label': 'Type' }, [el('span', { class: 'tag', text: typeLabel(s.type) })]),
           s.tables ? tablesCell(s, open) : el('td', { class: 'mono wrap', 'data-label': 'Table' }, s.table ? breakable('eyetable_raw.' + s.table) : [s.datasets + ' dataset(s)']),
           el('td', { class: 'num', 'data-label': 'Rows', text: s.table ? fmtInt(s.rows) : '—' }),
-          el('td', { class: 'wrap', 'data-label': 'Last file', title: s.file_set ? 'Every file matching ' + s.file_set.pattern + ' in ' + s.file_set.folder : '',
-            text: s.file_set ? s.file_set.pattern : s.last_upload ? s.last_upload.filename : '—' }),
+          el('td', { class: 'wrap', 'data-label': 'Last file', title: s.file_set ? 'Every file matching ' + s.file_set.pattern + ' in ' + s.file_set.folder : '' },
+            [fileCell(s)]),
           el('td', { 'data-label': 'Last loaded', text: fmtTime(s.last_loaded_at || s.updated_at), title: s.last_loaded_at ? 'Last time data finished loading' : 'Not loaded yet' }),
           el('td', { class: 'actions' }, s.hidden ? [] : [loadButtons(s)])
         ]);
@@ -1698,9 +1708,156 @@
         tr.addEventListener('click', pick);
         tr.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); pick(); } });
         rows.push(tr);
+        if (state.pathEdit && state.pathEdit.source === s.name) rows.push(pathEditorRow(s, member));
         if (open) s.tables.forEach(function (t) { rows.push(tableRow(s, t, member)); });
       })();
       return rows;
+    }
+
+    // -- a file source's file, editable into a pattern (a_20261105.csv -> a_*.csv) ----------
+    function fileCell(s) {
+      var text = s.file_set ? s.file_set.pattern : s.last_upload ? s.last_upload.filename : '\u2014';
+      var cell = el('span', { class: 'file-cell' }, [el('span', null, breakable(text))]);
+      if (s.type !== 'file' || s.hidden) return cell;
+      var b = el('button', { type: 'button', class: 'edit', text: '\u270e', 'aria-label': 'Edit the file path of ' + s.name,
+        title: 'Edit the path: put a * in the name (a_*.csv) to load every matching file in its folder into this one table' });
+      b.addEventListener('click', function (e) { e.stopPropagation(); openPathEditor(s); });
+      b.addEventListener('keydown', function (e) { e.stopPropagation(); });
+      cell.appendChild(b);
+      return cell;
+    }
+
+    function openPathEditor(s) {
+      state.pathEdit = { source: s.name, value: '', info: null, loading: true, focus: true, caret: null, check: null };
+      renderSources();
+      api('/api/sources/' + encodeURIComponent(s.name) + '/file-location').then(function (info) {
+        var pe = state.pathEdit;
+        if (!pe || pe.source !== s.name) return;
+        pe.info = info;
+        pe.loading = false;
+        pe.value = info.folder ? joinPath(info.folder, info.pattern) : (info.pattern || '');
+        renderSources();
+        checkPath();
+      }, function (err) {
+        var pe = state.pathEdit;
+        if (!pe || pe.source !== s.name) return;
+        pe.loading = false;
+        pe.check = { error: err.message };
+        renderSources();
+      });
+    }
+
+    function joinPath(folder, name) {
+      var sep = folder.indexOf('/') >= 0 && folder.indexOf('\\') < 0 ? '/' : '\\';
+      return folder.replace(/[\\/]+$/, '') + sep + name;
+    }
+
+    // "C:\Users\Ted\Desktop\a_*.csv" -> folder and pattern; a bare name keeps the folder already known.
+    function splitPath(value) {
+      var v = value.trim().replace(/^"|"$/g, '');
+      var cut = Math.max(v.lastIndexOf('\\'), v.lastIndexOf('/'));
+      if (cut >= 0) return { folder: v.slice(0, cut) || v.slice(0, cut + 1), pattern: v.slice(cut + 1) };
+      var pe = state.pathEdit;
+      return { folder: pe && pe.info && pe.info.folder || '', pattern: v };
+    }
+
+    function checkPath() {
+      var pe = state.pathEdit;
+      if (!pe) return;
+      clearTimeout(pe.timer);
+      pe.timer = setTimeout(function () {
+        var parts = splitPath(pe.value), source = pe.source;
+        if (!parts.folder) { pe.check = { error: 'Type the whole path, folder included, like C:\\Users\\Ted\\Desktop\\' + (parts.pattern || 'a_*.csv') + '.' }; updatePathCheck(); return; }
+        if (!parts.pattern) { pe.check = { error: 'Add the file name, or a pattern such as a_*.csv, after the folder.' }; updatePathCheck(); return; }
+        api('/api/files/match', { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify(parts) }).then(function (r) {
+          if (state.pathEdit !== pe || pe.source !== source) return;
+          pe.check = r;
+          updatePathCheck();
+        }, function (err) {
+          if (state.pathEdit !== pe) return;
+          pe.check = { error: err.message };
+          updatePathCheck();
+        });
+      }, 350);
+    }
+
+    function updatePathCheck() {
+      var box = $('path-edit-check'), pe = state.pathEdit;
+      if (!box || !pe) return;
+      var c = pe.check;
+      box.className = 'matches' + (c && c.error ? ' bad' : '');
+      if (!c) { box.textContent = 'Checking\u2026'; return; }
+      if (c.error) { box.textContent = c.error; return; }
+      var names = c.files.map(function (f) { return f.name; });
+      box.textContent = !c.count ? 'No file there matches.'
+        : plural(c.count, 'file') + ' match' + (c.count === 1 ? 'es' : '') + ': ' + names.slice(0, 8).join(', ') + (c.count > 8 ? ', \u2026' : '') +
+          (c.count > 1 ? '. Each load reads all of them into this one table.' : '.');
+      var save = $('path-edit-save'), load = $('path-edit-load');
+      if (save) save.disabled = load.disabled = !c.count;
+    }
+
+    function savePath(s, thenLoad) {
+      var pe = state.pathEdit, parts = splitPath(pe.value), msg = clear($('sources-msg'));
+      api('/api/sources/' + encodeURIComponent(s.name) + '/settings', { method: 'PUT', headers: JSON_HEADERS,
+        body: JSON.stringify({ folder: parts.folder, pattern: parts.pattern, test: true }) }).then(function (d) {
+        state.pathEdit = null;
+        msg.appendChild(banner('ok', s.name + ' now reads ' + (d.file_count === 1 ? '1 file' : 'the ' + fmtInt(d.file_count) + ' files') + ' matching ' +
+          d.pattern + ' in ' + d.folder + (thenLoad ? '; loading them now.' : '. Reload loads them all into its table.')));
+        return refreshSourcesOnly().then(function () {
+          if (!thenLoad) return;
+          var fresh = state.sources.filter(function (x) { return x.name === s.name; })[0];
+          if (fresh) reloadSource(fresh, true);
+        });
+      }, function (err) {
+        pe.check = { error: 'Not saved: ' + err.message };
+        updatePathCheck();
+      });
+    }
+
+    function pathEditorRow(s, member) {
+      var pe = state.pathEdit;
+      var input = el('input', { type: 'text', id: 'path-edit-input', spellcheck: 'false', autocomplete: 'off',
+        'aria-label': 'Path of the file or files ' + s.name + ' loads', placeholder: 'C:\\Users\\Ted\\Desktop\\a_*.csv' });
+      input.value = pe.value;
+      input.disabled = !!pe.loading;
+      input.addEventListener('input', function () { pe.value = input.value; pe.caret = input.selectionStart; pe.check = null; updatePathCheck(); checkPath(); });
+      input.addEventListener('focus', function () { pe.focus = true; });
+      input.addEventListener('blur', function () { pe.focus = false; });
+      input.addEventListener('keydown', function (e) {
+        e.stopPropagation();
+        if (e.key === 'Escape') { state.pathEdit = null; renderSources(); }
+        if (e.key === 'Enter' && pe.check && pe.check.count) savePath(s, false);
+      });
+      var info = pe.info;
+      var how = pe.loading ? 'Looking for where ' + (s.last_upload ? s.last_upload.filename : 'the file') + ' is on this machine\u2026'
+        : info && info.found === 'set' ? 'This source reads every file matching this path. Change it, or put a plain file name back.'
+        : info && info.found ? 'Found the uploaded file at this path on the eyetable server. Change the name to a pattern, like a_*.csv, ' +
+          'to load every matching file in this folder into this one table (* stands for any characters, ? for one).'
+        : 'A browser doesn\u2019t tell eyetable which folder an uploaded file came from, and this one wasn\u2019t found in ' +
+          ((info && info.searched || []).slice(0, 4).join(', ') || 'your usual folders') + '. Type its folder in front of the name.';
+      var save = el('button', { type: 'button', class: 'btn small', id: 'path-edit-save', text: 'Save' });
+      var load = el('button', { type: 'button', class: 'btn small primary', id: 'path-edit-load', text: 'Save and load' });
+      var cancel = el('button', { type: 'button', class: 'link', text: 'Cancel' });
+      save.disabled = load.disabled = true;
+      save.addEventListener('click', function (e) { e.stopPropagation(); savePath(s, false); });
+      load.addEventListener('click', function (e) { e.stopPropagation(); savePath(s, true); });
+      cancel.addEventListener('click', function (e) { e.stopPropagation(); state.pathEdit = null; renderSources(); });
+      var editor = el('div', { class: 'path-editor' }, [
+        el('div', { class: 'hint', style: 'margin:0', text: how }), input,
+        el('div', { class: 'matches', id: 'path-edit-check' }),
+        el('div', { class: 'set-actions' }, [load, save, cancel])
+      ]);
+      editor.addEventListener('click', function (e) { e.stopPropagation(); });
+      var tr = el('tr', { class: 'path-edit' + (member ? ' member' : '') }, [el('td', { colspan: String(SOURCE_COLS.length) }, [editor])]);
+      setTimeout(function () {
+        updatePathCheck();
+        if (pe.focus && document.body.contains(input) && !input.disabled) {
+          input.focus();
+          var at = pe.caret === null ? input.value.length : pe.caret;
+          input.setSelectionRange(at, at);
+        }
+      }, 0);
+      return tr;
     }
 
     // Up to three tables are named; more are counted, and the row opens to list them.
