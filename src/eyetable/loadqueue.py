@@ -17,17 +17,20 @@ from __future__ import annotations
 import datetime as dt
 import secrets
 import threading
+import time
 import traceback
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
+from . import loadlog
 from .connectors.file import DATASET_KEY
 from .engine import Engine
 from .identifiers import table_name
 from .incremental import IncrementalProblem
 
 ACTIVE = ("queued", "running")
+MAX_LOG = 5000  # log entries kept per item (a repeated statement is one entry)
 KEEP_FINISHED = 40  # finished items listed until dismissed; older ones drop off
 
 
@@ -108,7 +111,7 @@ class LoadQueue:
             "id": secrets.token_hex(6), "source": source, "table": table, "incremental": incremental,
             "label": planned[0]["label"] if table else source,
             "status": "queued", "created_at": _now(), "started_at": None, "finished_at": None,
-            "tables": tables, "errors": [], "cancel": False,
+            "tables": tables, "errors": [], "cancel": False, "log": [], "log_dropped": 0,
         }
         with self._lock:
             self._items.append(item)
@@ -126,6 +129,16 @@ class LoadQueue:
     def get(self, item_id: str) -> dict[str, Any]:
         with self._lock:
             return self._public(self._find(item_id))
+
+    def log(self, item_id: str, after: int = 0) -> dict[str, Any]:
+        """An item's log entries from index `after` on (ask again from the last index you have:
+        a repeated statement updates its entry in place)."""
+        with self._lock:
+            item = self._find(item_id)
+            after = max(0, min(after, len(item["log"])))
+            return {"id": item_id, "from": after, "entries": [dict(e) for e in item["log"][after:]],
+                    "count": len(item["log"]), "dropped": item["log_dropped"], "status": item["status"],
+                    "started_at": item["started_at"]}
 
     def cancel(self, item_id: str) -> dict[str, Any]:
         """Stop an item: one still waiting never starts; a running one stops at its next batch."""
@@ -177,9 +190,24 @@ class LoadQueue:
                         entry["status"], entry["started_at"] = "loading", _now()
                     entry["rows"], entry["updated_at"] = rows, _now()
 
+            def record(entry: dict[str, Any]) -> dict[str, Any] | None:
+                with self._lock:
+                    log = item["log"]
+                    last = log[-1] if log else None
+                    if last and (last["kind"], last["text"], last.get("db")) == (entry["kind"], entry["text"], entry.get("db")):
+                        last["repeat"] = last.get("repeat", 1) + 1  # the same statement again (an insert per batch, say)
+                        last["at_last"] = entry["at"]
+                        return last
+                    if len(log) >= MAX_LOG:
+                        item["log_dropped"] += 1
+                        return None
+                    log.append(entry)
+                    return entry
+
             fetch = (lambda url: self._sheet_fetch(url, token)) if self._sheet_fetch else None
             try:
-                with self.engine.reporting(progress):
+                meta = {t.name for t in self.store.metadata.tables.values()}
+                with self.engine.reporting(progress), loadlog.capture(record, self.store.db, meta):
                     kwargs = {"sheet_fetch": fetch} if fetch else {}
                     results = self.engine.reload_source(item["source"], incremental=item["incremental"],
                                                         table=item["table"], **kwargs)
@@ -189,6 +217,8 @@ class LoadQueue:
                     for entry in item["tables"]:
                         if entry["status"] in ("waiting", "loading"):
                             entry["status"] = "cancelled" if item["cancel"] else "failed"
+                    item["log"].append({"at": time.time(), "kind": "warn",
+                                        "text": "Cancelled" if item["cancel"] else f"Failed: {describe(exc)}"})
                     self._finish(item, "cancelled" if item["cancel"] else "failed")
                 return
             with self._lock:
@@ -218,6 +248,9 @@ class LoadQueue:
                     status = "failed"
                 else:
                     status = "succeeded"
+                done = sum(e["rows"] for e in item["tables"] if e["status"] == "succeeded")
+                item["log"].append({"at": time.time(), "kind": "step" if status == "succeeded" else "warn",
+                                    "text": f"{status.capitalize()}: {done:,} rows in {time.time() - item['started_at'].timestamp():.1f} s"})
                 self._finish(item, status)
 
     # -- helpers (called with self._lock held) --------------------------------------
@@ -252,7 +285,8 @@ class LoadQueue:
 
     @staticmethod
     def _public(item: dict[str, Any]) -> dict[str, Any]:
-        out = {k: v for k, v in item.items() if k != "cancel"}
+        out = {k: v for k, v in item.items() if k not in ("cancel", "log")}
+        out["log_count"] = len(item["log"])
         out["cancelling"] = item["cancel"] and item["status"] in ACTIVE
         out["tables"] = [dict(t) for t in item["tables"]]
         out["errors"] = [dict(e) for e in item["errors"]]

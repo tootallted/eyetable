@@ -554,7 +554,14 @@ class PostmanConnector(Connector):
                 )
 
     def _send(self, built: httpx.Request) -> httpx.Response:
+        from eyetable import loadlog
+
+        entry = loadlog.emit("http", f"{built.method} {loadlog.safe_url(built.url)}") if loadlog.active() else None
+        started = time.perf_counter()
         response = self._client.send(built)
+        if entry is not None:
+            entry.update(status=response.status_code, ms=round((time.perf_counter() - started) * 1000, 1),
+                         bytes=len(response.content))
         if response.is_error:
             # Not raise_for_status(): its message has the whole URL, and a query string
             # can hold API keys. This message is shown on the page and kept with the run.

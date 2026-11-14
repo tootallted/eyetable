@@ -804,6 +804,14 @@ def create_app(
     def list_queue() -> dict[str, Any]:
         return jsonable_encoder({"items": load_queue.list()})
 
+    @app.get("/api/queue/{item_id}/log", dependencies=auth)
+    def load_log(item_id: str, after: int = 0) -> dict[str, Any]:
+        """A queued load's queries, requests and steps, from entry `after` on."""
+        try:
+            return jsonable_encoder(load_queue.log(item_id, after))
+        except KeyError as exc:
+            raise HTTPException(404, str(exc).strip("'\"")) from None
+
     @app.post("/api/queue/{item_id}/cancel", dependencies=auth)
     def cancel_load(item_id: str) -> dict[str, Any]:
         try:

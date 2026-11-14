@@ -556,6 +556,30 @@ How items run:
   details** (the full traceback). **Dismiss** removes one item, and **Clear
   finished** removes all finished items.
 
+**Queries and log.** Each item has **Show queries and log**, which opens a
+scrolling record of what the load is doing, as it does it:
+
+* **SQL source**: every statement sent to the source database, with how long
+  it took to run and rows where the driver reports them. The values of range
+  and incremental queries are shown too.
+* **SQL eyetable**: statements on eyetable's own store, such as creating the
+  staging table, inserting batches, adding columns, the swap and the key scan.
+  A statement repeated back to back (an insert per batch) is one line with a
+  count, total time and total rows.
+* **HTTP**: an API source's requests, with status, size and time. Query
+  values whose names look like keys or tokens are masked.
+* **file**: each file a file set reads, with its rows and columns.
+* **step**: the engine's decisions, such as full or incremental, the
+  incremental boundary, reading in parts, each part's range and rows, and
+  switching to parts after a timeout.
+
+The box follows new lines while it's scrolled to the bottom; scroll up to read
+and it stays put. A long statement is cut short until you click it. **Show
+bookkeeping** adds eyetable's own record-keeping and SQLAlchemy's table
+descriptions, which are hidden by default. **Copy the log** copies it as text.
+The log keeps up to 5,000 lines per load. API:
+`GET /api/queue/<id>/log?after=<n>` returns the lines from line *n* on.
+
 The queue lives in the API process, so it starts empty when the service
 restarts; each load is still recorded in `eyetable.runs`. Group runs and
 schedules don't go through the queue.

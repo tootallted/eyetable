@@ -189,3 +189,37 @@ def test_the_queue_api(engine):
     assert client.delete(f"/api/queue/{item['id']}", headers=AUTH).json() == {"ok": True}
     assert client.get("/api/queue", headers=AUTH).json()["items"] == []
     assert client.get("/api/queue").status_code == 401
+
+
+def test_a_load_keeps_a_log_of_its_queries_and_steps(engine):
+    queue = LoadQueue(engine)
+    item = queue.wait(queue.add("crm", table="crm__data")[0]["id"], 30)
+    assert item["log_count"] > 3
+    everything = queue.log(item["id"])["entries"]
+    assert any(e.get("meta") for e in everything)  # eyetable's bookkeeping is there, marked
+    log = [e for e in everything if not e.get("meta")]
+    texts = [e["text"] for e in log]
+    assert texts[0].startswith("Full load of crm")
+    source_sql = [e for e in log if e["kind"] == "sql" and e["db"] == "source"]
+    assert any("FROM main.accounts" in e["text"] and "*" not in e["text"] for e in source_sql)  # columns named
+    inserts = [e for e in log if e["kind"] == "sql" and e["db"] == "eyetable" and e["text"].startswith("INSERT")]
+    assert inserts and inserts[0].get("repeat", 1) == 3 and inserts[0]["rows_total"] == 2500  # one line, three batches
+    assert all("ms" in e for e in source_sql + inserts)
+    assert any(t.startswith("Swapped crm__data__stg in as crm__data") for t in texts)
+    assert texts[-1].startswith("Succeeded: 2,500 rows")
+    # asking from an index returns only what's after it
+    later = queue.log(item["id"], after=len(everything) - 1)
+    assert later["from"] == len(everything) - 1 and len(later["entries"]) == 1
+
+
+def test_a_log_masks_secrets_in_urls():
+    from eyetable.loadlog import safe_url
+
+    assert safe_url("https://api.x.com/v1/items?page=2&api_key=abc123&token=t") == "https://api.x.com/v1/items?page=2&api_key=\u2026&token=\u2026"
+
+
+def test_nothing_is_logged_outside_the_queue(engine, store):
+    from eyetable import loadlog
+
+    assert not loadlog.active()
+    engine.reload_source("crm")  # no error, nothing listening

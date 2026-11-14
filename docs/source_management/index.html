@@ -187,6 +187,29 @@
   .q-error { background: var(--surface); border: 1px solid color-mix(in srgb, var(--err) 35%, transparent); border-radius: 6px; padding: 6px 10px; color: var(--err); font-size: 13px; overflow-wrap: anywhere; }
   .q-error details { color: var(--text); margin-top: 4px; }
   .q-error pre { white-space: pre-wrap; font-size: 12px; max-height: 260px; overflow: auto; margin: 6px 0 0; }
+  /* a load's queries and log */
+  .q-log-toggle { justify-self: start; }
+  .q-log { display: grid; gap: 6px; }
+  .q-log-bar { display: flex; gap: 8px 14px; align-items: center; flex-wrap: wrap; font-size: 12.5px; color: var(--muted); }
+  .q-log-bar .check { font-size: 12.5px; }
+  .q-log-box { max-height: 340px; overflow: auto; background: var(--surface-2); border: 1px solid var(--border); border-radius: 6px;
+    padding: 6px 0; font-family: var(--mono); font-size: 12px; line-height: 1.45; }
+  .q-log-box .ll { display: grid; grid-template-columns: 58px 92px minmax(0, 1fr); gap: 8px; padding: 1px 10px; cursor: default; }
+  .q-log-box .ll:hover { background: color-mix(in srgb, var(--accent-soft) 60%, transparent); }
+  .q-log-box .ll .t { color: var(--muted); text-align: right; }
+  .q-log-box .ll .k { font-weight: 600; white-space: nowrap; }
+  .q-log-box .ll .x { white-space: pre-wrap; overflow-wrap: anywhere; }
+  .q-log-box .ll .m { color: var(--muted); }
+  .q-log-box .ll.long .x { cursor: pointer; }
+  .q-log-box .ll.k-step .k { color: var(--text); }
+  .q-log-box .ll.k-source .k { color: var(--accent); }
+  .q-log-box .ll.k-eyetable .k { color: var(--ok); }
+  .q-log-box .ll.k-http .k { color: #8250df; }
+  .q-log-box .ll.k-file .k { color: var(--warn); }
+  .q-log-box .ll.k-warn { background: var(--warn-soft); }
+  .q-log-box .ll.k-warn .k, .q-log-box .ll.k-warn .x { color: var(--warn); }
+  .q-log-box .ll.meta { opacity: .6; }
+  @media (max-width: 600px) { .q-log-box .ll { grid-template-columns: 48px minmax(0, 1fr); } .q-log-box .ll .k { display: none; } }
   @media (max-width: 600px) { .q-table { grid-template-columns: 1fr; } .q-text { grid-column: 1; } }
   @media (prefers-reduced-motion: reduce) { .reload.busy svg { animation: none; } }
   .groups-table td { white-space: normal; }
@@ -4173,6 +4196,10 @@
       var signature = items.filter(function (i) { return QUEUE_ACTIVE[i.status]; }).map(function (i) { return i.id + i.status; }).join(',');
       if (signature !== queueState.signature) { queueState.signature = signature; if (!finishedNow) renderSources(); }
       if (finishedNow) refresh().catch(function () {});  // new row counts and load times
+      items.forEach(function (i) {
+        var lg = queueState.logs[i.id];
+        if (lg && lg.open && (QUEUE_ACTIVE[i.status] || lg.count !== i.log_count)) fetchLog(i.id);
+      });
       if (items.some(function (i) { return QUEUE_ACTIVE[i.status]; })) scheduleQueuePoll(1500);
     }
 
@@ -4214,6 +4241,11 @@
 
     function renderQueue() {
       var items = queueState.items;
+      // an open log keeps its scroll place while the queue redraws around it
+      Object.keys(queueState.logs).forEach(function (id) {
+        var lg = queueState.logs[id];
+        if (lg.box) lg.scrollTop = lg.box.scrollTop;
+      });
       $('queue-card').hidden = !items.length;
       var active = items.filter(function (i) { return QUEUE_ACTIVE[i.status]; });
       var running = active.filter(function (i) { return i.status === 'running'; }).length;
@@ -4225,6 +4257,11 @@
       $('queue-clear').hidden = items.length === active.length;
       var list = clear($('queue-list'));
       items.forEach(function (item) { list.appendChild(queueItem(item)); });
+      Object.keys(queueState.logs).forEach(function (id) {
+        var lg = queueState.logs[id];
+        if (!lg.open || !lg.box) return;
+        lg.box.scrollTop = lg.follow ? lg.box.scrollHeight : lg.scrollTop;
+      });
     }
 
     var QUEUE_STATUS = { queued: 'Waiting', running: 'Loading', succeeded: 'Done', failed: 'Failed', cancelled: 'Cancelled' };
@@ -4272,6 +4309,7 @@
           el('span', { class: 'q-text', text: queueTableText(item, t) })
         ]));
       });
+      box.appendChild(queueLogPanel(item));
       if (item.errors.length) {
         box.appendChild(el('div', { class: 'q-errors' }, item.errors.map(function (e) {
           var who = e.table ? (item.tables.filter(function (t) { return t.table === e.table; })[0] || { label: e.table }).label + ': ' : '';
@@ -4281,6 +4319,114 @@
         })));
       }
       return box;
+    }
+
+    // -- a queued load's queries and log ---------------------------------------------
+    // Every SQL statement (to the source database and to eyetable's own store, timed, with
+    // row counts), API request, file read and loading step, appended as the load runs. The
+    // box follows new lines while it is scrolled to the bottom; scroll up to stay put.
+    queueState.logs = {};
+    var LOG_KINDS = { step: 'step', file: 'file', http: 'HTTP', warn: 'note' };
+
+    function queueLog(id) {
+      if (!queueState.logs[id]) queueState.logs[id] = { open: false, entries: [], showMeta: false, follow: true, box: null,
+        fetching: false, startedAt: null, scrollTop: 0, count: 0, dropped: 0 };
+      return queueState.logs[id];
+    }
+
+    function logLine(e, lg) {
+      var kind = e.kind === 'sql' ? (e.db === 'source' ? 'source' : 'eyetable') : e.kind;
+      var label = e.kind === 'sql' ? (e.db === 'source' ? 'SQL source' : 'SQL eyetable') : (LOG_KINDS[e.kind] || e.kind);
+      var at = lg.startedAt ? '+' + Math.max(0, e.at - lg.startedAt).toFixed(1) + 's' : '';
+      var facts = [];
+      if (e.repeat > 1) facts.push('\u00d7' + fmtInt(e.repeat));
+      if (e.ms !== undefined) facts.push(e.repeat > 1 && e.ms_total !== undefined ? fmtInt(Math.round(e.ms_total)) + ' ms in all' : fmtInt(Math.round(e.ms)) + ' ms');
+      if (e.rows_total !== undefined && e.repeat > 1) facts.push(plural(e.rows_total, 'row'));
+      else if (e.rows !== undefined) facts.push(plural(e.rows, 'row'));
+      if (e.batch) facts.push(plural(e.batch, 'row') + ' a batch');
+      if (e.status !== undefined) facts.push(String(e.status));
+      if (e.bytes !== undefined) facts.push(fmtBytes(e.bytes));
+      var full = e.text + (e.params ? '\n  values: ' + e.params : '');
+      var long = full.length > 300;
+      var x = el('span', { class: 'x', text: long ? full.slice(0, 300) + '\u2026' : full });
+      if (facts.length) x.appendChild(el('span', { class: 'm', text: '  (' + facts.join(', ') + ')' }));
+      var line = el('div', { class: 'll k-' + kind + (e.meta ? ' meta' : '') + (long ? ' long' : ''), title: long ? 'Click to show it all' : '' },
+        [el('span', { class: 't', text: at }), el('span', { class: 'k', text: label }), x]);
+      if (long) line.addEventListener('click', function () {
+        var open = line.getAttribute('data-open') === '1';
+        x.firstChild.textContent = open ? full.slice(0, 300) + '\u2026' : full;
+        line.setAttribute('data-open', open ? '0' : '1');
+      });
+      return line;
+    }
+
+    function fillLog(lg) {
+      if (!lg.box) return;
+      clear(lg.box);
+      var shown = lg.entries.filter(function (e) { return lg.showMeta || !e.meta; });
+      if (!shown.length) lg.box.appendChild(el('div', { class: 'll' }, [el('span'), el('span'), el('span', { class: 'm', text: lg.fetching ? 'Loading the log\u2026' : 'Nothing logged yet.' })]));
+      shown.forEach(function (e) { lg.box.appendChild(logLine(e, lg)); });
+      if (lg.dropped) lg.box.appendChild(el('div', { class: 'll k-warn' }, [el('span'), el('span', { class: 'k', text: 'note' }),
+        el('span', { class: 'x', text: fmtInt(lg.dropped) + ' more entries weren\u2019t kept (the log keeps the first 5,000).' })]));
+      if (lg.follow) lg.box.scrollTop = lg.box.scrollHeight;
+    }
+
+    function fetchLog(id) {
+      var lg = queueLog(id);
+      if (lg.fetching) return;
+      lg.fetching = true;
+      // from the last line already here: a repeated statement updates that line in place
+      var from = Math.max(0, lg.entries.length - 1);
+      api('/api/queue/' + id + '/log?after=' + from).then(function (r) {
+        lg.entries = lg.entries.slice(0, r.from).concat(r.entries);
+        lg.count = r.count;
+        lg.dropped = r.dropped;
+        if (r.started_at) lg.startedAt = new Date(r.started_at).getTime() / 1000;
+        var at = lg.box ? lg.box.scrollTop : 0;
+        fillLog(lg);
+        if (lg.box && !lg.follow) lg.box.scrollTop = at;
+        if (lg.counter) lg.counter.textContent = plural(lg.entries.filter(function (e) { return !e.meta; }).length, 'line') +
+          (lg.entries.some(function (e) { return e.meta; }) ? ' (+' + fmtInt(lg.entries.filter(function (e) { return e.meta; }).length) + ' bookkeeping)' : '');
+      }, function () {}).then(function () { lg.fetching = false; });
+    }
+
+    function queueLogPanel(item) {
+      var lg = queueLog(item.id);
+      var wrap = el('div', { class: 'q-log' });
+      var toggle = el('button', { type: 'button', class: 'btn small q-log-toggle', 'aria-expanded': String(lg.open),
+        text: (lg.open ? '\u25be Hide' : '\u25b8 Show') + ' queries and log' + (item.log_count ? ' (' + fmtInt(item.log_count) + ')' : '') });
+      toggle.addEventListener('click', function () {
+        lg.open = !lg.open;
+        if (lg.open) { lg.follow = true; fetchLog(item.id); }
+        renderQueue();
+      });
+      wrap.appendChild(toggle);
+      if (!lg.open) return wrap;
+      var meta = el('input', { type: 'checkbox' });
+      meta.checked = lg.showMeta;
+      meta.addEventListener('change', function () { lg.showMeta = meta.checked; fillLog(lg); });
+      var copy = el('button', { type: 'button', class: 'link', text: 'Copy the log' });
+      copy.addEventListener('click', function () {
+        var text = lg.entries.filter(function (e) { return lg.showMeta || !e.meta; }).map(function (e) {
+          return (lg.startedAt ? '+' + Math.max(0, e.at - lg.startedAt).toFixed(1) + 's ' : '') + '[' + (e.kind === 'sql' ? 'SQL ' + e.db : e.kind) + '] ' +
+            e.text + (e.params ? '  values: ' + e.params : '') + (e.ms !== undefined ? '  (' + Math.round(e.repeat > 1 ? e.ms_total : e.ms) + ' ms' +
+            (e.repeat > 1 ? ', x' + e.repeat : '') + ')' : '');
+        }).join('\n');
+        try { navigator.clipboard.writeText(text); copy.textContent = 'Copied'; setTimeout(function () { copy.textContent = 'Copy the log'; }, 1500); } catch (e) {}
+      });
+      lg.counter = el('span');
+      if (!lg.box) {
+        lg.box = el('div', { class: 'q-log-box', role: 'log', 'aria-live': 'off', tabindex: '0', 'aria-label': 'Queries and log of ' + item.label });
+        lg.box.addEventListener('scroll', function () {
+          lg.follow = lg.box.scrollTop + lg.box.clientHeight >= lg.box.scrollHeight - 12;
+        });
+        fillLog(lg);
+      }
+      wrap.appendChild(el('div', { class: 'q-log-bar' }, [lg.counter,
+        el('label', { class: 'check' }, [meta, ' Show bookkeeping (eyetable\u2019s own records, table descriptions)']), copy,
+        el('span', { text: QUEUE_ACTIVE[item.status] ? 'New lines appear as the load runs; scroll up to pause.' : '' })]));
+      wrap.appendChild(lg.box);
+      return wrap;
     }
 
     state.showHidden = false;

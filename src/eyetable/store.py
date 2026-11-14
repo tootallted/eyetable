@@ -851,7 +851,11 @@ class CoreStore:
         """
         if mode not in ("replace", "append"):
             raise ValueError(f"unknown write mode {mode!r}")
+        from eyetable import loadlog
+
         target = f"{table}__stg" if mode == "replace" else table
+        loadlog.step(f"Writing into {target}" + (f", to be swapped in for {table} when every row is in" if mode == "replace"
+                                                 else f" ({mode})"))
         writer = _TableWriter(self, target, fresh=(mode == "replace"))
         rows = 0
         try:
@@ -869,6 +873,7 @@ class CoreStore:
             with self.db.begin() as conn:
                 conn.execute(sa.text(f"DROP TABLE IF EXISTS {self.qualified(table)}"))
                 conn.execute(sa.text(f"ALTER TABLE {self.qualified(target)} RENAME TO {prep.quote(table)}"))
+            loadlog.step(f"Swapped {target} in as {table}: {rows:,} rows, {len(writer.columns) + 1} columns")
         return rows
 
     def read_table(self, table: str, limit: int | None = None) -> list[dict[str, Any]]:
@@ -947,6 +952,9 @@ class _TableWriter:
             self._create_from({})
         if not (reorder and self.out_of_order):
             return
+        from eyetable import loadlog
+
+        loadlog.step(f"Rebuilding {self.table} so columns that arrived late sit before the ET_ columns")
         db, prep = self.store.db, self.store.db.dialect.identifier_preparer
         data = {n: k for n, k in self.columns.items() if n not in META_COLUMNS}
         temp = f"et_reorder_{secrets.token_hex(6)}"
@@ -995,6 +1003,9 @@ class _TableWriter:
                     kind = kind or "text"
                     ddl = sa_type(kind).compile(dialect=db.dialect)
                     conn.execute(sa.text(f"ALTER TABLE {qualified} ADD COLUMN {prep.quote(col)} {ddl}"))
+                    from eyetable import loadlog
+
+                    loadlog.step(f"New column {col} ({kind}) added to {self.table}")
                     self.columns[col] = kind
                     self.out_of_order = self.out_of_order or any(m in self.columns for m in META_COLUMNS)
                     changed = True

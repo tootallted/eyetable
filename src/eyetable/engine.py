@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
-from eyetable import filesets, gsheets, incremental, keys
+from eyetable import filesets, gsheets, incremental, keys, loadlog
 from eyetable.connectors import Connector, build_connector
 from eyetable.connectors.file import DATASET_KEY, FileConnector
 from eyetable.credentials import decrypt_secrets, resolve_env
@@ -561,6 +561,8 @@ class Engine:
         loads just that one of a database source's tables.
         """
         src = self.store.get_source(source)
+        loadlog.step(f"{'Incremental' if incremental else 'Full'} load of {source} ({src.type} source)"
+                     + (f", table {table}" if table else ""))
         if incremental and src.type == "file":
             raise incremental_problem("a file source gets new rows by loading a file with Append; there is nothing to fetch")
         keys_ = None
@@ -670,6 +672,7 @@ class Engine:
         ET_source names its file."""
         table = table_name(source, DATASET_KEY)
         files = filesets.matching_files(config.get("folder", ""), config["pattern"])
+        loadlog.step(f"{len(files):,} file{'s' if len(files) != 1 else ''} in {config.get('folder')} match {config['pattern']}")
         if not files:
             raise filesets.FileSetProblem(f"no file in {config.get('folder')} matches {config['pattern']}")
         run_id = self.store.start_run(source, DATASET_KEY, table, "replace")
@@ -691,6 +694,7 @@ class Engine:
                 # the same heading in two files (even spelled Amount and amount) is one column
                 rename = {c.name: canon[column_name(c.name)] for c in dataset.columns if canon[column_name(c.name)] != c.name}
                 current["origin"] = f"{source} - {f.name}"
+                loadlog.emit("file", f"{f}: {dataset.row_count:,} rows, {len(dataset.columns)} columns")
                 for batch in conn.read(DATASET_KEY):
                     yield [{rename.get(k, k): v for k, v in r.items()} for r in batch] if rename else batch
 
@@ -787,6 +791,7 @@ class Engine:
             if undo:
                 undo()
             column = choices[0]
+            loadlog.emit("warn", f"Reading it in one query timed out ({exc}); reading it again in parts by {column}")
             log.warning("%s/%s timed out in one query; reading it in parts by %s", source, key, column)
             rows = write(column)
             self.set_split(source, key, column, auto=True)
@@ -854,6 +859,10 @@ class Engine:
                 table = table_name(source, catalog[key].name)
                 if mode == "incremental":
                     p = incremental.plan(self.store, table)
+                    loadlog.step(f"{table}: incremental by {p.column}; " + (
+                        f"rows with {p.column} {'>=' if p.inclusive else '>'} {p.since}"
+                        + (f", replacing older copies by the natural key {' + '.join(p.key)}" if p.key else ", appended (no natural key)")
+                        if p.since is not None else "the table is empty, so it loads in full"))
                     if p.since is not None:
                         results.append(self._ingest_increment(conn, source, key, catalog[key], table, p, batch_size))
                         continue
@@ -862,6 +871,7 @@ class Engine:
                 write_mode = "replace" if mode == "incremental" else mode
 
                 def write(split, key=key, table=table, run_id=run_id, write_mode=write_mode):
+                    loadlog.step(f"Reading {conn.origin(key)} into {table}" + (f" in parts by {split}" if split else ""))
                     read = conn.read(key, batch_size, split=split) if split else conn.read(key, batch_size)
                     return self.store.write(table, self._counted(table, read), write_mode, run_id,
                                             origin=f"{source} - {conn.origin(key)}")

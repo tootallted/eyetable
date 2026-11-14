@@ -2,6 +2,7 @@
 
 import datetime as dt
 import re
+import time
 from decimal import Decimal
 
 import sqlalchemy as sa
@@ -155,6 +156,10 @@ class DbTableConnector(DatabaseConnector):
                 low, high = conn.execute(sa.select(sa.func.min(col), sa.func.max(col)).select_from(source).where(*base)).one()
         except sa.exc.SQLAlchemyError as exc:
             raise ConnectionError_(f"finding the range of {column} in {schema}.{table} failed: {friendly(exc)}") from None
+        from eyetable import loadlog
+
+        loadlog.step(f"Reading {schema}.{table} in parts by {column}: it runs {low} .. {high}; each part aims at "
+                     f"{target:,} rows ({len(source.c)} columns)")
         parts = 0
         if low is not None:
             step = _Step(low, high, target)
@@ -162,14 +167,19 @@ class DbTableConnector(DatabaseConnector):
             while True:
                 last = step.past(at, high)
                 where = col >= at if last else sa.and_(col >= at, col < step.after(at))
+                t0 = time.perf_counter()
                 try:
                     rows = self._fetch(sa.select(source).where(*base, where))
                 except sa.exc.SQLAlchemyError as exc:
                     if is_timeout(exc) and step.halve():
+                        loadlog.emit("warn", f"Part {parts + 1} ({column} from {at}) timed out after "
+                                             f"{time.perf_counter() - t0:.0f} s; trying it half as wide")
                         continue  # the same start, half as wide
                     raise ConnectionError_(f"reading {schema}.{table} (part {parts + 1}, {column} from {at}) failed: "
                                            f"{friendly(exc)}") from None
                 parts += 1
+                loadlog.step(f"Part {parts}: {column} from {at}" + ("" if last else f" up to {step.after(at)}") +
+                             f": {len(rows):,} rows in {time.perf_counter() - t0:.1f} s")
                 for i in range(0, len(rows), batch_size):
                     yield rows[i:i + batch_size]
                 if last:
