@@ -457,7 +457,8 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from None
         try:
-            run_id = groups.run_tag(tag, google_token=body.google_token if body else None)
+            run_id = groups.run_tag(tag, google_token=body.google_token if body else None,
+                                    incremental=bool(body and body.incremental))
         except LookupError as exc:
             raise HTTPException(404, str(exc).strip("'\"")) from None
         except ValueError as exc:
@@ -748,7 +749,8 @@ def create_app(
         """Start reloading every source in the group; poll /api/group-runs/{run_id} for progress."""
         get_group(group_id)
         try:
-            run_id = groups.run(group_id, "manual", google_token=body.google_token if body else None)
+            run_id = groups.run(group_id, "manual", google_token=body.google_token if body else None,
+                                incremental=bool(body and body.incremental))
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from None
         return {"run_id": run_id}

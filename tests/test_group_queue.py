@@ -76,3 +76,69 @@ def test_the_api_wires_group_runs_into_its_queue(store):
     items = client.get("/api/queue", headers=AUTH).json()["items"]
     assert runner.queue is client.app.state.load_queue
     assert sorted(i["source"] for i in items) == ["orders", "parts"] and all(i["by"] == "Group Both · Run now" for i in items)
+
+
+def test_incremental_group_runs_load_incrementally_where_set_up_and_in_full_elsewhere(store, tmp_path):
+    import sqlite3
+
+    from cryptography.fernet import Fernet
+
+    path = tmp_path / "crm.db"
+    conn = sqlite3.connect(path)
+    conn.executescript("CREATE TABLE accounts (id INTEGER); INSERT INTO accounts VALUES (1), (2);"
+                       "CREATE TABLE notes (b TEXT); INSERT INTO notes VALUES ('x');")
+    conn.commit()
+    conn.close()
+    engine = Engine(store, environ={"EYETABLE_SECRET_KEY": Fernet.generate_key().decode()})
+    engine.load_db_objects(f"sqlite:///{path.as_posix()}", [{"schema": "main", "name": "accounts", "kind": "table", "source": "crm"}])
+    engine.set_db_tables("crm", [{"schema": "main", "name": t, "kind": "table"} for t in ("accounts", "notes")])
+    engine.ingest_upload("parts", "parts.csv", b"name\nbolt\n", create=True)
+    store.save_increment("crm__data", "id")
+    conn = sqlite3.connect(path)
+    conn.execute("INSERT INTO accounts VALUES (3)")
+    conn.commit()
+    conn.close()
+
+    runner = GroupRunner(engine)
+    runner.queue = LoadQueue(engine)
+    group = runner.create("Both", ["crm", "parts"])
+    run = store.get_group_run(runner.run(group.id, wait=True, incremental=True))
+    assert run.status == "succeeded" and {r["source"]: r["load"] for r in run.results} == {"crm": "incremental", "parts": "full"}
+    crm = next(i for i in runner.queue.list() if i["source"] == "crm")
+    modes = {t["table"]: (t["mode"], t["rows"], t["expected"]) for t in crm["tables"]}
+    assert modes == {"crm__data": ("incremental", 1, None), "crm__notes": ("replace", 1, 1)}  # 1 new account; notes in full
+    assert crm["by"] == "Group Both \u00b7 Run now, incremental"
+    assert store.count_rows("crm__data") == 3
+
+    # a full run loads everything in full
+    run = store.get_group_run(runner.run(group.id, wait=True, incremental=False))
+    crm = runner.queue.list()[1]
+    assert [t["mode"] for t in crm["tables"]] == ["replace", "replace"] and store.count_rows("crm__data") == 3
+
+
+def test_a_schedule_says_whether_its_runs_are_incremental(store):
+    from eyetable.schedule import describe, normalize
+
+    sched = {"type": "daily", "times": ["06:00"], "days": [0, 1, 2, 3, 4, 5, 6], "timezone": "UTC"}
+    assert normalize(sched)["load"] == "full"
+    assert normalize({**sched, "load": "incremental"})["load"] == "incremental"
+    assert describe({**sched, "load": "incremental"}) == "Every day at 6:00 AM, incremental where set up"
+    import pytest
+
+    from eyetable.schedule import ScheduleError
+    with pytest.raises(ScheduleError):
+        normalize({**sched, "load": "sometimes"})
+    engine = loaded(store)
+    now = dt.datetime(2026, 11, 13, 6, 0, tzinfo=dt.timezone.utc)
+    runner = GroupRunner(engine, clock=lambda: now)
+    runner.queue = LoadQueue(engine)
+    group = runner.create("Morning", ["parts"], schedule={**sched, "load": "incremental"})
+    store.update_group(group.id, next_run_at=now - dt.timedelta(minutes=1))
+    [run_id] = runner.tick()
+    import time
+    for _ in range(200):
+        if store.get_group_run(run_id).status != "running":
+            break
+        time.sleep(0.05)
+    assert runner.queue.list()[0]["by"] == "Group Morning \u00b7 scheduled, incremental"
+    assert store.get_group_run(run_id).results[0]["load"] == "full"  # a file source has no incremental load

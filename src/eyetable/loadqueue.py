@@ -62,12 +62,12 @@ class LoadQueue:
 
     # -- what an item will load ----------------------------------------------------
 
-    def planned_tables(self, source: str, table: str | None, incremental: bool) -> list[dict[str, str]]:
+    def planned_tables(self, source: str, table: str | None, incremental: bool | str) -> list[dict[str, str]]:
         """The tables a reload of `source` (or of its `table`) loads: [{table, label}]."""
         from . import dbconnect
 
         src = self.store.get_source(source)
-        if incremental and src.type == "file":
+        if incremental is True and src.type == "file":
             raise IncrementalProblem("a file source gets new rows by loading a file with Append; there is nothing to fetch")
         if src.type == "dbtable":
             planned = [{"table": i.get("target") or table_name(source, i["name"]), "label": f"{i['schema']}.{i['table']}"}
@@ -82,7 +82,7 @@ class LoadQueue:
         if all(p["table"] in hidden for p in planned):
             raise ValueError(f"{planned[0]['label'] if table else source} is hidden in Sources; unhide it to load it")
         planned = [p for p in planned if p["table"] not in hidden]  # every load skips hidden tables
-        if incremental:
+        if incremental is True:
             chosen = self.store.increments()
             planned = [p for p in planned if p["table"] in chosen]
             if not planned:
@@ -91,20 +91,25 @@ class LoadQueue:
 
     # -- adding, listing, cancelling ----------------------------------------------
 
-    def add(self, source: str, table: str | None = None, incremental: bool = False,
+    def add(self, source: str, table: str | None = None, incremental: bool | str = False,
             google_token: str | None = None, by: str | None = None) -> tuple[dict[str, Any], bool]:
+        """Queue a reload: incremental=False (full), True (incremental tables only) or "auto"
+        (incremental where a table has an incremental column, full elsewhere)."""
         """Queue a reload; returns (the item, whether it is new). The same reload already waiting
         or running is returned instead of being queued twice."""
         planned = self.planned_tables(source, table, incremental)
+        src_type = self.store.get_source(source).type
         with self._lock:
             for item in self._items:
                 if item["status"] in ACTIVE and (item["source"], item["table"], item["incremental"]) == (source, table, incremental):
                     return self._public(item), False
+        chosen = self.store.increments() if incremental == "auto" else {}
         tables = []
         for p in planned:
             # how many rows the table had: what a full load is measured against
             before = self.store.count_rows(p["table"])
-            tables.append({**p, "before": before, "expected": None if incremental else before, "rows": 0,
+            by_increment = incremental is True or (incremental == "auto" and p["table"] in chosen and src_type != "file")
+            tables.append({**p, "before": before, "expected": None if by_increment else before, "rows": 0,
                            "status": "waiting", "mode": None, "since": None, "replaced": 0, "error": None,
                            "started_at": None, "updated_at": None, "finished_at": None})
         item = {

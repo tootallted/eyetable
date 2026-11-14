@@ -747,10 +747,23 @@ weekends), in your browser's timezone. The editor shows the schedule in words
 and its next three run times as you change it. Untick *Run on this schedule*
 to pause a group without losing its schedule.
 
-**Run now** reloads every source in the group, one after another (each the
-same way as its own **Reload** button), in the background: the row shows
-progress, then the result per source. One failing source doesn't stop the
-rest; the run is marked *Partly failed* and lists what went wrong.
+Each group has two buttons to run it now:
+
+* **Full load** reloads every table in the group in full.
+* **Incremental** loads incrementally every table that has an incremental
+  column (see *Incremental loads*). Every other table loads in full, including
+  file sources and tables without one.
+
+The sources load one after another, in the background, through the Load
+queue. The group's row shows progress, then the result for each source,
+including whether it actually loaded incrementally or in full. One failing
+source doesn't stop the rest; the run is marked *Partly failed* and lists what
+went wrong.
+
+A schedule chooses which of the two its runs do: *At the scheduled time,
+load: Incremental where set up, full for the rest* or *Everything in full*
+(the default). The schedule's description says so, for example "Every day at
+6:00 AM, incremental where set up".
 
 Scheduled runs happen inside `eyetable serve` (so on this PC, via the
 `EyetableApi` service or the `EyetablePublicApi` logon task), which checks every 30 seconds for groups

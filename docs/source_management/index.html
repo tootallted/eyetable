@@ -934,6 +934,12 @@
             <div class="hint">Quick pick: <button type="button" class="link" data-days="0,1,2,3,4,5,6">every day</button> ·
               <button type="button" class="link" data-days="0,1,2,3,4">weekdays</button> ·
               <button type="button" class="link" data-days="5,6">weekends</button></div>
+            <div class="row-inline" role="radiogroup" aria-label="What the scheduled run loads" style="gap:6px 16px">
+              <span>At the scheduled time, load:</span>
+              <label class="check"><input type="radio" name="ge-load" value="incremental" id="ge-load-inc">
+                Incremental where set up, full for the rest</label>
+              <label class="check"><input type="radio" name="ge-load" value="full" id="ge-load-full" checked> Everything in full</label>
+            </div>
             <label class="check"><input type="checkbox" id="ge-enabled" checked> Run on this schedule (untick to pause it)</label>
             <div class="preview" id="ge-preview" aria-live="polite"></div>
           </div>
@@ -3814,9 +3820,14 @@
       var body = groupsState.list.map(function (g) {
         var last = el('td');
         fillRunStatus(last, g);
-        var runBtn = el('button', { type: 'button', class: 'btn small primary', text: 'Run now' });
+        var runBtn = el('button', { type: 'button', class: 'btn small primary', text: 'Full load',
+          title: 'Run now: load every table in the group in full' });
         runBtn.disabled = !!g.running || !state.connected;
-        runBtn.addEventListener('click', function () { runGroup(g); });
+        runBtn.addEventListener('click', function () { runGroup(g, false); });
+        var incBtn = el('button', { type: 'button', class: 'btn small', text: 'Incremental',
+          title: 'Run now: tables with an incremental column load incrementally; every other table loads in full' });
+        incBtn.disabled = !!g.running || !state.connected;
+        incBtn.addEventListener('click', function () { runGroup(g, true); });
         var editBtn = el('button', { type: 'button', class: 'btn small', text: 'Edit' });
         editBtn.addEventListener('click', function () { openEditor(g); });
         return el('tr', null, [
@@ -3830,16 +3841,20 @@
           el('td', { text: g.schedule_text + (g.schedule && !g.enabled ? ' (paused)' : '') }),
           el('td', { class: 'nowrap', text: g.next_run_at ? fmtTime(g.next_run_at) : '—' }),
           last,
-          el('td', null, [el('div', { class: 'actions' }, [runBtn, editBtn])])
+          el('td', null, [el('div', { class: 'actions' }, [runBtn, incBtn, editBtn])])
         ]);
       });
       wrap.appendChild(el('table', { class: 'groups-table' }, [el('thead', null, [head]), el('tbody', null, body)]));
     }
 
-    function runGroup(g) {
+    function runGroup(g, incremental) {
       var msg = clear($('groups-msg'));
       var hasSheets = (g.sources || g.members).some(function (m) { return state.sources.some(function (s) { return s.name === m && s.type === 'gsheet'; }); });
-      var body = hasSheets && googleToken() ? JSON.stringify({ google_token: googleToken() }) : '{}';
+      var payload = {};
+      if (hasSheets && googleToken()) payload.google_token = googleToken();
+      if (incremental) payload.incremental = true;  // incremental where set up, full for the rest
+      g.lastIncremental = !!incremental;
+      var body = JSON.stringify(payload);
       g.running = true;
       renderGroups();
       var path = g.tag ? '/api/tags/' + encodeURIComponent(g.tag) + '/run' : '/api/groups/' + g.id + '/run';
@@ -3870,7 +3885,7 @@
           var b = banner(run.status === 'succeeded' ? 'ok' : run.status === 'partial' ? 'warn' : 'err', text);
           var needsGoogle = failed.some(function (r) { return /private|sign in/i.test(r.error || ''); });
           if (needsGoogle && GOOGLE_CLIENT_ID && gauth.client && !googleToken()) {
-            b.appendChild(el('div', null, [googleButton('Sign in with Google and run again', function () { runGroup(g); }, 'groups-msg')]));
+            b.appendChild(el('div', null, [googleButton('Sign in with Google and run again', function () { runGroup(g, g.lastIncremental); }, 'groups-msg')]));
           }
           clear($('groups-msg')).appendChild(b);
           refresh().catch(function () {});
@@ -3882,7 +3897,7 @@
     // The editor --------------------------------------------------------------
     function defaultEditing() {
       return { id: null, name: '', members: [], kind: 'none', times: ['06:00'], every: 1, start: '08:00', end: '17:00',
-               days: [0, 1, 2, 3, 4, 5, 6], enabled: true, timezone: BROWSER_TZ };
+               days: [0, 1, 2, 3, 4, 5, 6], enabled: true, timezone: BROWSER_TZ, load: 'full' };
     }
 
     function openEditor(g) {
@@ -3892,7 +3907,7 @@
         e.id = g.id; e.name = g.name; e.members = g.members.slice(); e.enabled = g.enabled;
         var sc = g.schedule;
         if (sc) {
-          e.kind = sc.type; e.days = sc.days.slice(); e.timezone = sc.timezone;
+          e.kind = sc.type; e.days = sc.days.slice(); e.timezone = sc.timezone; e.load = sc.load || 'full';
           if (sc.type === 'daily') e.times = sc.times.slice();
           else { e.every = sc.every; e.start = sc.start; e.end = sc.end; }
         }
@@ -3908,6 +3923,8 @@
       $('ge-start').value = e.start;
       $('ge-end').value = e.end;
       $('ge-enabled').checked = e.enabled;
+      $('ge-load-inc').checked = e.load === 'incremental';
+      $('ge-load-full').checked = e.load !== 'incremental';
       clear($('ge-msg'));
       renderEditor();
       $('group-editor').hidden = false;
@@ -3980,8 +3997,10 @@
     function editorSchedule() {
       var e = groupsState.editing;
       if (!e || e.kind === 'none') return null;
-      if (e.kind === 'daily') return { type: 'daily', times: e.times.filter(Boolean), days: e.days, timezone: e.timezone };
-      return { type: 'hourly', every: Number($('ge-every').value), start: $('ge-start').value, end: $('ge-end').value, days: e.days, timezone: e.timezone };
+      var load = $('ge-load-inc').checked ? 'incremental' : 'full';
+      if (e.kind === 'daily') return { type: 'daily', times: e.times.filter(Boolean), days: e.days, timezone: e.timezone, load: load };
+      return { type: 'hourly', every: Number($('ge-every').value), start: $('ge-start').value, end: $('ge-end').value, days: e.days,
+               timezone: e.timezone, load: load };
     }
 
     function schedulePreview() {
@@ -4384,7 +4403,8 @@
     var QUEUE_STATUS = { queued: 'Waiting', running: 'Loading', succeeded: 'Done', failed: 'Failed', cancelled: 'Cancelled' };
 
     function queueItem(item) {
-      var title = (item.incremental ? 'Incremental load' : 'Full load') + ' \u00b7 ' + item.label + (item.table ? ' (' + item.source + ')' : '');
+      var title = (item.incremental === 'auto' ? 'Incremental where set up' : item.incremental ? 'Incremental load' : 'Full load') +
+        ' \u00b7 ' + item.label + (item.table ? ' (' + item.source + ')' : '');
       var by = item.by ? el('span', { class: 'q-by', text: item.by }) : null;
       var when = item.status === 'queued' ? 'added ' + fmtTime(item.created_at)
         : item.finished_at ? 'took ' + fmtDuration(new Date(item.finished_at) - new Date(item.started_at || item.created_at)) + ', finished ' + fmtTime(item.finished_at)

@@ -546,7 +546,7 @@ class Engine:
         self,
         source: str,
         sheet_fetch: Callable[[str], gsheets.Workbook] = gsheets.fetch_workbook,
-        incremental: bool = False,
+        incremental: bool | str = False,
         table: str | None = None,
     ) -> list[RunResult]:
         """Load a source's data again, so its table (and last-loaded time) is fresh.
@@ -557,11 +557,22 @@ class Engine:
         * database / postman: every readable dataset is pulled again (replace).
 
         With `incremental`, only rows past each table's incremental column are
-        loaded (see incremental.py); tables without one are left alone. `table`
+        loaded (see incremental.py); tables without one are left alone. With
+        `incremental="auto"`, tables with an incremental column load incrementally and
+        every other table (file sources included) loads in full. `table`
         loads just that one of a database source's tables.
         """
         src = self.store.get_source(source)
-        loadlog.step(f"{'Incremental' if incremental else 'Full'} load of {source} ({src.type} source)"
+        auto = incremental == "auto"
+        if auto:  # per table: incremental where set up, full elsewhere
+            chosen = self.store.increments()
+            incremental = src.type != "file" and any(t in chosen for t in targets.tables(src))
+            if incremental and src.type != "dbtable":
+                incremental = True  # its one table has an incremental column
+            elif src.type == "dbtable" and incremental:
+                incremental = "auto"
+        loadlog.step(f"{'Incremental where set up, full elsewhere:' if incremental == 'auto' else 'Incremental' if incremental else 'Full'}"
+                     f" load of {source} ({src.type} source)"
                      + (f", table {table}" if table else ""))
         if incremental and src.type == "file":
             raise incremental_problem("a file source gets new rows by loading a file with Append; there is nothing to fetch")
@@ -627,7 +638,8 @@ class Engine:
             if incremental:
                 return [self._sheet_increment(book, tab, source, target)]
             return [self._load_sheet_tab(book, tab, source, target, "replace")]
-        return skipped + self.ingest(source, keys=keys_, mode="incremental" if incremental else "replace")
+        return skipped + self.ingest(source, keys=keys_, mode="auto" if incremental == "auto" else
+                                     "incremental" if incremental else "replace")
 
     def _sheet_increment(self, book: gsheets.Workbook, tab: gsheets.Tab, source: str, table: str) -> RunResult:
         """Add the tab's rows past the incremental column (the whole tab is fetched; sheets can't be asked for less)."""
@@ -931,11 +943,14 @@ class Engine:
             if not keys:
                 raise incremental_problem("no incremental column is chosen for this table; choose one in Preview Data")
 
+        chosen_columns = self.store.increments() if mode == "auto" else {}
         results = []
         with self.connector(source) as conn:
             for key in keys:
                 table = targets.table_for(src, catalog[key].name)
-                if mode == "incremental":
+                # "auto": this table incrementally if it has an incremental column, else in full
+                key_mode = ("incremental" if table in chosen_columns else "replace") if mode == "auto" else mode
+                if key_mode == "incremental":
                     p = incremental.plan(self.store, table)
                     loadlog.step(f"{table}: incremental by {p.column}; " + (
                         f"rows with {p.column} {'>=' if p.inclusive else '>'} {p.since}"
@@ -945,8 +960,8 @@ class Engine:
                         results.append(self._ingest_increment(conn, source, key, catalog[key], table, p, batch_size))
                         continue
                     # an empty (or missing) table: there is nothing to go on, so load it all
-                run_id = self.store.start_run(source, key, table, "replace" if mode == "incremental" else mode)
-                write_mode = "replace" if mode == "incremental" else mode
+                run_id = self.store.start_run(source, key, table, "replace" if key_mode == "incremental" else key_mode)
+                write_mode = "replace" if key_mode == "incremental" else key_mode
 
                 def write(split, key=key, table=table, run_id=run_id, write_mode=write_mode):
                     loadlog.step(f"Reading {conn.origin(key)} into {table}" + (f" in parts by {split}" if split else ""))

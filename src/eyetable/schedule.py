@@ -48,6 +48,11 @@ def normalize(schedule: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(days, list) or not days or any(d not in range(7) for d in days):
         raise ScheduleError("pick at least one day (0 = Monday ... 6 = Sunday)")
     days = sorted(set(days))
+    # what a scheduled run loads: "full" (everything in full) or "incremental" (incremental where
+    # a table has an incremental column, full elsewhere)
+    load = schedule.get("load") or "full"
+    if load not in ("full", "incremental"):
+        raise ScheduleError('load must be "full" or "incremental"')
 
     if kind == "daily":
         times = schedule.get("times")
@@ -56,7 +61,8 @@ def normalize(schedule: dict[str, Any]) -> dict[str, Any]:
         if len(times) > 24:
             raise ScheduleError("a daily schedule can have at most 24 times")
         parsed = sorted({_parse_time(t, "each time") for t in times})
-        return {"type": "daily", "times": [t.strftime("%H:%M") for t in parsed], "days": days, "timezone": tz}
+        return {"type": "daily", "times": [t.strftime("%H:%M") for t in parsed], "days": days, "timezone": tz,
+                "load": load}
     if kind == "hourly":
         every = schedule.get("every", 1)
         if every not in EVERY_HOURS:
@@ -66,7 +72,7 @@ def normalize(schedule: dict[str, Any]) -> dict[str, Any]:
         if end < start:
             raise ScheduleError("the end time must not be before the start time")
         return {"type": "hourly", "every": every, "start": start.strftime("%H:%M"), "end": end.strftime("%H:%M"),
-                "days": days, "timezone": tz}
+                "days": days, "timezone": tz, "load": load}
     raise ScheduleError('schedule type must be "daily" or "hourly"')
 
 
@@ -139,8 +145,10 @@ def describe(schedule: dict[str, Any] | None) -> str:
     if s["type"] == "daily":
         times = [_clock(_parse_time(t, "time")) for t in s["times"]]
         when = times[0] if len(times) == 1 else ", ".join(times[:-1]) + " and " + times[-1]
-        return f"Daily at {when}, {days}" if days != "every day" else f"Every day at {when}"
-    every = "Every hour" if s["every"] == 1 else f"Every {s['every']} hours"
-    start, end = _clock(_parse_time(s["start"], "start")), _clock(_parse_time(s["end"], "end"))
-    window = "all day" if s["start"] == "00:00" and s["end"] == "23:00" and s["every"] == 1 else f"from {start} to {end}"
-    return f"{every} {window}, {days}"
+        text = f"Daily at {when}, {days}" if days != "every day" else f"Every day at {when}"
+    else:
+        every = "Every hour" if s["every"] == 1 else f"Every {s['every']} hours"
+        start, end = _clock(_parse_time(s["start"], "start")), _clock(_parse_time(s["end"], "end"))
+        window = "all day" if s["start"] == "00:00" and s["end"] == "23:00" and s["every"] == 1 else f"from {start} to {end}"
+        text = f"{every} {window}, {days}"
+    return text + (", incremental where set up" if s.get("load") == "incremental" else "")
