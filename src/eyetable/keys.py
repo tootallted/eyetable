@@ -41,7 +41,7 @@ def source_columns(store: CoreStore, table: str) -> dict[str, str]:
     """A loaded table's own columns (no ET_ ones), in table order: name -> kind."""
     if not store.table_exists(table):
         raise KeyProblem(f"there is no loaded table named {table}")
-    cols = sa.inspect(store.db).get_columns(table, schema=store.data_schema)
+    cols = store.columns(table)
     return {c["name"]: kind_of(c["type"]) for c in cols if c["name"] not in ET_COLUMNS}
 
 
@@ -184,7 +184,7 @@ def increment_info(store: CoreStore, table: str) -> dict[str, Any] | None:
     column = store.get_increment(table)
     if column is None:
         return None
-    cols = {c["name"]: c["type"] for c in sa.inspect(store.db).get_columns(table, schema=store.data_schema)}         if store.table_exists(table) else {}
+    cols = {c["name"]: c["type"] for c in store.columns(table)} if store.table_exists(table) else {}
     if column not in cols:
         return {"column": column, "kind": None, "latest": None, "missing": True}
     return {"column": column, "kind": kind_of(cols[column]), "latest": store.max_value(table, column, cols[column]),

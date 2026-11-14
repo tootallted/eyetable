@@ -799,6 +799,11 @@
     </div>
     <div class="card-body" id="detail-body">
       <div class="stats" id="detail-stats"></div>
+      <div id="detail-naming" hidden style="display:grid; gap:10px">
+        <h3 style="font-size:14px; margin:0">Name and table</h3>
+        <div id="naming-body" style="display:grid; gap:10px"></div>
+        <div id="naming-msg" role="status"></div>
+      </div>
       <div id="src-settings" hidden style="display:grid; gap:10px">
         <h3 style="font-size:14px; margin:0">Connection settings</h3>
         <div id="ss-body" style="display:grid; gap:12px"></div>
@@ -1518,7 +1523,7 @@
         text: function (s) { return (s.tags || []).map(function (t) { return '#' + t; }).join(' '); } },
       { key: 'type', label: 'Type', value: function (s) { return typeLabel(s.type); } },
       { key: 'table', label: 'Table', value: function (s) { return s.tables ? s.tables.map(function (t) { return t.name; }).join(', ') : s.table || ''; },
-        text: function (s) { return s.tables ? s.tables.map(function (t) { return t.schema + '.' + t.name + ' eyetable_raw.' + t.table; }).join(' ') : 'eyetable_raw.' + (s.table || ''); } },
+        text: function (s) { return s.tables ? s.tables.map(function (t) { return t.schema + '.' + t.name + ' ' + fullTable(t.table); }).join(' ') : fullTable(s.table || ''); } },
       { key: 'rows', label: 'Rows', num: true, numeric: true, firstDir: -1,
         value: function (s) { return s.rows === null || s.rows === undefined ? null : s.rows; },
         text: function (s) { return s.rows === null || s.rows === undefined ? '' : fmtInt(s.rows) + ' ' + s.rows; } },
@@ -1609,6 +1614,9 @@
       rows.forEach(function (r) { body.appendChild(r); });
     }
 
+    // A table's full name: a plain one lives in eyetable_raw; one given a schema of its own names it.
+    function fullTable(ref) { return !ref ? '' : ref.indexOf('.') >= 0 ? ref : 'eyetable_raw.' + ref; }
+
     // A name as text with line-break chances after each _ and . (copying it still gives the plain name).
     function breakable(text) {
       var out = [];
@@ -1639,7 +1647,7 @@
         el('td', { class: 'wrap', 'data-label': 'Table' }, name),
         el('td', { 'data-label': 'Tags' }, [tagsCell(s)]),
         el('td', { 'data-label': 'Type' }, [el('span', { class: 'tag', text: typeLabel(s.type) })]),
-        el('td', { class: 'mono wrap', 'data-label': 'Loaded into' }, breakable('eyetable_raw.' + t.table)),
+        el('td', { class: 'mono wrap', 'data-label': 'Loaded into' }, breakable(fullTable(t.table))),
         el('td', { class: 'num', 'data-label': 'Rows', text: t.rows === null || t.rows === undefined ? '\u2014' : fmtInt(t.rows) }),
         el('td', { 'data-label': 'Columns', text: t.columns ? plural(t.columns, 'column') : '\u2014' }),
         el('td', { 'data-label': 'Last loaded', text: t.last_loaded_at ? fmtTime(t.last_loaded_at) : 'Not loaded yet' }),
@@ -1715,7 +1723,7 @@
           el('td', { class: 'wrap', 'data-label': 'Source' }, [el('strong', null, breakable(s.name))]),
           el('td', { 'data-label': 'Tags' }, [tagsCell(s)]),
           el('td', { 'data-label': 'Type' }, [el('span', { class: 'tag', text: typeLabel(s.type) })]),
-          s.tables ? tablesCell(s, open) : el('td', { class: 'mono wrap', 'data-label': 'Table' }, s.table ? breakable('eyetable_raw.' + s.table) : [s.datasets + ' dataset(s)']),
+          s.tables ? tablesCell(s, open) : el('td', { class: 'mono wrap', 'data-label': 'Table' }, s.table ? breakable(fullTable(s.table)) : [s.datasets + ' dataset(s)']),
           el('td', { class: 'num', 'data-label': 'Rows', text: s.table ? fmtInt(s.rows) : '—' }),
           el('td', { class: 'wrap', 'data-label': 'Last file', title: s.file_set ? 'Every file matching ' + s.file_set.pattern + ' in ' + s.file_set.folder : '' },
             [fileCell(s)]),
@@ -1886,10 +1894,10 @@
     // Up to three tables are named; more are counted, and the row opens to list them.
     function tablesCell(s, open) {
       var names = s.tables.map(function (t) { return t.name; });
-      var full = s.tables.map(function (t) { return 'eyetable_raw.' + t.table; }).join('\n');
+      var full = s.tables.map(function (t) { return fullTable(t.table); }).join('\n');
       if (s.tables.length <= 3) {
         var text = names.join(', ');
-        if (s.tables.length === 1) text = 'eyetable_raw.' + s.tables[0].table;
+        if (s.tables.length === 1) text = fullTable(s.tables[0].table);
         var shown = el('span', { text: text });
         if (s.tables.length > 1) shown.appendChild(el('span', { class: 'muted', text: open ? ' \u25be' : ' \u25b8' }));
         return el('td', { class: 'mono wrap', 'data-label': 'Table', title: full }, [shown]);
@@ -1906,7 +1914,7 @@
         el('td', { class: 'wrap', 'data-label': 'Table' }, [el('span', { class: 'sub-name', text: t.schema + '.' + t.name })]),
         el('td', { 'data-label': '' }),
         el('td', { 'data-label': 'Type' }, [el('span', { class: 'tag', text: t.kind })]),
-        el('td', { class: 'mono wrap', 'data-label': 'Loaded into' }, breakable('eyetable_raw.' + t.table)),
+        el('td', { class: 'mono wrap', 'data-label': 'Loaded into' }, breakable(fullTable(t.table))),
         el('td', { class: 'num', 'data-label': 'Rows', text: t.rows === null || t.rows === undefined ? '\u2014' : fmtInt(t.rows) }),
         el('td', { 'data-label': 'Columns', text: t.columns ? plural(t.columns, 'column') : '' }),
         el('td', { 'data-label': 'Last loaded', text: t.last_loaded_at ? fmtTime(t.last_loaded_at) : 'Not loaded yet' }),
@@ -2063,7 +2071,7 @@
       });
       var removed = dbt.tables.filter(function (t) { return !dbt.chosen[t.schema + '.' + t.name]; });
       if (removed.length && !confirm('Remove ' + plural(removed.length, 'table') + ' from ' + name + '? Their loaded copies are deleted: ' +
-          removed.map(function (t) { return 'eyetable_raw.' + t.table; }).join(', ') + '. The tables in the database itself aren\u2019t touched.')) return;
+          removed.map(function (t) { return fullTable(t.table); }).join(', ') + '. The tables in the database itself aren\u2019t touched.')) return;
       $('dbt-save').disabled = true;
       $('dbt-save').textContent = 'Loading\u2026';
       api('/api/sources/' + encodeURIComponent(name) + '/tables', { method: 'PUT', headers: JSON_HEADERS,
@@ -2590,7 +2598,7 @@
         if (!(src.tables && src.tables.length > 1)) stat('Columns', fmtInt(src.columns));
         if (src.type !== 'dbtable') stat(src.type === 'gsheet' ? 'Times loaded' : 'Files loaded', fmtInt(src.uploads.length));
         if (src.tables && src.tables.length > 1) stat('Tables', fmtInt(src.tables.length));
-        else stat('Table', 'eyetable_raw.' + src.table, true);
+        else stat('Table', fullTable(src.table), true);
         if (src.statement_count !== undefined) stat('Statements', fmtInt(src.statement_count));
         stats.appendChild(el('div', { class: 'stat' }, [el('div', { class: 'k', text: 'Primary key' }),
           el('div', { class: 'v', id: 'key-stat', text: '\u2026' })]));
@@ -2600,6 +2608,7 @@
       }
 
       loadSettings(src);
+      renderNaming(src, src.tables && src.tables.length > 1 ? (state.pickedTable[src.name] || src.table) : src.table);
       renderDbTables(src);
       renderRequest(src);
       var pv = clear($('detail-preview'));
@@ -2612,6 +2621,7 @@
         which.addEventListener('change', function () {
           var picked = src.tables.filter(function (t) { return t.table === which.value; })[0];
           state.pickedTable[src.name] = which.value;
+          renderNaming(src, which.value);
           renderSources();  // the picked table's row is the highlighted one
           renderKeys(which.value, picked && picked.last_loaded_at, src);
           api('/api/sources/' + encodeURIComponent(src.name) + '/preview?limit=20&table=' + encodeURIComponent(which.value)).then(function (p) {
@@ -2681,7 +2691,7 @@
       clear($('incr-msg'));
       clear($('incr-body'));
       if (!table) return;
-      $('key-table').textContent = 'eyetable_raw.' + table;
+      $('key-table').textContent = fullTable(table);
       clear($('key-body')).appendChild(el('div', { class: 'muted', text: 'Loading the key scan\u2026' }));
       fetchKeys(table);
     }
@@ -3054,6 +3064,106 @@
       return api('/api/sources').then(function (sources) { state.sources = sources; renderSources(); }, function () {});
     }
 
+    // -- renaming a source and its table --------------------------------------------
+    // The source's name, and its table's full name (schema.table). A renamed table's old copy
+    // is kept, archived as <schema>_archived.<table>_<date>_<time>; the next full load makes the
+    // new one. Tables still named after the source (<source>__data) follow a new source name.
+    var namingState = { source: null, table: null, dirty: false };
+
+    function defaultTableFor(name, src, table) {
+      // <old source>__<dataset> follows the source; a table with a name of its own keeps it
+      var prefix = src.name + '__';
+      return table.indexOf('.') < 0 && table.indexOf(prefix) === 0 ? name + '__' + table.slice(prefix.length) : null;
+    }
+
+    function stamp() {
+      var d = new Date(), two = function (n) { return (n < 10 ? '0' : '') + n; };
+      return '' + d.getFullYear() + two(d.getMonth() + 1) + two(d.getDate()) + '_' + two(d.getHours()) + two(d.getMinutes()) + two(d.getSeconds());
+    }
+
+    function renderNaming(src, table) {
+      var box = $('detail-naming');
+      box.hidden = !table;
+      if (!table) return;
+      if (namingState.source === src.name && namingState.table === table && namingState.dirty) return;  // keep what's being typed
+      namingState = { source: src.name, table: table, dirty: false };
+      clear($('naming-msg'));
+      var body = clear($('naming-body'));
+      var name = el('input', { type: 'text', value: src.name, spellcheck: 'false', autocomplete: 'off', 'aria-label': 'Source name' });
+      var tbl = el('input', { type: 'text', value: fullTable(table), spellcheck: 'false', autocomplete: 'off', 'aria-label': 'Table (schema.table)' });
+      tbl.style.fontFamily = 'var(--mono)';
+      var note = el('p', { class: 'hint', style: 'margin:0' });
+      var tblTouched = false;
+      var show = function () {
+        var newName = name.value.trim(), newTable = tbl.value.trim(), oldFull = fullTable(table);
+        var tableChanges = newTable && newTable !== oldFull;
+        var parts = [];
+        if (newName !== src.name) parts.push('The source becomes ' + newName + '.');
+        if (tableChanges) {
+          var old = oldFull.split('.'), archived = old[0] + '_archived.' + old[1] + '_' + stamp();
+          parts.push('The table becomes ' + newTable + '. The current ' + oldFull + ' is kept, archived as ' + archived +
+            ', and the new table is made by the next full load (Save and load does that now). Its natural key, incremental column and hidden setting carry over.');
+        } else if (newName !== src.name) {
+          parts.push('Its table keeps its name, ' + oldFull + '.');
+        }
+        note.textContent = parts.join(' ') || 'Change the source\u2019s name, or its table\u2019s name and schema (schema.table).';
+        save.disabled = load.disabled = !(newName && (newName !== src.name || tableChanges));
+      };
+      name.addEventListener('input', function () {
+        namingState.dirty = true;
+        if (!tblTouched) {  // a table named after the source follows its new name
+          var follow = defaultTableFor(name.value.trim() || src.name, src, table);
+          if (follow) tbl.value = fullTable(follow);
+        }
+        show();
+      });
+      tbl.addEventListener('input', function () { namingState.dirty = true; tblTouched = true; show(); });
+      var save = el('button', { type: 'button', class: 'btn', text: 'Save' });
+      var load = el('button', { type: 'button', class: 'btn primary', text: 'Save and load' });
+      var go = function (thenLoad) {
+        var newName = name.value.trim(), newTable = tbl.value.trim();
+        var body = { name: newName !== src.name ? newName : null };
+        if (newTable !== fullTable(table)) { body.table = table; body.new_table = newTable; }
+        var msg = clear($('naming-msg'));
+        save.disabled = load.disabled = true;
+        api('/api/sources/' + encodeURIComponent(src.name) + '/naming', { method: 'PUT', headers: JSON_HEADERS, body: JSON.stringify(body) }).then(function (r) {
+          var lines = [];
+          if (r.renamed_from) lines.push(r.renamed_from + ' is now ' + r.source + '.');
+          r.tables.forEach(function (c) {
+            lines.push(fullTable(c.from) + ' \u2192 ' + fullTable(c.to) + (c.archived_as ? '; the old table is kept as ' + fullTable(c.archived_as) : '') + '.');
+          });
+          var renamedTable = r.tables.filter(function (c) { return c.from === table; })[0];
+          if (r.renamed_from && state.selected === r.renamed_from) state.selected = r.source;
+          if (r.renamed_from) { state.pickedTable[r.source] = state.pickedTable[r.renamed_from]; delete state.pickedTable[r.renamed_from]; }
+          if (renamedTable && state.pickedTable[r.source]) state.pickedTable[r.source] = renamedTable.to;
+          namingState = { source: null, table: null, dirty: false };
+          var done = function () {  // at the top of Sources: Preview Data redraws after the refresh
+            clear($('sources-msg')).appendChild(banner('ok', lines.join(' ') + (thenLoad ? ' Loading the new table now.'
+              : r.tables.length ? ' The next full load (Reload) creates the new table.' : '')));
+          };
+          return refresh().then(function () {
+            done();
+            if (!thenLoad) return;
+            var fresh = state.sources.filter(function (x) { return x.name === r.source; })[0];
+            if (fresh) reloadSource(fresh, true, { table: renamedTable ? renamedTable.to : null,
+              label: fresh.tables && fresh.tables.length > 1 && renamedTable ? renamedTable.to : null });
+          });
+        }, function (err) {
+          msg.appendChild(banner('err', 'Not saved: ' + err.message));
+          show();
+        });
+      };
+      save.addEventListener('click', function () { go(false); });
+      load.addEventListener('click', function () { go(true); });
+      body.appendChild(el('div', { class: 'curl-settings' }, [
+        setField('Source name', name, 'Lowercase letters, digits and _, starting with a letter. Groups, tags and history follow.'),
+        setField('Table (schema.table)', tbl, 'The schema is created if it isn\u2019t there. A plain name stays in eyetable_raw.')
+      ]));
+      body.appendChild(note);
+      body.appendChild(el('div', { class: 'set-actions' }, [load, save]));
+      show();
+    }
+
     // -- staging a file ----------------------------------------------------
     function sanitize(name) {
       var s = name.toLowerCase().replace(/\.[^.]*$/, '').replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
@@ -3158,7 +3268,7 @@
       } else {
         var s = fileSources().filter(function (x) { return x.name === $('existing-source').value; })[0];
         if (s) {
-          t.append(chosenMode() === 'replace' ? 'Replaces the ' : 'Appends to the ', plural(s.rows, 'row') + ' in ', el('code', { text: 'eyetable_raw.' + s.table }), '.');
+          t.append(chosenMode() === 'replace' ? 'Replaces the ' : 'Appends to the ', plural(s.rows, 'row') + ' in ', el('code', { text: fullTable(s.table) }), '.');
         }
       }
     }
@@ -3298,7 +3408,7 @@
       });
       var entry = el('div', { class: 'tbl' }, [
         el('div', { class: 'tbl-head' }, [caret, nameBtn, peek]),
-        table && table !== name ? el('div', { class: 'alias', text: 'eyetable_raw.' + table, title: 'Also queryable by this table name' }) : null,
+        table && table !== name ? el('div', { class: 'alias', text: fullTable(table), title: 'Also queryable by this table name' }) : null,
         cols
       ]);
       entry.searchText = (name + ' ' + (table || '') + ' ' + (owner || '')).toLowerCase();

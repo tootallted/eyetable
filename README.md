@@ -392,6 +392,36 @@ organization blocks that, or device code sign-in, register your own public
 client app and set `EYETABLE_ENTRA_CLIENT_ID` in `.env`. API:
 `POST /api/entra/sign-in`, `GET /api/entra/sign-in/<id>`.
 
+### Renaming a source and its table
+
+Selecting a row in **Sources** shows **Name and table** in Preview Data. There
+you can change the source's name, its table's name, or both. The table can be
+moved to a schema of its own by writing `schema.table` (`finance.ledger`). A
+plain name stays in `eyetable_raw`.
+
+A renamed table isn't renamed in place:
+
+* The current table is **archived**, kept as
+  `<schema>_archived.<table>_<yyyymmdd>_<hhmmss>`, for example
+  `eyetable_raw_archived.ledger__data_20261113_161034`. It stays in the
+  database, unchanged.
+* The table's natural key, incremental column and hidden setting move to the
+  new name.
+* The **next full load** creates the new table. **Save and load** runs one
+  straight away; an incremental load of the new, empty table loads in full.
+* Tables still named after the source (`<source>__data`) follow a new source
+  name, and the box shows the new name as you type. A table with a name of its
+  own keeps it.
+* A source's groups, tags, history and the query window's source alias follow
+  a renamed source.
+
+New schemas, archives included, are created when first needed. On Postgres,
+the query window's read-only role is given SELECT on them. The query window
+lists tables outside `eyetable_raw` as `schema.table`, archives included.
+
+API: `PUT /api/sources/<name>/naming` with `{"name"?, "table"?, "new_table"?}`.
+`table` is the table's current name, needed when a source has several.
+
 ### Sources grouped by connection
 
 In **Sources**, sources that come from the same place sit under one line:

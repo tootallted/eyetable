@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
-from eyetable import filesets, gsheets, incremental, keys, loadlog
+from eyetable import filesets, gsheets, incremental, keys, loadlog, targets
 from eyetable.connectors import Connector, build_connector
 from eyetable.connectors.file import DATASET_KEY, FileConnector
 from eyetable.credentials import decrypt_secrets, resolve_env
@@ -209,7 +209,7 @@ class Engine:
 
         upload_id = self.store.save_upload(source, filename, content, mode) if keep_file else None
         dataset.detail["upload_id"] = upload_id
-        table = table_name(source, dataset.name)
+        table = targets.table_for(self.store.get_source(source), dataset.name)
         run_id = self.store.start_run(source, DATASET_KEY, table, mode)
         if upload_id is not None:
             self.store.link_upload(upload_id, run_id)
@@ -237,7 +237,7 @@ class Engine:
                 name = gsheets.make_source_name(f"{base}_{n}")
                 n += 1
             taken.add(name)
-            plan = SheetTabPlan(tab.title, tab.index, name, table_name(name, DATASET_KEY),
+            plan = SheetTabPlan(tab.title, tab.index, name, self._table_of(name),
                                 len(tab.headers), len(tab.records), exists=False)
             if not tab.headers:
                 plan.problem = "the tab is empty"
@@ -428,7 +428,7 @@ class Engine:
         self.store.save_source(name, "dbtable", config)
         self.store.save_catalog(name, datasets)
         for item in removed:
-            self.store.drop_table(table_name(name, item["name"]))
+            self.store.drop_table(item.get("target") or table_name(name, item["name"]))
         results = self.ingest(name, keys=[i["key"] for i in added]) if added else []
         return {"added": [i["key"] for i in added], "removed": [i["key"] for i in removed], "results": results}
 
@@ -570,10 +570,10 @@ class Engine:
             if src.type == "dbtable":
                 from eyetable import dbconnect
 
-                keys_ = [i["key"] for i in dbconnect.db_tables(src.config) if table_name(source, i["name"]) == table]
+                keys_ = [e["key"] for e in targets.entries(src) if e["ref"] == table]
                 if not keys_:
                     raise ValueError(f"{source} has no table {table}")
-            elif table != table_name(source, DATASET_KEY):
+            elif table != targets.table_for(src):
                 raise ValueError(f"{source} has no table {table}")
         # Tables hidden in Sources are skipped by every load: groups, schedules, the queue.
         hidden = self.store.hidden()
@@ -584,14 +584,14 @@ class Engine:
             items = dbconnect.db_tables(src.config)
             wanted = keys_ if keys_ is not None else [i["key"] for i in items]
             for i in items:
-                t = table_name(source, i["name"])
+                t = targets.table_for(src, i["name"])
                 if i["key"] in wanted and t in hidden:
                     skipped.append(RunResult(0, i["key"], t, "skipped", 0, "hidden in Sources"))
             keys_ = [k for k in wanted if k not in {r.dataset_key for r in skipped}]
             if not keys_:
                 return skipped
-        elif table_name(source, DATASET_KEY) in hidden:
-            return [RunResult(0, DATASET_KEY, table_name(source, DATASET_KEY), "skipped", 0, "hidden in Sources")]
+        elif targets.table_for(src) in hidden:
+            return [RunResult(0, DATASET_KEY, targets.table_for(src), "skipped", 0, "hidden in Sources")]
         if src.type == "file" and src.config.get("pattern"):
             return [self._load_file_set(source, src.config)]
         if src.type == "file":
@@ -623,7 +623,7 @@ class Engine:
                 raise ValueError(f'the tab "{wanted}" is no longer in "{book.title}"; it may have been renamed or deleted')
             if not tab.headers:
                 raise ValueError(f'the tab "{wanted}" is empty now; nothing was reloaded')
-            target = table_name(source, DATASET_KEY)
+            target = targets.table_for(src)
             if incremental:
                 return [self._sheet_increment(book, tab, source, target)]
             return [self._load_sheet_tab(book, tab, source, target, "replace")]
@@ -670,7 +670,7 @@ class Engine:
         """Load every file in the folder that matches the pattern into the source's one table (a replace).
         A column in any file becomes a column; rows from files without it are NULL. Each row's
         ET_source names its file."""
-        table = table_name(source, DATASET_KEY)
+        table = targets.table_for(self.store.get_source(source))
         files = filesets.matching_files(config.get("folder", ""), config["pattern"])
         loadlog.step(f"{len(files):,} file{'s' if len(files) != 1 else ''} in {config.get('folder')} match {config['pattern']}")
         if not files:
@@ -752,18 +752,95 @@ class Engine:
             name = new_name
         return name, warnings
 
+    def _table_of(self, source: str, name: str = DATASET_KEY) -> str:
+        """The table a source's dataset loads into (named after the source if there's no source yet)."""
+        try:
+            return targets.table_for(self.store.get_source(source), name)
+        except SourceNotFound:
+            return table_name(source, name)
+
     def rename_source(self, old: str, new: str) -> None:
-        """Rename a source, and its tables with it (<old>__x becomes <new>__x)."""
-        if not SOURCE_NAME.match(new):
-            raise ValueError("source names are lowercase letters, digits and _, starting with a letter")
-        src = self.store.get_source(old)
+        """Rename a source; tables named after it follow (their old copies archived). See rename."""
+        self.rename(old, new_name=new)
+
+    def rename(self, source: str, new_name: str | None = None, table: str | None = None,
+               new_table: str | None = None) -> dict[str, Any]:
+        """Rename a source and/or one of its tables (`table`, given a new name `new_table`, which may
+        name a schema: "finance.ledger").
+
+        A table that changes name isn't renamed in place: the old table is archived (kept, as
+        <schema>_archived.<table>_<yyyymmdd_hhmmss>), its settings (natural key, incremental
+        column, hidden) move to the new name, and the next full load creates the new table.
+        Tables still named after the source (<source>__x) follow a new source name the same way;
+        a table with a name of its own keeps it. Returns what changed.
+        """
+        src = self.store.get_source(source)
+        new_name = (new_name or source).strip()
+        if new_name != source:
+            if not SOURCE_NAME.match(new_name):
+                raise ValueError("source names are lowercase letters, digits and _, starting with a letter")
+            if self.store.source_exists(new_name):
+                raise ValueError(f"there is already a source named {new_name}")
+        current = targets.entries(src)
+        chosen = None
+        if new_table is not None:
+            matches = [e for e in current if e["ref"] == table] if table else current[:1] if len(current) == 1 else []
+            if not matches:
+                raise ValueError(f"{source} has no table {table}" if table else f"say which of {source}'s tables to rename")
+            chosen = matches[0]
+            schema, name = targets.parse(new_table, self.store.data_schema, self.store.meta_schema)
+            wanted = self.store.ref(schema, name)
+        plan = []
+        for e in current:
+            default = table_name(new_name, e["name"])
+            if chosen is not None and e is chosen:
+                want = wanted
+            elif e["target"]:
+                want = e["target"]
+            else:
+                want = default
+            plan.append((e, want, None if want == default else want))
+        wants = [w for _, w, _ in plan]
+        if len(set(wants)) != len(wants):
+            raise ValueError("two of its tables would have the same name")
+        for e, want, _ in plan:
+            if want != e["ref"]:
+                taken = [s.name for s in self.store.list_sources() if s.name != source and want in targets.tables(s)]
+                if taken:
+                    raise ValueError(f"{want} is already the table of {taken[0]}")
+                if self.store.table_exists(want):
+                    raise ValueError(f"a table named {want} already exists; choose another name")
+        changes = []
+        for e, want, _ in plan:
+            if want == e["ref"]:
+                continue
+            archived = self.store.archive_table(e["ref"])
+            self.store.move_table_settings(e["ref"], want)
+            self.store.ensure_schema(self.store.split(want)[0])
+            loadlog.step(f"{e['ref']} becomes {want}" + (f"; the old table is kept as {archived}" if archived else ""))
+            changes.append({"key": e["key"], "from": e["ref"], "to": want, "archived_as": archived})
+        config = dict(src.config)
         if src.type == "dbtable":
             from eyetable import dbconnect
 
-            names = [i["name"] for i in dbconnect.db_tables(src.config)]
+            items = [dict(i) for i in dbconnect.db_tables(config)]
+            for item, (_, _, target) in zip(items, plan):
+                if target:
+                    item["target"] = target
+                else:
+                    item.pop("target", None)
+            config.update(tables=items, schema=items[0]["schema"], table=items[0]["table"], kind=items[0]["kind"])
         else:
-            names = [DATASET_KEY]
-        self.store.rename_source(old, new, [(table_name(old, n), table_name(new, n)) for n in names])
+            target = plan[0][2]
+            if target:
+                config["target"] = target
+            else:
+                config.pop("target", None)
+        if config != src.config:
+            self.store.save_source(source, src.type, config)
+        if new_name != source:
+            self.store.rename_source(source, new_name)
+        return {"source": new_name, "renamed_from": source if new_name != source else None, "tables": changes}
 
     # -- big tables: reading in parts -----------------------------------------------------
 
@@ -839,6 +916,7 @@ class Engine:
         With no `keys`, every readable dataset in the catalog is ingested
         (discovering first if the source has never been discovered).
         """
+        src = self.store.get_source(source)
         catalog = {d.key: d for _, d in self.store.list_datasets(source)}
         if not catalog:
             catalog = {d.key: d for d in self.discover(source)}
@@ -849,14 +927,14 @@ class Engine:
             raise UnknownDataset(f"not in {source!r} catalog (run discover?): {', '.join(unknown)}")
         if mode == "incremental":
             chosen = self.store.increments()
-            keys = [k for k in keys if table_name(source, catalog[k].name) in chosen]
+            keys = [k for k in keys if targets.table_for(src, catalog[k].name) in chosen]
             if not keys:
                 raise incremental_problem("no incremental column is chosen for this table; choose one in Preview Data")
 
         results = []
         with self.connector(source) as conn:
             for key in keys:
-                table = table_name(source, catalog[key].name)
+                table = targets.table_for(src, catalog[key].name)
                 if mode == "incremental":
                     p = incremental.plan(self.store, table)
                     loadlog.step(f"{table}: incremental by {p.column}; " + (

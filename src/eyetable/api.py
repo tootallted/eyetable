@@ -36,7 +36,7 @@ from eyetable.engine import SINGLE_TABLE_TYPES, Engine
 from eyetable.gsheets import SheetError, fetch_workbook, fetch_workbook_signed_in
 from eyetable.identifiers import SOURCE_NAME, normalize_tag, table_name
 from eyetable.query import MAX_LIMIT, QueryError, QueryRunner
-from eyetable import dbconnect, entra, filesets, keys
+from eyetable import dbconnect, entra, filesets, keys, targets
 from eyetable.loadqueue import LoadQueue
 from eyetable.curl import auth_scheme, clean_statements, components, parse_curl, preview_statements, secret_places, stored_request
 from eyetable.curl import plan as curl_plan
@@ -192,6 +192,12 @@ class HiddenIn(BaseModel):
     hidden: bool
 
 
+class NamingIn(BaseModel):
+    name: str | None = Field(default=None, max_length=64)  # the source's new name
+    table: str | None = Field(default=None, max_length=200)  # which of its tables to rename (its table name now)
+    new_table: str | None = Field(default=None, max_length=200)  # its new name: "table" or "schema.table"
+
+
 class FilesIn(BaseModel):
     folder: str = Field(max_length=1000)
     pattern: str = Field(max_length=260)
@@ -330,7 +336,7 @@ def create_app(
         catalog = {d.key: d for d in datasets}
         out = []
         for item in dbconnect.db_tables(src.config):
-            table = table_name(src.name, item["name"])
+            table = item.get("target") or table_name(src.name, item["name"])
             finished, written, mode = loads.get(item["key"], (None, None, None))
             # a replace writes the whole table, so its count is the table's; otherwise count it
             rows = written if mode == "replace" else store.count_rows(table)
@@ -343,8 +349,8 @@ def create_app(
     def main_table(src) -> str:
         """The table a single-table source's name stands for in queries."""
         if src.type == "dbtable":
-            return table_name(src.name, dbconnect.db_tables(src.config)[0]["name"])
-        return table_name(src.name, DATASET_KEY)
+            return targets.table_for(src, dbconnect.db_tables(src.config)[0]["name"])
+        return targets.table_for(src)
 
     def source_summary(src, tags: dict[str, list[str]] | None = None) -> dict[str, Any]:
         datasets = [d for _, d in store.list_datasets(src.name)]
@@ -369,7 +375,7 @@ def create_app(
                 tables=tables,
             )
         elif src.type in SINGLE_TABLE_TYPES:
-            table = table_name(src.name, DATASET_KEY)
+            table = targets.table_for(src)
             uploads = store.list_uploads(src.name, limit=1)
             if src.type == "file" and src.config.get("pattern"):
                 summary["file_set"] = {"folder": src.config.get("folder"), "pattern": src.config["pattern"]}
@@ -613,7 +619,7 @@ def create_app(
         if src.type not in SINGLE_TABLE_TYPES:
             raise HTTPException(400, "preview is available for file and Google Sheet sources")
         if src.type == "dbtable" and table:
-            if table not in [table_name(name, i["name"]) for i in dbconnect.db_tables(src.config)]:
+            if table not in targets.tables(src):
                 raise HTTPException(404, f"{name} has no table {table}")
         else:
             table = main_table(src)
@@ -639,7 +645,7 @@ def create_app(
             if src.type in SINGLE_TABLE_TYPES:
                 entry["table"] = main_table(src)
             if src.type == "dbtable":
-                entry["tables"] = [table_name(src.name, i["name"]) for i in dbconnect.db_tables(src.config)]
+                entry["tables"] = targets.tables(src)
             sources.append(entry)
         return {"sources": sources, "tables": queries.tables()}
 
@@ -835,7 +841,7 @@ def create_app(
         return {"cleared": load_queue.clear_finished()}
 
     # -- key candidates and natural keys (keys.py) ------------------------------
-    TABLE_NAME = re.compile(r"^[A-Za-z0-9_]{1,63}$")
+    TABLE_NAME = re.compile(r"^([A-Za-z0-9_]{1,63}\.)?[A-Za-z0-9_]{1,63}$")  # a table, or schema.table
 
     def loaded_table(table: str) -> str:
         if not TABLE_NAME.match(table) or not store.table_exists(table):
@@ -862,6 +868,17 @@ def create_app(
             raise HTTPException(400, str(exc)) from None
 
     # -- file sets: a file source reading every matching file in a server folder ------
+    @app.put("/api/sources/{name}/naming", dependencies=auth)
+    def rename_source(name: str, body: NamingIn) -> dict[str, Any]:
+        """Rename a source and/or one of its tables (schema.table). A renamed table's old copy is
+        archived as <schema>_archived.<table>_<timestamp>; the next full load creates the new one."""
+        get_source(name)
+        try:
+            done = engine.rename(name, body.name, body.table, body.new_table)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from None
+        return jsonable_encoder({**done, "summary": source_summary(store.get_source(done["source"]))})
+
     @app.post("/api/files/match", dependencies=auth)
     def match_files(body: FilesIn) -> dict[str, Any]:
         """The files in a folder on the server that match a pattern (before saving it to a source)."""
@@ -894,8 +911,7 @@ def create_app(
     def set_hidden(table: str, body: HiddenIn) -> dict[str, Any]:
         """Hide a source's table from Sources and from every load (groups, schedules, Reload), or bring it back."""
         for src in store.list_sources():
-            tables = [table_name(src.name, i["name"]) for i in dbconnect.db_tables(src.config)] if src.type == "dbtable" \
-                else [table_name(src.name, DATASET_KEY)] if src.type in SINGLE_TABLE_TYPES else []
+            tables = targets.tables(src) if src.type == "dbtable" or src.type in SINGLE_TABLE_TYPES else []
             if table in tables:
                 store.set_hidden(table, body.hidden)
                 return jsonable_encoder({"table": table, "source": src.name, "hidden": body.hidden})
@@ -907,7 +923,7 @@ def create_app(
         for src in store.list_sources():
             if src.type == "dbtable":
                 for item in dbconnect.db_tables(src.config):
-                    if table_name(src.name, item["name"]) == table:
+                    if (item.get("target") or table_name(src.name, item["name"])) == table:
                         return src, item
         raise HTTPException(404, f"{table} isn't loaded from a database, so it has no parts setting")
 

@@ -71,6 +71,18 @@ class QueryRunner:
         # A fresh connection per query: temp views and session settings never leak.
         self.db = sa.create_engine(url, poolclass=NullPool) if url else store.db
         self.timeout_ms = int(timeout_s * 1000)
+        self.reader = sa.make_url(url).username if url else None
+        if self.reader and store.db.dialect.name == "postgresql":
+            store.schema_hooks.append(self.share_schema)  # new schemas (a table's own, archives) can be queried
+
+    def share_schema(self, schema: str) -> None:
+        """Let the query window's read-only role read a schema's tables, now and later ones."""
+        prep = self.store.db.dialect.identifier_preparer
+        s, r = prep.quote_schema(schema), prep.quote(self.reader)
+        with self.store.db.begin() as conn:
+            conn.execute(sa.text(f"GRANT USAGE ON SCHEMA {s} TO {r}"))
+            conn.execute(sa.text(f"GRANT SELECT ON ALL TABLES IN SCHEMA {s} TO {r}"))
+            conn.execute(sa.text(f"ALTER DEFAULT PRIVILEGES IN SCHEMA {s} GRANT SELECT ON TABLES TO {r}"))
 
     def _meta_tables(self) -> set[str]:
         """eyetable's own tables, when they share a schema with the data (SQLite)."""
@@ -83,11 +95,14 @@ class QueryRunner:
         insp = sa.inspect(self.store.db)
         hidden = self._meta_tables()
         out = []
-        for name in sorted(insp.get_table_names(schema=self.store.data_schema)):
-            if name.endswith("__stg") or name in hidden:
-                continue
-            cols = insp.get_columns(name, schema=self.store.data_schema)
-            out.append({"table": name, "columns": [{"name": c["name"], "type": str(c["type"])} for c in cols]})
+        for schema in [self.store.data_schema, *self.store.other_schemas()]:
+            for name in sorted(insp.get_table_names(schema=schema)):
+                if name.endswith("__stg") or name.startswith("et_reorder_") or name in hidden:
+                    continue
+                cols = insp.get_columns(name, schema=schema)
+                # tables outside the data schema are queried by schema.table
+                out.append({"table": self.store.ref(schema, name),
+                            "columns": [{"name": c["name"], "type": str(c["type"])} for c in cols]})
         return out
 
     def run(self, sql: str, limit: int = 1000, aliases: dict[str, str] | None = None) -> QueryResult:
@@ -133,7 +148,8 @@ class QueryRunner:
         return [
             f"CREATE TEMP VIEW {prep.quote(alias)} AS SELECT * FROM {self.store.qualified(table)}"
             for alias, table in sorted(aliases.items())
-            if table in existing and alias not in existing  # never shadow a real table
+            if (table in existing or ("." in table and self.store.table_exists(table)))
+            and alias not in existing  # never shadow a real table
         ]
 
     def _postgres(self, raw, sql: str, limit: int, aliases: dict[str, str]):

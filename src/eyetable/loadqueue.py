@@ -70,10 +70,10 @@ class LoadQueue:
         if incremental and src.type == "file":
             raise IncrementalProblem("a file source gets new rows by loading a file with Append; there is nothing to fetch")
         if src.type == "dbtable":
-            planned = [{"table": table_name(source, i["name"]), "label": f"{i['schema']}.{i['table']}"}
+            planned = [{"table": i.get("target") or table_name(source, i["name"]), "label": f"{i['schema']}.{i['table']}"}
                        for i in dbconnect.db_tables(src.config)]
         else:
-            planned = [{"table": table_name(source, DATASET_KEY), "label": source}]
+            planned = [{"table": src.config.get("target") or table_name(source, DATASET_KEY), "label": source}]
         if table is not None:
             planned = [p for p in planned if p["table"] == table]
             if not planned:

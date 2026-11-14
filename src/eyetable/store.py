@@ -199,6 +199,8 @@ class CoreStore:
         sqlite = self.db.dialect.name == "sqlite"
         self.meta_schema = None if sqlite else meta_schema
         self.data_schema = None if sqlite else data_schema
+        self.schema_hooks: list = []  # called with each schema ensure_schema creates (QueryRunner shares it)
+        self._schemas_made: set[str] = set()
 
         self.metadata = sa.MetaData(schema=self.meta_schema)
         self.sources = sa.Table(
@@ -712,26 +714,16 @@ class CoreStore:
 
     # -- renaming a source ---------------------------------------------------------
 
-    def rename_source(self, old: str, new: str, tables: list[tuple[str, str]]) -> None:
-        """Rename a source everywhere: its config, catalog, runs, files, tags, groups, and its tables
-        (`tables`: (old table, new table) pairs) with their keys, incremental columns and hidden flags."""
+    def rename_source(self, old: str, new: str) -> None:
+        """Rename a source in eyetable's records: its config, catalog, runs, files, tags and groups.
+        (Its tables are Engine.rename's job.)"""
         if self.source_exists(new):
             raise ValueError(f"there is already a source named {new}")
-        for _, t in tables:
-            if self.table_exists(t):
-                raise ValueError(f"there is already a table named {t}")
-        prep = self.db.dialect.identifier_preparer
         with self.db.begin() as conn:
             for table in (self.sources, ):
                 conn.execute(sa.update(table).where(table.c.name == old).values(name=new))
             for table in (self.datasets, self.runs, self.uploads, self.source_tags):
                 conn.execute(sa.update(table).where(table.c.source == old).values(source=new))
-            for old_t, new_t in tables:
-                conn.execute(sa.update(self.runs).where(self.runs.c.target_table == old_t).values(target_table=new_t))
-                for table in (self.table_keys, self.table_increments, self.hidden_tables):
-                    conn.execute(sa.update(table).where(table.c.table_name == old_t).values(table_name=new_t))
-                if sa.inspect(conn).has_table(old_t, schema=self.data_schema):
-                    conn.execute(sa.text(f"ALTER TABLE {self.qualified(old_t)} RENAME TO {prep.quote(new_t)}"))
             for row in conn.execute(sa.select(self.groups.c.id, self.groups.c.members)).all():
                 if old in row.members:
                     conn.execute(sa.update(self.groups).where(self.groups.c.id == row.id)
@@ -774,7 +766,8 @@ class CoreStore:
         if type_ is not None and isinstance(type_, sa.DateTime):
             type_ = UTCDateTime() if type_.timezone else sa.DateTime()
         col = sa.column(column, type_ if type_ is not None else sa.Text())
-        query = sa.select(sa.func.max(col)).select_from(sa.table(table, schema=self.data_schema))
+        schema, name = self.split(table)
+        query = sa.select(sa.func.max(col)).select_from(sa.table(name, schema=schema))
         with self.db.connect() as conn:
             return conn.execute(query).scalar()
 
@@ -817,8 +810,88 @@ class CoreStore:
 
     # -- data --------------------------------------------------------------
 
+    # A table is named by a "ref": "name" for a table in the data schema, or "schema.name" for a
+    # table a source was given a name of its own for, in a schema of its own.
+
+    def split(self, ref: str) -> tuple[str | None, str]:
+        """(schema, table name) of a table ref."""
+        if "." in ref:
+            schema, name = ref.split(".", 1)
+            return schema, name
+        return self.data_schema, ref
+
+    def ref(self, schema: str | None, name: str) -> str:
+        """The ref of a table: plain in the data schema, schema.name anywhere else."""
+        return name if schema in (None, self.data_schema) else f"{schema}.{name}"
+
+    def ensure_schema(self, schema: str | None) -> None:
+        """Create a schema if it isn't there yet, and tell whoever asked (the query window shares it)."""
+        if not schema or schema in self._schemas_made or self.db.dialect.name == "sqlite":
+            return
+        with self.db.begin() as conn:
+            conn.execute(CreateSchema(schema, if_not_exists=True))
+        self._schemas_made.add(schema)
+        for hook in self.schema_hooks:
+            try:
+                hook(schema)
+            except Exception:
+                pass  # sharing with the query window is a nicety; a load must not fail on it
+
+    def other_schemas(self) -> list[str]:
+        """Schemas besides the data schema that hold source tables: ones sources were given, and
+        the archives (<schema>_archived) of those and of the data schema. Only those that exist."""
+        if self.db.dialect.name == "sqlite":
+            return []
+        from eyetable import targets
+
+        wanted = {f"{self.data_schema}_archived"}
+        for src in self.list_sources():
+            try:
+                refs = targets.tables(src)
+            except Exception:
+                continue
+            for ref in refs:
+                schema = self.split(ref)[0]
+                if schema and schema != self.data_schema:
+                    wanted |= {schema, f"{schema}_archived"}
+        existing = set(sa.inspect(self.db).get_schema_names())
+        return sorted(wanted & existing)
+
+    def columns(self, ref: str) -> list[dict[str, Any]]:
+        schema, name = self.split(ref)
+        return sa.inspect(self.db).get_columns(name, schema=schema)
+
     def table_exists(self, table: str) -> bool:
-        return sa.inspect(self.db).has_table(table, schema=self.data_schema)
+        schema, name = self.split(table)
+        return sa.inspect(self.db).has_table(name, schema=schema)
+
+    def archive_table(self, ref: str, when: dt.datetime | None = None) -> str | None:
+        """Keep a table out of the way under a dated name: eyetable_raw.ledger becomes
+        eyetable_raw_archived.ledger_20261113_161034. Returns its new ref (None if there was no table)."""
+        if not self.table_exists(ref):
+            return None
+        schema, name = self.split(ref)
+        stamp = (when or dt.datetime.now()).strftime("%Y%m%d_%H%M%S")
+        new_name = f"{name[:63 - len(stamp) - 1]}_{stamp}"
+        prep = self.db.dialect.identifier_preparer
+        if self.db.dialect.name == "sqlite" or not schema:  # no schemas: a dated name beside it
+            with self.db.begin() as conn:
+                conn.execute(sa.text(f"ALTER TABLE {self.qualified(ref)} RENAME TO {prep.quote(new_name)}"))
+            return new_name
+        archive = f"{schema}_archived"[:63]
+        self.ensure_schema(archive)
+        with self.db.begin() as conn:
+            conn.execute(sa.text(f"ALTER TABLE {self.qualified(ref)} RENAME TO {prep.quote(new_name)}"))
+            conn.execute(sa.text(f"ALTER TABLE {prep.quote_schema(schema)}.{prep.quote(new_name)} "
+                                 f"SET SCHEMA {prep.quote_schema(archive)}"))
+        return f"{archive}.{new_name}"
+
+    def move_table_settings(self, old: str, new: str) -> None:
+        """A table's natural key and scan, incremental column and hidden flag follow it to a new name."""
+        with self.db.begin() as conn:
+            for table in (self.table_keys, self.table_increments, self.hidden_tables):
+                conn.execute(sa.delete(table).where(table.c.table_name == new))
+                conn.execute(sa.update(table).where(table.c.table_name == old).values(table_name=new))
 
     def count_rows(self, table: str) -> int | None:
         if not self.table_exists(table):
@@ -828,9 +901,10 @@ class CoreStore:
 
     def qualified(self, table: str) -> str:
         prep = self.db.dialect.identifier_preparer
-        if self.data_schema:
-            return f"{prep.quote_schema(self.data_schema)}.{prep.quote(table)}"
-        return prep.quote(table)
+        schema, name = self.split(table)
+        if schema:
+            return f"{prep.quote_schema(schema)}.{prep.quote(name)}"
+        return prep.quote(name)
 
     def write(
         self,
@@ -872,16 +946,17 @@ class CoreStore:
             prep = self.db.dialect.identifier_preparer
             with self.db.begin() as conn:
                 conn.execute(sa.text(f"DROP TABLE IF EXISTS {self.qualified(table)}"))
-                conn.execute(sa.text(f"ALTER TABLE {self.qualified(target)} RENAME TO {prep.quote(table)}"))
+                conn.execute(sa.text(f"ALTER TABLE {self.qualified(target)} RENAME TO {prep.quote(self.split(table)[1])}"))
             loadlog.step(f"Swapped {target} in as {table}: {rows:,} rows, {len(writer.columns) + 1} columns")
         return rows
 
     def read_table(self, table: str, limit: int | None = None) -> list[dict[str, Any]]:
+        schema, name = self.split(table)
         reflected = sa.Table(
-            table,
+            name,
             sa.MetaData(),
             sa.Column(TIMESTAMP_COLUMN, UTCDateTime()),
-            schema=self.data_schema,
+            schema=schema,
             autoload_with=self.db,
         )
         query = sa.select(reflected).order_by(reflected.c[ID_COLUMN]).limit(limit)
@@ -907,14 +982,15 @@ class _TableWriter:
         self.out_of_order = False  # a source column was added after the ET columns
 
         qualified = store.qualified(table)
+        self.schema, self.name = store.split(table)
         insp = sa.inspect(store.db)
-        exists = insp.has_table(table, schema=store.data_schema)
+        exists = insp.has_table(self.name, schema=self.schema)
         if exists and fresh:
             with store.db.begin() as conn:
                 conn.execute(sa.text(f"DROP TABLE {qualified}"))
             exists = False
         if exists:
-            existing = insp.get_columns(table, schema=store.data_schema)
+            existing = insp.get_columns(self.name, schema=self.schema)
             if ID_COLUMN not in {c["name"] for c in existing}:
                 raise ValueError(f"{table} has no {ID_COLUMN} column; ingest it with mode=replace once to rebuild it")
             for col in existing:
@@ -925,7 +1001,9 @@ class _TableWriter:
         self._rebuild()
 
     def _create(self, name: str, data: dict[str, str]) -> None:
-        """A table of ET_id, the source's columns (`data`), then the other ET columns."""
+        """A table of ET_id, the source's columns (`data`), then the other ET columns (`name`: a bare
+        name, in this writer's schema)."""
+        self.store.ensure_schema(self.schema)
         cols = [
             # BIGINT identity on Postgres; SQLite only auto-numbers an INTEGER PRIMARY KEY.
             sa.Column(
@@ -937,11 +1015,11 @@ class _TableWriter:
             *(sa.Column(n, sa_type(k)) for n, k in data.items()),
             *(sa.Column(n, sa_type(k), nullable=False) for n, k in META_COLUMNS.items()),
         ]
-        sa.Table(name, sa.MetaData(), *cols, schema=self.store.data_schema).create(self.store.db)
+        sa.Table(name, sa.MetaData(), *cols, schema=self.schema).create(self.store.db)
 
     def _create_from(self, kinds: dict[str, str | None]) -> None:
         data = {self._column_for(key): kind or "text" for key, kind in kinds.items()}
-        self._create(self.table, data)
+        self._create(self.name, data)
         self.columns = {**data, **META_COLUMNS}
         self.pending = False
         self._rebuild()
@@ -957,8 +1035,9 @@ class _TableWriter:
         loadlog.step(f"Rebuilding {self.table} so columns that arrived late sit before the ET_ columns")
         db, prep = self.store.db, self.store.db.dialect.identifier_preparer
         data = {n: k for n, k in self.columns.items() if n not in META_COLUMNS}
-        temp = f"et_reorder_{secrets.token_hex(6)}"
-        self._create(temp, data)
+        temp_name = f"et_reorder_{secrets.token_hex(6)}"
+        self._create(temp_name, data)
+        temp = self.store.ref(self.schema, temp_name)
         names = ", ".join(prep.quote(c) for c in [ID_COLUMN, *data, *META_COLUMNS])
         overriding = " OVERRIDING SYSTEM VALUE" if db.dialect.name == "postgresql" else ""
         with db.begin() as conn:
@@ -970,14 +1049,14 @@ class _TableWriter:
                     f"MAX({prep.quote(ID_COLUMN)}) IS NOT NULL) FROM {self.store.qualified(temp)}"
                 ), {"t": self.store.qualified(temp), "c": ID_COLUMN})
             conn.execute(sa.text(f"DROP TABLE {self.store.qualified(self.table)}"))
-            conn.execute(sa.text(f"ALTER TABLE {self.store.qualified(temp)} RENAME TO {prep.quote(self.table)}"))
+            conn.execute(sa.text(f"ALTER TABLE {self.store.qualified(temp)} RENAME TO {prep.quote(self.name)}"))
         self.columns = {**data, **META_COLUMNS}
         self.out_of_order = False
         self._rebuild()
 
     def _rebuild(self) -> None:
         cols = [sa.column(n, sa_type(k)) for n, k in self.columns.items()]
-        self._table = sa.table(self.table, *cols, schema=self.store.data_schema)
+        self._table = sa.table(self.name, *cols, schema=self.schema)
 
     def _column_for(self, key: str) -> str:
         if key not in self.key_to_column:

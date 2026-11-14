@@ -61,7 +61,10 @@ def test_an_uploaded_file_becomes_a_set_of_files_in_one_table(store, folder):
     name, warnings = engine.update_file_source("ledger_2026_01_02", str(folder), "ledger_*.csv", "ledger_aggregated")
     assert (name, warnings) == ("ledger_aggregated", [])
     assert not store.source_exists("ledger_2026_01_02") and not store.table_exists("ledger_2026_01_02__data")
-    assert store.table_exists("ledger_aggregated__data")  # the old table, renamed
+    assert not store.table_exists("ledger_aggregated__data")  # made by the next load
+    import sqlalchemy as sa
+    archived = [t for t in sa.inspect(store.db).get_table_names() if t.startswith("ledger_2026_01_02__data_")]
+    assert len(archived) == 1  # the old table is kept under a dated name
     assert store.tags_by_source()["ledger_aggregated"] == ["finance"]
     assert store.get_group(group.id).members == ["ledger_aggregated"]
 

@@ -199,7 +199,7 @@ def plan(store: CoreStore, table: str) -> Plan:
         raise IncrementalProblem(f"{table} has no incremental column; choose one in Preview Data")
     if not store.table_exists(table):
         return Plan(column, None, False, None)
-    kinds = {c["name"]: c["type"] for c in sa.inspect(store.db).get_columns(table, schema=store.data_schema)}
+    kinds = {c["name"]: c["type"] for c in store.columns(table)}
     if column not in kinds:
         raise IncrementalProblem(f"{table} no longer has its incremental column {column}; choose another")
     saved = store.get_table_key(table)
