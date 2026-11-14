@@ -325,6 +325,16 @@
   .db-tools select { width: auto; }
   .db-list { max-height: 380px; overflow: auto; }
   .key-cols td.yes { color: var(--ok); font-weight: 600; }
+  .history-box { display: grid; gap: 4px; padding: 8px 12px; border: 1px solid var(--border); border-radius: 8px; }
+  .history-box.on { border-color: color-mix(in srgb, var(--accent) 45%, transparent); background: var(--accent-soft); }
+  /* Sources: what a table is set up with */
+  .flags { display: inline-flex; gap: 3px; flex-wrap: nowrap; }
+  .flag { font: 600 10px/1.4 var(--mono); padding: 0 4px; border-radius: 4px; background: var(--surface-2); color: var(--muted);
+    border: 1px solid var(--border); white-space: nowrap; }
+  .flag.pk { background: var(--ok-soft); color: var(--ok); border-color: transparent; }
+  .flag.ic { background: var(--accent-soft); color: var(--accent); border-color: transparent; }
+  .flag.h { background: var(--warn-soft); color: var(--warn); border-color: transparent; }
+  .sources-table th.flags-col, .sources-table td.flags-col { width: 1%; padding-left: 2px; padding-right: 2px; }
   .incr-list { display: grid; gap: 6px; }
   .incr-list label { display: flex; gap: 8px; align-items: baseline; font-size: 14px; cursor: pointer; }
   .incr-list label .why { color: var(--muted); font-size: 13px; }
@@ -1526,6 +1536,7 @@
       { key: 'hide', label: '', sort: false, filter: false, cls: 'hide-col' },
       { key: 'name', label: 'Source', value: function (s) { return s.name; },
         text: function (s) { return s.name + ' ' + (s.source || '') + ' ' + (s.connection ? s.connection.label : ''); } },
+      { key: 'flags', label: '', sort: false, filter: false, cls: 'flags-col' },
       { key: 'tags', label: 'Tags', value: function (s) { return (s.tags || []).join(' '); },
         text: function (s) { return (s.tags || []).map(function (t) { return '#' + t; }).join(' '); } },
       { key: 'type', label: 'Type', value: function (s) { return typeLabel(s.type); } },
@@ -1635,6 +1646,15 @@
       return out;
     }
 
+    // [PK] a natural key, [IC] an incremental column, [H] history kept: a table's set-up at a glance.
+    function flagsCell(t) {
+      var flags = [];
+      if (t && t.key) flags.push(el('span', { class: 'flag pk', text: 'PK', title: 'Has a natural (primary) key' }));
+      if (t && t.incremental) flags.push(el('span', { class: 'flag ic', text: 'IC', title: 'Incremental column: ' + t.incremental }));
+      if (t && t.history) flags.push(el('span', { class: 'flag h', text: 'H', title: 'Keeps history: loads merge by the natural key' }));
+      return el('td', { class: 'flags-col', 'data-label': flags.length ? 'Set up' : '' }, flags.length ? [el('span', { class: 'flags' }, flags)] : []);
+    }
+
     // One table of a database source, shaped like a source so it sorts and filters with the others.
     function dbTableEntry(s, t) {
       return { name: t.name, source: s.name, tags: s.tags, type: s.type, table: t.table, schema: t.schema, hidden: !!t.hidden,
@@ -1652,6 +1672,7 @@
         title: t.schema + '.' + t.name + (t.name !== s.name ? ', one of the tables of source ' + s.name : '') }, [
         hideCell(s, t),
         el('td', { class: 'wrap', 'data-label': 'Table' }, name),
+        flagsCell(t),
         el('td', { 'data-label': 'Tags' }, [tagsCell(s)]),
         el('td', { 'data-label': 'Type' }, [el('span', { class: 'tag', text: typeLabel(s.type) })]),
         el('td', { class: 'mono wrap', 'data-label': 'Loaded into' }, breakable(fullTable(t.table))),
@@ -1700,6 +1721,7 @@
         title: (open ? 'Close ' : 'Open ') + connection.label + ' to ' + (open ? 'hide' : 'show') + ' its ' + plural(members.length, allTables ? 'table' : 'source') }, [
         el('td', { class: 'hide-col' }),
         el('td', { class: 'wrap', 'data-label': 'Connection' }, [el('span', null, [caret, el('strong', { text: connection.label })])]),
+        el('td', { class: 'flags-col' }),
         el('td', { 'data-label': '' }),
         el('td', { 'data-label': 'Type' }, types.map(function (t) { return el('span', { class: 'tag', text: t }); })),
         el('td', { 'data-label': 'Holds', text: allTables ? plural(members.length, 'table')
@@ -1728,6 +1750,7 @@
         var tr = el('tr', { class: 'clickable' + (member ? ' member' : '') + (s.name === state.selected ? ' selected' : ''), tabindex: '0' }, [
           hideCell(s, null),
           el('td', { class: 'wrap', 'data-label': 'Source' }, [el('strong', null, breakable(s.name))]),
+          flagsCell(s.tables ? (s.tables.length === 1 ? s.tables[0] : null) : s),
           el('td', { 'data-label': 'Tags' }, [tagsCell(s)]),
           el('td', { 'data-label': 'Type' }, [el('span', { class: 'tag', text: typeLabel(s.type) })]),
           s.tables ? tablesCell(s, open) : el('td', { class: 'mono wrap', 'data-label': 'Table' }, s.table ? breakable(fullTable(s.table)) : [s.datasets + ' dataset(s)']),
@@ -1919,6 +1942,7 @@
       return el('tr', { class: 'sub' + (member ? ' member' : '') }, [
         el('td', { class: 'hide-col' }),
         el('td', { class: 'wrap', 'data-label': 'Table' }, [el('span', { class: 'sub-name', text: t.schema + '.' + t.name })]),
+        flagsCell(t),
         el('td', { 'data-label': '' }),
         el('td', { 'data-label': 'Type' }, [el('span', { class: 'tag', text: t.kind })]),
         el('td', { class: 'mono wrap', 'data-label': 'Loaded into' }, breakable(fullTable(t.table))),
@@ -2727,8 +2751,9 @@
       if (info.key) {
         var chk = info.key_check, ok = chk && chk.ok;
         body.appendChild(banner(ok ? 'ok' : 'warn', 'Natural key: ' + keyText(info.key) + '. ' + (ok
-          ? 'Every row has a value and no two rows share one (checked against ' + plural(chk.rows, 'row') + ').'
+          ? 'Every row has a value and no two rows share one (checked against ' + plural(chk.rows, 'row') + (info.history ? ', the current versions' : '') + ').'
           : keyProblem(chk))));
+        body.appendChild(historyControl(info));
       }
       if (scanning) body.appendChild(el('div', { class: 'muted', text: 'Scanning the latest load\u2026 this updates by itself.' }));
       if (!s) {
@@ -2772,6 +2797,44 @@
       body.appendChild(el('p', { class: 'hint', style: 'margin:0', text: 'Scanned ' + fmtTime(s.scanned_at) + ' over ' + plural(s.rows, 'row') +
         '. Every load scans its table again and re-checks the natural key. ET_id isn\u2019t offered: eyetable numbers rows as it loads them, ' +
         'so it can\u2019t match a row from one load to the next.' }));
+    }
+
+    // History: loads merge into the table by its natural key, keeping every version of a row
+    // (ET_active, ET_fromdt, ET_todt), and the table is never replaced while this is on.
+    function historyControl(info) {
+      var table = keyView.table;
+      var box = el('input', { type: 'checkbox' });
+      box.checked = !!info.history;
+      var wrap = el('div', { class: 'history-box' + (info.history ? ' on' : '') }, [
+        el('label', { class: 'check', style: 'font-weight:600; color:var(--text)' }, [box,
+          ' Track history: keep every version of each row (by ' + keyText(info.key) + ')']),
+        el('p', { class: 'hint', style: 'margin:0', text: info.history
+          ? 'On. Loads (full and incremental) merge into this table by ' + keyText(info.key) + ' and never replace it. A new ' +
+            keyText(info.key) + ' is added with ET_active 1, ET_fromdt now and ET_todt 9999-12-31. When a row\u2019s other columns change, ' +
+            'its current version is closed (ET_active 0, ET_todt now) and the new version is added the same way. Unchanged rows are left as they are. ' +
+            'Untick to stop: the next full load then replaces the table, and its old versions go with it.'
+          : 'Off: a full load replaces the table. Tick to keep history from the next load on: this table is then never replaced, ' +
+            'new and changed rows are added as current versions (ET_active 1, ET_fromdt, ET_todt 9999-12-31) and changed rows\u2019 old versions are kept, closed.' })
+      ]);
+      box.addEventListener('change', function () {
+        var on = box.checked, msg = clear($('key-msg'));
+        if (!on && !confirm('Stop keeping history for ' + fullTable(table) + '? The next full load replaces the table, and its old versions are dropped.')) {
+          box.checked = true;
+          return;
+        }
+        box.disabled = true;
+        api(keyApi(table, '/history'), { method: 'PUT', headers: JSON_HEADERS, body: JSON.stringify({ on: on }) }).then(function (r) {
+          if (keyView.table !== table) return;
+          showKeys(r);
+          $('key-msg').appendChild(banner('ok', on ? 'History is kept for this table from its next load on.' : 'History is off: the next full load replaces the table.'));
+          refreshSourcesOnly();
+        }, function (err) {
+          box.checked = !on;
+          box.disabled = false;
+          msg.appendChild(banner('err', err.message));
+        });
+      });
+      return wrap;
     }
 
     function chosenKey() {
@@ -2867,7 +2930,7 @@
         });
         bar.appendChild(save);
       }
-      if (info.key) {
+      if (info.key && !info.history) {  // a history table merges by its key: it stays while history is kept
         var drop = el('button', { type: 'button', class: 'btn danger', text: 'Clear the natural key' });
         drop.addEventListener('click', function () {
           var msg = clear($('key-msg'));
@@ -4573,6 +4636,9 @@
       state.showHidden = !state.showHidden;
       renderSources();
     });
+
+    // a background tab skips its queue checks; coming back, it catches up at once
+    document.addEventListener('visibilitychange', function () { if (!document.hidden && state.connected) loadQueue(); });
 
     $('queue-clear').addEventListener('click', function () {
       api('/api/queue', { method: 'DELETE' }).then(loadQueue, function () { loadQueue(); });

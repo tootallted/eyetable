@@ -20,6 +20,7 @@ import datetime as dt
 import hashlib
 import json
 import secrets
+import threading
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
@@ -39,7 +40,14 @@ TIMESTAMP_COLUMN = "ET_timestamp"
 SOURCE_COLUMN = "ET_source"
 RUN_ID_COLUMN = "ET_run_id"
 # Data columns may not take these names (compared case-insensitively, as SQLite does).
-RESERVED_COLUMNS = {c.lower() for c in (ID_COLUMN, TIMESTAMP_COLUMN, SOURCE_COLUMN, RUN_ID_COLUMN)}
+# A history table's columns (see CoreStore._merge): which version of a row is current, and when
+# each version was current from and to (datetime, no zone; current versions run to 9999-12-31).
+ACTIVE_COLUMN = "ET_active"
+FROM_COLUMN = "ET_fromdt"
+TO_COLUMN = "ET_todt"
+HISTORY_COLUMNS = (ACTIVE_COLUMN, FROM_COLUMN, TO_COLUMN)
+FOREVER = dt.datetime(9999, 12, 31)
+RESERVED_COLUMNS = {c.lower() for c in (ID_COLUMN, TIMESTAMP_COLUMN, SOURCE_COLUMN, RUN_ID_COLUMN, *HISTORY_COLUMNS)}
 # Every loaded table: ET_id, then the source's own columns, then these.
 META_COLUMNS = {TIMESTAMP_COLUMN: "timestamptz", SOURCE_COLUMN: "varchar", RUN_ID_COLUMN: "bigint"}
 
@@ -200,6 +208,7 @@ class CoreStore:
         self.meta_schema = None if sqlite else meta_schema
         self.data_schema = None if sqlite else data_schema
         self.schema_hooks: list = []  # called with each schema ensure_schema creates (QueryRunner shares it)
+        self._merges = threading.local()  # the last history merge's counts, per thread (take_merge_stats)
         self._schemas_made: set[str] = set()
 
         self.metadata = sa.MetaData(schema=self.meta_schema)
@@ -309,6 +318,14 @@ class CoreStore:
             self.metadata,
             sa.Column("table_name", sa.Text, primary_key=True),
             sa.Column("column_name", sa.Text, nullable=False),
+            sa.Column("set_at", UTCDateTime(), nullable=False),
+        )
+        # Tables that keep history: loads merge into them by their natural key (see _merge) instead
+        # of replacing them, keeping every version of each row.
+        self.table_history = sa.Table(
+            "table_history",
+            self.metadata,
+            sa.Column("table_name", sa.Text, primary_key=True),
             sa.Column("set_at", UTCDateTime(), nullable=False),
         )
         # Tables hidden in Sources ("commented out"): every load skips them (see Engine.reload_source).
@@ -688,6 +705,7 @@ class CoreStore:
             conn.execute(sa.delete(self.table_keys).where(self.table_keys.c.table_name == table))
             conn.execute(sa.delete(self.table_increments).where(self.table_increments.c.table_name == table))
             conn.execute(sa.delete(self.hidden_tables).where(self.hidden_tables.c.table_name == table))
+            conn.execute(sa.delete(self.table_history).where(self.table_history.c.table_name == table))
 
     # -- key scans and natural keys ------------------------------------------
 
@@ -728,6 +746,151 @@ class CoreStore:
                 if old in row.members:
                     conn.execute(sa.update(self.groups).where(self.groups.c.id == row.id)
                                  .values(members=[new if m == old else m for m in row.members]))
+
+    # -- history tables -------------------------------------------------------------
+
+    def keyed_tables(self) -> set[str]:
+        """The tables with a natural key."""
+        with self.db.connect() as conn:  # a cleared key is JSON null, so it's checked here, not in SQL
+            rows = conn.execute(sa.select(self.table_keys.c.table_name, self.table_keys.c.key_columns)).all()
+        return {r.table_name for r in rows if r.key_columns}
+
+    def histories(self) -> set[str]:
+        """The tables that keep history."""
+        with self.db.connect() as conn:
+            return set(conn.execute(sa.select(self.table_history.c.table_name)).scalars())
+
+    def has_history(self, table: str) -> bool:
+        return table in self.histories()
+
+    def set_history(self, table: str, on: bool) -> None:
+        with self.db.begin() as conn:
+            conn.execute(sa.delete(self.table_history).where(self.table_history.c.table_name == table))
+            if on:
+                conn.execute(sa.insert(self.table_history).values(table_name=table, set_at=_now()))
+
+    def history_key(self, table: str) -> list[str] | None:
+        """The natural key a history table merges by; None if the table doesn't keep history."""
+        if not self.has_history(table):
+            return None
+        saved = self.get_table_key(table)
+        return saved["key"] if saved and saved.get("key") else None
+
+    def take_merge_stats(self) -> dict[str, int] | None:
+        """The counts of the last history merge on this thread (once)."""
+        stats = getattr(self._merges, "stats", None)
+        self._merges.stats = None
+        return stats
+
+    def current_rows(self, ref: str) -> str:
+        """A table as SQL to select from: a history table's current versions only, else the table."""
+        if self.has_history(ref) and ACTIVE_COLUMN in {c["name"] for c in self.columns(ref)}:
+            prep = self.db.dialect.identifier_preparer
+            return f"(SELECT * FROM {self.qualified(ref)} WHERE {prep.quote(ACTIVE_COLUMN)} = 1) current_rows"
+        return self.qualified(ref)
+
+    def _merge(self, table: str, batches: Iterable[list[dict[str, Any]]], run_id: int, origin: Any,
+               key: list[str]) -> int:
+        """Load batches into a history table by its natural key `key`: a key not there yet is added
+        (ET_active 1, ET_fromdt now, ET_todt 9999-12-31); a key whose other columns changed gets a
+        new version the same way and its current version is closed (ET_active 0, ET_todt now); an
+        unchanged row is left as it is. Nothing is ever deleted. Returns the rows read."""
+        from eyetable import loadlog
+
+        schema, name = self.split(table)
+        incoming = self.ref(schema, f"{name[:50]}__incoming")
+        loadlog.step(f"{table} keeps history: reading the load into {incoming}, then merging it by {' + '.join(key)}")
+        rows = self.write(incoming, batches, "replace", run_id, origin=origin)
+        try:
+            stats = self._merge_into(table, incoming, key, rows)
+        finally:
+            with self.db.begin() as conn:
+                conn.execute(sa.text(f"DROP TABLE IF EXISTS {self.qualified(incoming)}"))
+        self._merges.stats = stats
+        loadlog.step(f"History merge into {table}: {stats['new']:,} new, {stats['changed']:,} changed "
+                     f"(their old versions closed), {stats['unchanged']:,} unchanged")
+        return rows
+
+    def _merge_into(self, table: str, incoming: str, key: list[str], rows: int) -> dict[str, int]:
+        db = self.db
+        prep = db.dialect.identifier_preparer
+        q = prep.quote
+        clock = dt.datetime.now()  # the server's local time, kept to the millisecond
+        now = clock.replace(microsecond=clock.microsecond // 1000 * 1000)
+        inc_cols = {c["name"]: c["type"] for c in self.columns(incoming)}
+        missing = [k for k in key if k not in inc_cols]
+        if missing:
+            raise ValueError(f"this load has no column {', '.join(missing)}, part of {table}'s natural key; "
+                             "a history table merges by it")
+        qi = self.qualified(incoming)
+        keys_sql = ", ".join(q(k) for k in key)
+        with db.connect() as conn:
+            nulls = conn.execute(sa.text(f"SELECT COUNT(*) FROM {qi} WHERE " +
+                                         " OR ".join(f"{q(k)} IS NULL" for k in key))).scalar_one()
+            dups = conn.execute(sa.text(f"SELECT COUNT(*) FROM (SELECT {keys_sql} FROM {qi} GROUP BY {keys_sql} "
+                                        f"HAVING COUNT(*) > 1) d")).scalar_one()
+        if nulls or dups:
+            raise ValueError(f"a history table needs one row per {' + '.join(key)} in each load; this one has "
+                             + " and ".join(x for x in [f"{nulls:,} row{'s' if nulls != 1 else ''} with no value in it" if nulls else "",
+                                                        f"{dups:,} value{'s' if dups != 1 else ''} more than once" if dups else ""] if x)
+                             + ". Nothing was changed.")
+        schema, name = self.split(table)
+        meta = {ID_COLUMN, *META_COLUMNS, *HISTORY_COLUMNS}
+        if not self.table_exists(table):  # the first load: every row is a first, current version
+            with db.begin() as conn:
+                conn.execute(sa.text(f"ALTER TABLE {qi} RENAME TO {q(name)}"))
+                self._add_history_columns(conn, table, now)
+            return {"new": rows, "changed": 0, "unchanged": 0}
+        tgt_cols = {c["name"]: c["type"] for c in self.columns(table)}
+        with db.begin() as conn:
+            if ACTIVE_COLUMN not in tgt_cols:  # history just turned on: today's rows are the first versions
+                self._add_history_columns(conn, table, now)
+            for c, typ in inc_cols.items():  # a column first seen in this load
+                if c not in tgt_cols and c not in meta:
+                    conn.execute(sa.text(f"ALTER TABLE {self.qualified(table)} ADD COLUMN {q(c)} "
+                                         f"{typ.compile(dialect=db.dialect)}"))
+                    tgt_cols[c] = typ
+            data = [c for c in tgt_cols if c not in meta]
+            t, i = q(name), "i"
+            text = "TEXT"
+            distinct = "IS DISTINCT FROM" if db.dialect.name == "postgresql" else "IS NOT"
+
+            def as_text(side: str, col: str) -> str:
+                return f"CAST({side}.{q(col)} AS {text})"
+
+            same_key = " AND ".join(f"{as_text(i, k)} = {as_text('{T}', k)}" for k in key)
+            changed = " OR ".join(
+                f"{as_text(i, c) if c in inc_cols else 'NULL'} {distinct} {as_text('{T}', c)}"
+                for c in data if c not in key) or "1 = 0"
+            closed = conn.execute(sa.text(
+                f"UPDATE {self.qualified(table)} SET {q(ACTIVE_COLUMN)} = 0, {q(TO_COLUMN)} = :now "
+                f"WHERE {q(ACTIVE_COLUMN)} = 1 AND EXISTS (SELECT 1 FROM {qi} {i} WHERE "
+                f"{same_key.replace('{T}', t)} AND ({changed.replace('{T}', t)}))"), {"now": now}).rowcount or 0
+
+            def value(c: str) -> str:
+                if c not in inc_cols:
+                    return "NULL"
+                if type(inc_cols[c]) is type(tgt_cols[c]) or db.dialect.name == "sqlite":
+                    return f"{i}.{q(c)}"
+                return f"CAST({i}.{q(c)} AS {tgt_cols[c].compile(dialect=db.dialect)})"
+
+            cols = data + [TIMESTAMP_COLUMN, SOURCE_COLUMN, RUN_ID_COLUMN, ACTIVE_COLUMN, FROM_COLUMN, TO_COLUMN]
+            select = [value(c) for c in data] + [f"{i}.{q(TIMESTAMP_COLUMN)}", f"{i}.{q(SOURCE_COLUMN)}",
+                                                 f"{i}.{q(RUN_ID_COLUMN)}", "1", ":now", ":forever"]
+            inserted = conn.execute(sa.text(
+                f"INSERT INTO {self.qualified(table)} ({', '.join(q(c) for c in cols)}) "
+                f"SELECT {', '.join(select)} FROM {qi} {i} WHERE NOT EXISTS (SELECT 1 FROM {self.qualified(table)} h "
+                f"WHERE h.{q(ACTIVE_COLUMN)} = 1 AND {same_key.replace('{T}', 'h')})"),
+                {"now": now, "forever": FOREVER}).rowcount or 0
+        return {"new": inserted - closed, "changed": closed, "unchanged": rows - inserted}
+
+    def _add_history_columns(self, conn: sa.Connection, table: str, now: dt.datetime) -> None:
+        q = self.db.dialect.identifier_preparer.quote
+        stamp = sa.DateTime().compile(dialect=self.db.dialect)
+        for col, ddl in ((ACTIVE_COLUMN, "INTEGER"), (FROM_COLUMN, stamp), (TO_COLUMN, stamp)):
+            conn.execute(sa.text(f"ALTER TABLE {self.qualified(table)} ADD COLUMN {q(col)} {ddl}"))
+        conn.execute(sa.text(f"UPDATE {self.qualified(table)} SET {q(ACTIVE_COLUMN)} = 1, {q(FROM_COLUMN)} = :now, "
+                             f"{q(TO_COLUMN)} = :forever"), {"now": now, "forever": FOREVER})
 
     # -- hidden tables -----------------------------------------------------------
 
@@ -889,7 +1052,7 @@ class CoreStore:
     def move_table_settings(self, old: str, new: str) -> None:
         """A table's natural key and scan, incremental column and hidden flag follow it to a new name."""
         with self.db.begin() as conn:
-            for table in (self.table_keys, self.table_increments, self.hidden_tables):
+            for table in (self.table_keys, self.table_increments, self.hidden_tables, self.table_history):
                 conn.execute(sa.delete(table).where(table.c.table_name == new))
                 conn.execute(sa.update(table).where(table.c.table_name == old).values(table_name=new))
 
@@ -925,6 +1088,9 @@ class CoreStore:
         """
         if mode not in ("replace", "append"):
             raise ValueError(f"unknown write mode {mode!r}")
+        key = self.history_key(table)
+        if key:  # a history table is never replaced: every load merges into it
+            return self._merge(table, batches, run_id, origin, key)
         from eyetable import loadlog
 
         target = f"{table}__stg" if mode == "replace" else table

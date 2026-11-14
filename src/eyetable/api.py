@@ -203,6 +203,10 @@ class FilesIn(BaseModel):
     pattern: str = Field(max_length=260)
 
 
+class HistoryIn(BaseModel):
+    on: bool
+
+
 class SplitIn(BaseModel):
     column: str | None = Field(default=None, max_length=128)  # None: read in one query
 
@@ -333,6 +337,7 @@ def create_app(
         loads = store.table_loads(src.name)
         increments = store.increments()
         hidden = store.hidden()
+        keyed, histories = store.keyed_tables(), store.histories()
         catalog = {d.key: d for d in datasets}
         out = []
         for item in dbconnect.db_tables(src.config):
@@ -343,6 +348,7 @@ def create_app(
             out.append({"key": item["key"], "schema": item["schema"], "name": item["table"], "kind": item.get("kind", "table"),
                         "table": table, "rows": rows, "last_loaded_at": finished, "incremental": increments.get(table),
                         "split": (item.get("split") or {}).get("column"), "hidden": table in hidden,
+                        "key": table in keyed, "history": table in histories,
                         "columns": len(catalog[item["key"]].columns) if item["key"] in catalog else None})
         return out
 
@@ -382,6 +388,8 @@ def create_app(
             summary.update(
                 table=table,
                 hidden=table in store.hidden(),
+                key=table in store.keyed_tables(),
+                history=store.has_history(table),
                 incremental=store.get_increment(table),
                 rows=store.count_rows(table),
                 columns=len(datasets[0].columns) if datasets else None,
@@ -974,10 +982,26 @@ def create_app(
     def clear_table_increment(table: str) -> dict[str, Any]:
         return jsonable_encoder(keys.choose_increment(store, loaded_table(table), None))
 
+    @app.put("/api/tables/{table}/history", dependencies=auth)
+    def set_table_history(table: str, body: HistoryIn) -> dict[str, Any]:
+        """Keep a table's history (merge loads by its natural key) or stop keeping it."""
+        try:
+            return jsonable_encoder(keys.choose_history(store, loaded_or_planned(table), body.on))
+        except keys.KeyProblem as exc:
+            raise HTTPException(400, str(exc)) from None
+
+    def loaded_or_planned(table: str) -> str:
+        if not TABLE_NAME.match(table) or not any(table in targets.tables(s) for s in store.list_sources()
+                                                  if s.type == "dbtable" or s.type in SINGLE_TABLE_TYPES):
+            raise HTTPException(404, f"no source loads a table named {table}")
+        return table
+
     @app.delete("/api/tables/{table}/key", dependencies=auth)
     def clear_table_key(table: str) -> dict[str, Any]:
-        store.save_table_key(loaded_table(table), None)
-        return jsonable_encoder(keys.key_info(store, table))
+        try:
+            return jsonable_encoder(keys.clear_key(store, loaded_table(table)))
+        except keys.KeyProblem as exc:
+            raise HTTPException(400, str(exc)) from None
 
     # -- curl commands -----------------------------------------------------------
     @app.post("/api/curl/inspect", dependencies=auth)

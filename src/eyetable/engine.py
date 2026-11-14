@@ -224,7 +224,7 @@ class Engine:
         self.store.finish_run(run_id, "succeeded", rows)
         self.store.save_catalog(source, [dataset])
         self.scan_keys(table)
-        return RunResult(run_id, DATASET_KEY, table, "succeeded", rows, upload_id=upload_id)
+        return RunResult(run_id, DATASET_KEY, table, "succeeded", rows, upload_id=upload_id, note=self._merge_note(None))
 
     def plan_gsheet(self, book: gsheets.Workbook) -> SheetLoad:
         """What loading this spreadsheet would do, tab by tab, without changing anything."""
@@ -310,7 +310,7 @@ class Engine:
             detail={"spreadsheet_id": book.spreadsheet_id, "file_title": book.title, "tab_title": tab.title,
                     "url": book.url, "upload_id": upload_id},
         )])
-        return RunResult(run_id, tab.title, table, "succeeded", rows, upload_id=upload_id)
+        return RunResult(run_id, tab.title, table, "succeeded", rows, upload_id=upload_id, note=self._merge_note(None))
 
     def load_curl(
         self,
@@ -663,7 +663,8 @@ class Engine:
                 rows, note = self._write_or_split(*retry, write, undo=lambda: self.store.delete_run_rows(table, run_id))
             else:
                 rows = write(None)
-            replaced = self.store.replace_older(table, p.key, run_id) if p.key and rows else 0
+            # a history table merged the rows already (closing old versions); others drop their older copies
+            replaced = self.store.replace_older(table, p.key, run_id) if p.key and rows and not self.store.has_history(table) else 0
         except Exception as exc:
             self.store.delete_run_rows(table, run_id)  # all or nothing, like a replace
             error = f"{type(exc).__name__}: {exc}"
@@ -674,7 +675,7 @@ class Engine:
         if rows:
             self.scan_keys(table)
         return RunResult(run_id, key, table, "succeeded", rows, mode="incremental", since=p.since, replaced=replaced,
-                         note=note)
+                         note=self._merge_note(note))
 
     # -- file sets: every file matching a pattern in a server folder (filesets.py) -------------
 
@@ -724,7 +725,7 @@ class Engine:
                                     "files": [f.name for f in files]})])
         self.scan_keys(table)
         return RunResult(run_id, DATASET_KEY, table, "succeeded", rows,
-                         note=f"{len(files):,} file{'s' if len(files) != 1 else ''} matching {config['pattern']}")
+                         note=self._merge_note(f"{len(files):,} file{'s' if len(files) != 1 else ''} matching {config['pattern']}"))
 
     def update_file_source(self, name: str, folder: str | None, pattern: str | None, new_name: str | None,
                            test: bool = True) -> tuple[str, list[str]]:
@@ -763,6 +764,14 @@ class Engine:
             self.rename_source(name, new_name)
             name = new_name
         return name, warnings
+
+    def _merge_note(self, note: str | None) -> str | None:
+        """Add what the last history merge on this thread did to a load's note."""
+        stats = self.store.take_merge_stats()
+        if not stats:
+            return note
+        text = f"history: {stats['new']:,} new, {stats['changed']:,} changed, {stats['unchanged']:,} unchanged"
+        return f"{note}; {text}" if note else text
 
     def _table_of(self, source: str, name: str = DATASET_KEY) -> str:
         """The table a source's dataset loads into (named after the source if there's no source yet)."""
@@ -977,7 +986,7 @@ class Engine:
                     results.append(RunResult(run_id, key, table, "failed", 0, error, detail=traceback.format_exc()))
                 else:
                     self.store.finish_run(run_id, "succeeded", rows)
-                    results.append(RunResult(run_id, key, table, "succeeded", rows, note=note))
+                    results.append(RunResult(run_id, key, table, "succeeded", rows, note=self._merge_note(note)))
                     self.scan_keys(table)
         return results
 

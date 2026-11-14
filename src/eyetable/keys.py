@@ -21,14 +21,14 @@ from typing import Any
 import sqlalchemy as sa
 
 from . import incremental
-from .store import ID_COLUMN, META_COLUMNS, CoreStore, kind_of
+from .store import HISTORY_COLUMNS, ID_COLUMN, META_COLUMNS, CoreStore, kind_of
 
 MAX_SET_SIZE = 3
 PAIR_POOL = 12  # the pairs come from this many of the most varied columns
 TRIPLE_POOL = 8
 MAX_SETS = 10  # report at most this many column sets
 SET_SEARCH_SECONDS = 60.0  # stop looking for sets after this long and say the search was cut short
-ET_COLUMNS = {ID_COLUMN, *META_COLUMNS}
+ET_COLUMNS = {ID_COLUMN, *META_COLUMNS, *HISTORY_COLUMNS}
 
 _ID_NAME = re.compile(r"(^|_)(id|key|guid|uuid|code|number|no|num)$", re.IGNORECASE)
 
@@ -65,7 +65,7 @@ def check_set(store: CoreStore, table: str, columns: list[str], kinds: dict[str,
     if missing:
         return {"columns": columns, "ok": False, "missing": missing}
     exprs = [_expr(store, c, kinds[c]) for c in columns]
-    q = store.qualified(table)
+    q = store.current_rows(table)
     any_null = " OR ".join(f"{e} IS NULL" for e in exprs)
     none_null = " AND ".join(f"{e} IS NOT NULL" for e in exprs)
     group = ", ".join(exprs)
@@ -82,7 +82,7 @@ def check_set(store: CoreStore, table: str, columns: list[str], kinds: dict[str,
 def _unique(conn: sa.Connection, store: CoreStore, table: str, exprs: list[str]) -> bool:
     group = ", ".join(exprs)
     found = conn.execute(sa.text(
-        f"SELECT 1 FROM {store.qualified(table)} GROUP BY {group} HAVING COUNT(*) > 1 LIMIT 1")).first()
+        f"SELECT 1 FROM {store.current_rows(table)} GROUP BY {group} HAVING COUNT(*) > 1 LIMIT 1")).first()
     return found is None
 
 
@@ -91,7 +91,7 @@ def scan(store: CoreStore, table: str) -> dict[str, Any]:
     started = time.monotonic()
     kinds = source_columns(store, table)
     names = list(kinds)
-    q = store.qualified(table)
+    q = store.current_rows(table)
     with store.db.connect() as conn:
         parts = ["COUNT(*)"]
         for n in names:
@@ -176,6 +176,7 @@ def key_info(store: CoreStore, table: str) -> dict[str, Any]:
         "key_set_at": saved["key_set_at"] if saved else None,
         "key_check": check,
         "incremental": increment_info(store, table),
+        "history": store.has_history(table),
     }
 
 
@@ -216,12 +217,38 @@ def choose_key(store: CoreStore, table: str, columns: list[str]) -> dict[str, An
     et = [c for c in columns if c in ET_COLUMNS]
     if et:
         raise KeyProblem(f"{', '.join(et)} {'is' if len(et) == 1 else 'are'} eyetable's own; choose columns from the source")
+    saved = store.get_table_key(table)
+    if store.has_history(table) and saved and saved.get("key") and saved["key"] != columns:
+        raise KeyProblem(f"{table} keeps history by {' + '.join(saved['key'])}; turn history off to change its natural key")
     check = check_set(store, table, columns)
     if check.get("missing"):
         raise KeyProblem(f"{table} has no column {', '.join(check['missing'])}")
     if not check["ok"]:
         raise KeyProblem(describe_problem(check))
     store.save_table_key(table, columns)
+    return key_info(store, table)
+
+
+def clear_key(store: CoreStore, table: str) -> dict[str, Any]:
+    if store.has_history(table):
+        raise KeyProblem(f"{table} keeps history by its natural key; turn history off before clearing the key")
+    store.save_table_key(table, None)
+    return key_info(store, table)
+
+
+def choose_history(store: CoreStore, table: str, on: bool) -> dict[str, Any]:
+    """Keep (or stop keeping) a table's history. Keeping it needs a natural key that holds: from
+    then on loads merge into the table by that key and never replace it (see CoreStore._merge).
+    Stopping it lets the next full load replace the table, dropping its old versions."""
+    if on:
+        saved = store.get_table_key(table)
+        if not saved or not saved.get("key"):
+            raise KeyProblem("choose the table's natural key first: history is kept per key")
+        if store.table_exists(table):
+            check = check_set(store, table, saved["key"])
+            if not check["ok"]:
+                raise KeyProblem(describe_problem(check) + "; fix that before keeping history")
+    store.set_history(table, on)
     return key_info(store, table)
 
 

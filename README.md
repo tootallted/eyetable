@@ -666,6 +666,45 @@ API: `GET /api/tables/<table>/keys`, `POST /api/tables/<table>/keys/scan` (a
 background job), `PUT /api/tables/<table>/key` with `{"columns": [...]}`, and
 `DELETE /api/tables/<table>/key`.
 
+### History tables
+
+A table with a natural key can **keep history**. Tick **Track history** under
+the natural key in Preview Data. From the next load on, the table is never
+replaced: every load, full or incremental, **merges** into it by the natural
+key. Three columns record each row's versions:
+
+| Column | Type | Meaning |
+|---|---|---|
+| `ET_active` | integer | 1 for the current version of a key, 0 for older versions |
+| `ET_fromdt` | datetime | when this version became current (the load's time on the server) |
+| `ET_todt` | datetime | when it stopped being current; `9999-12-31 00:00:00.000` while it is current |
+
+What a load does to each row:
+
+* **A key that isn't there yet** is added: ET_active 1, ET_fromdt now, ET_todt
+  9999-12-31.
+* **A key whose other columns changed** gets a new version, added the same
+  way. Its current version is closed: ET_active 0, ET_todt now.
+* **An unchanged row** is left as it is.
+* **A row that's gone from the source** is left as it is; nothing is deleted.
+* A column first seen in a load is added to the table.
+
+The first load after history is turned on makes the table's rows their first
+versions. A load whose rows repeat a key, or have no value in it, is refused
+and changes nothing. Each load's queue item says how many rows were new,
+changed and unchanged.
+
+While history is kept, the natural key can't be cleared or changed. Key checks
+and scans look only at the current versions (`ET_active = 1`). Untick **Track
+history** to stop. The next full load then replaces the table, and its old
+versions go with it. To query the current rows: `WHERE "ET_active" = 1`.
+
+API: `PUT /api/tables/<table>/history` with `{"on": true}`.
+
+**Sources indicators.** A narrow column beside each source or table name
+shows how it's set up: **PK** for a natural key, **IC** for an incremental
+column, **H** for history kept.
+
 ### Incremental loads
 
 A full load reads a table's whole source again and replaces it. An incremental
