@@ -611,8 +611,18 @@ The log keeps up to 5,000 lines per load. API:
 `GET /api/queue/<id>/log?after=<n>` returns the lines from line *n* on.
 
 The queue lives in the API process, so it starts empty when the service
-restarts; each load is still recorded in `eyetable.runs`. Group runs and
-schedules don't go through the queue.
+restarts; each load is still recorded in `eyetable.runs`.
+
+**Group, tag and scheduled runs** load their sources through the queue too, one
+source after another as before. Each source's item is labeled with what
+started it: *Group Nightly · Run now*, *Group Nightly · scheduled* or *Tag
+#finance · Run now*. Each item has the same progress, log and errors as any
+other. Cancelling one in the queue stops that source, and the group goes on to
+the next. The group's own run record still lists every source's result.
+
+The page checks the queue every 10 seconds even when nothing is loading, so a
+run started by a schedule appears without a refresh. **Run now** opens the
+queue straight away.
 
 API: `POST /api/queue` with `{"source", "table"?, "incremental"?}`, `GET /api/queue`,
 `POST /api/queue/<id>/cancel`, `DELETE /api/queue/<id>`, and `DELETE /api/queue`

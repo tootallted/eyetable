@@ -92,7 +92,7 @@ class LoadQueue:
     # -- adding, listing, cancelling ----------------------------------------------
 
     def add(self, source: str, table: str | None = None, incremental: bool = False,
-            google_token: str | None = None) -> tuple[dict[str, Any], bool]:
+            google_token: str | None = None, by: str | None = None) -> tuple[dict[str, Any], bool]:
         """Queue a reload; returns (the item, whether it is new). The same reload already waiting
         or running is returned instead of being queued twice."""
         planned = self.planned_tables(source, table, incremental)
@@ -110,6 +110,7 @@ class LoadQueue:
         item = {
             "id": secrets.token_hex(6), "source": source, "table": table, "incremental": incremental,
             "label": planned[0]["label"] if table else source,
+            "by": by,  # what started it, when not a click on Reload: "Group Nightly · scheduled"
             "status": "queued", "created_at": _now(), "started_at": None, "finished_at": None,
             "tables": tables, "errors": [], "cancel": False, "log": [], "log_dropped": 0,
         }

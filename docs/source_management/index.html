@@ -168,6 +168,7 @@
   .q-head { display: flex; gap: 8px 12px; align-items: baseline; flex-wrap: wrap; }
   .q-head .q-title { font-weight: 600; overflow-wrap: anywhere; }
   .q-head .q-when { color: var(--muted); font-size: 13px; }
+  .q-head .q-by { font-size: 12px; padding: 1px 8px; border-radius: 999px; background: var(--accent-soft); color: var(--accent); }
   .q-head .q-actions { margin-left: auto; display: inline-flex; gap: 6px; }
   .q-status { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; background: var(--surface-2); color: var(--muted); }
   .q-running .q-status { background: var(--accent-soft); color: var(--accent); }
@@ -3843,7 +3844,11 @@
       renderGroups();
       var path = g.tag ? '/api/tags/' + encodeURIComponent(g.tag) + '/run' : '/api/groups/' + g.id + '/run';
       api(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: body })
-        .then(function (r) { pollRun(g, r.run_id); }, function (err) {
+        .then(function (r) {
+          pollRun(g, r.run_id);
+          setTimeout(loadQueue, 600);  // its sources load through the Load queue: show them there
+          unfold('queue');
+        }, function (err) {
           g.running = false;
           renderGroups();
           msg.appendChild(banner('err', g.name + ' did not start: ' + err.message));
@@ -4279,6 +4284,7 @@
 
     function loadQueue() {
       if (!state.connected) return Promise.resolve();
+      if (document.hidden) { scheduleQueuePoll(10000); return Promise.resolve(); }  // a background tab: check later
       return api('/api/queue').then(function (r) { setQueue(r.items); }, function () {
         if (queueState.items.some(function (i) { return QUEUE_ACTIVE[i.status]; })) scheduleQueuePoll(5000);
       });
@@ -4310,7 +4316,8 @@
         var lg = queueState.logs[i.id];
         if (lg && lg.open && (QUEUE_ACTIVE[i.status] || lg.count !== i.log_count)) fetchLog(i.id);
       });
-      if (items.some(function (i) { return QUEUE_ACTIVE[i.status]; })) scheduleQueuePoll(1500);
+      // while loads run, every 1.5 s; otherwise every 10 s, so a scheduled group run shows up by itself
+      scheduleQueuePoll(items.some(function (i) { return QUEUE_ACTIVE[i.status]; }) ? 1500 : 10000);
     }
 
     function fmtDuration(ms) {
@@ -4378,6 +4385,7 @@
 
     function queueItem(item) {
       var title = (item.incremental ? 'Incremental load' : 'Full load') + ' \u00b7 ' + item.label + (item.table ? ' (' + item.source + ')' : '');
+      var by = item.by ? el('span', { class: 'q-by', text: item.by }) : null;
       var when = item.status === 'queued' ? 'added ' + fmtTime(item.created_at)
         : item.finished_at ? 'took ' + fmtDuration(new Date(item.finished_at) - new Date(item.started_at || item.created_at)) + ', finished ' + fmtTime(item.finished_at)
         : 'running for ' + fmtDuration(Date.now() - new Date(item.started_at));
@@ -4401,6 +4409,7 @@
         el('div', { class: 'q-head' }, [
           el('span', { class: 'q-status', text: QUEUE_STATUS[item.status] || item.status }),
           el('span', { class: 'q-title', text: title }),
+          by,
           el('span', { class: 'q-when', text: when }),
           actions
         ])

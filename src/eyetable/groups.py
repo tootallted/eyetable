@@ -33,6 +33,8 @@ from eyetable.schedule import describe, next_runs, normalize
 from eyetable.store import Group, SourceNotFound
 
 log = logging.getLogger("eyetable.groups")
+# How a group run's load queue items say what started them
+TRIGGER_WORDS = {"manual": "Run now", "schedule": "scheduled", "catch-up": "scheduled, catching up"}
 
 SheetFetch = Callable[[str, str | None], gsheets.Workbook]
 CATCH_UP_AFTER = dt.timedelta(minutes=10)
@@ -51,6 +53,7 @@ def _default_fetch(url: str, google_token: str | None = None) -> gsheets.Workboo
 class GroupRunner:
     def __init__(self, engine: Engine, sheet_fetch: SheetFetch = _default_fetch, clock: Callable[[], dt.datetime] = _now):
         self.engine = engine
+        self.queue = None  # a LoadQueue: members load through it, so the page's Load queue shows them
         self.store = engine.store
         self.sheet_fetch = sheet_fetch
         self.clock = clock
@@ -135,18 +138,20 @@ class GroupRunner:
     def run(self, group_id: int, trigger: str = "manual", google_token: str | None = None, wait: bool = False) -> int:
         """Start a run of the group; returns the run id. `wait` runs it in this thread."""
         group = self.store.get_group(group_id)
+        by = f"Group {group.name} \u00b7 {TRIGGER_WORDS.get(trigger, trigger)}"
         return self._start(group_id, group.name, group.members,
-                           lambda: self.store.start_group_run(group_id, trigger), google_token, wait)
+                           lambda: self.store.start_group_run(group_id, trigger), google_token, wait, by)
 
     def run_tag(self, tag: str, google_token: str | None = None, wait: bool = False) -> int:
         """Start a run of every source with a tag; returns the run id."""
         tag = normalize_tag(tag)
         if not self.store.sources_with_tag(tag):
             raise LookupError(f"no source is tagged #{tag}")
-        return self._start(f"#{tag}", f"#{tag}", [f"#{tag}"], lambda: self.store.start_tag_run(tag), google_token, wait)
+        return self._start(f"#{tag}", f"#{tag}", [f"#{tag}"], lambda: self.store.start_tag_run(tag), google_token, wait,
+                           f"Tag #{tag} \u00b7 Run now")
 
     def _start(self, key: int | str, name: str, members: list[str], record: Callable[[], int],
-               google_token: str | None, wait: bool) -> int:
+               google_token: str | None, wait: bool, by: str | None = None) -> int:
         with self._lock:
             if key in self._active:
                 raise ValueError(f"{name} is already running")
@@ -158,12 +163,38 @@ class GroupRunner:
                 self._active.discard(key)
             raise
         if wait:
-            self._execute(key, name, members, run_id, google_token)
+            self._execute(key, name, members, run_id, google_token, by)
         else:
-            self._executor.submit(self._execute, key, name, members, run_id, google_token)
+            self._executor.submit(self._execute, key, name, members, run_id, google_token, by)
         return run_id
 
-    def _execute(self, key: int | str, name: str, members: list[str], run_id: int, google_token: str | None) -> None:
+    def _load(self, source: str, google_token: str | None, by: str | None) -> dict[str, Any]:
+        """Load one member: through the load queue when there is one (so the page shows it, with its
+        progress and log), else directly. Returns {status, rows, error} for the group run's results."""
+        if self.queue is None:
+            loads = self.engine.reload_source(source, sheet_fetch=lambda url: self.sheet_fetch(url, google_token))
+            failed = [r for r in loads if r.status == "failed"]
+            hidden = loads and all(r.status == "skipped" for r in loads)
+            return {"status": "failed" if failed else "skipped" if hidden else "succeeded",
+                    "rows": sum(r.rows for r in loads),
+                    "error": "; ".join(f"{r.dataset_key}: {r.error}" for r in failed) or
+                             ("hidden in Sources, so not loaded" if hidden else None)}
+        try:
+            item, _ = self.queue.add(source, google_token=google_token, by=by)
+        except ValueError as exc:
+            if "hidden" in str(exc):
+                return {"status": "skipped", "rows": 0, "error": "hidden in Sources, so not loaded"}
+            raise
+        done = self.queue.wait(item["id"])  # one member at a time, as a group run always has
+        rows = sum(t["rows"] for t in done["tables"] if t["status"] == "succeeded")
+        if done["status"] == "succeeded":
+            return {"status": "succeeded", "rows": rows, "error": None}
+        if done["status"] == "cancelled":
+            return {"status": "failed", "rows": rows, "error": "cancelled in the load queue"}
+        return {"status": "failed", "rows": rows, "error": "; ".join(e["message"] for e in done["errors"]) or done["status"]}
+
+    def _execute(self, key: int | str, name: str, members: list[str], run_id: int, google_token: str | None,
+                 by: str | None = None) -> None:
         results: list[dict[str, Any]] = []
         try:
             sources, empty_tags = self.resolve(members)
@@ -174,22 +205,11 @@ class GroupRunner:
                 results.append(entry)
                 self.store.update_group_run(run_id, results)
                 try:
-                    loads = self.engine.reload_source(
-                        source, sheet_fetch=lambda url: self.sheet_fetch(url, google_token)
-                    )
+                    entry.update(self._load(source, google_token, by))
                 except SourceNotFound:
                     entry.update(status="failed", error="this source no longer exists")
                 except Exception as exc:  # one source failing must not stop the rest
                     entry.update(status="failed", error=str(exc).strip("'\"") or type(exc).__name__)
-                else:
-                    failed = [r for r in loads if r.status == "failed"]
-                    hidden = loads and all(r.status == "skipped" for r in loads)
-                    entry.update(
-                        status="failed" if failed else "skipped" if hidden else "succeeded",
-                        rows=sum(r.rows for r in loads),
-                        error="; ".join(f"{r.dataset_key}: {r.error}" for r in failed) or
-                              ("hidden in Sources, so not loaded" if hidden else None),
-                    )
                 self.store.update_group_run(run_id, results)
             ok = sum(1 for r in results if r["status"] in ("succeeded", "skipped"))  # a hidden source isn't a failure
             status = "succeeded" if ok == len(results) else "failed" if ok == 0 else "partial"

@@ -705,6 +705,8 @@ def create_app(
             raise HTTPException(404, str(exc).strip("'\"")) from None
 
     groups = group_runner or GroupRunner(engine, sheet_fetch=lambda url, google_token=None: sheet_fetch(url, google_token))
+    if groups.queue is None:
+        groups.queue = load_queue  # group, tag and scheduled runs show in the page's Load queue
 
     def get_group(group_id: int):
         try:
