@@ -565,9 +565,24 @@ send `null` to read the table in one query.
 ### Load queue
 
 On the page, **Reload** and **Incremental** don't hold the page up while a
-table loads. The load goes into the **Load queue** panel, just above
-**Sources**, and runs in the background on the server. You can carry on with
-the page meanwhile, and the source's buttons show **Queued** or **Loading…**.
+table loads. The load goes into the **Load queue** panel at the bottom of the
+page, and runs in the background on the server. You can carry on with the
+page meanwhile, and the source's buttons show **Queued** or **Loading…**. The
+confirmation above Sources has a link down to the queue.
+
+The panel stays on the page even when nothing is loading. **Clear finished**
+only tidies the live list. **Show earlier runs** lists every load recorded in
+`eyetable.runs`, newest first, whatever started it, and these survive service
+restarts. You can filter them by:
+
+* part of a source or table name;
+* a time range (*From* / *To*, or the quick picks for the last 24 hours, 7
+  days or 30 days);
+* status.
+
+Each run shows when it started, its table, full or incremental, status, rows
+and how long it took, with the error if it failed. API: `GET /api/runs` with
+`source`, `since`, `until` (ISO times), `status` and `limit`.
 
 Each queue item shows each of its tables with a progress bar. For a full
 load it reads like "15,000 of 30,000 rows (50%)", measured against the table's

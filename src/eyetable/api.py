@@ -822,6 +822,17 @@ def create_app(
     def list_queue() -> dict[str, Any]:
         return jsonable_encoder({"items": load_queue.list()})
 
+    @app.get("/api/runs", dependencies=auth)
+    def search_runs(source: str | None = None, since: dt.datetime | None = None, until: dt.datetime | None = None,
+                    status: str | None = None, limit: int = 200) -> dict[str, Any]:
+        """Past loads (every load is recorded, whatever started it), newest first: filtered by a
+        source or table name (part of it), when they started (since/until, ISO times), and status."""
+        if status and status not in ("succeeded", "failed", "running"):
+            raise HTTPException(400, "status is succeeded, failed or running")
+        limit = max(1, min(limit, 1000))
+        runs = store.search_runs(source, since, until, status, limit + 1)
+        return jsonable_encoder({"runs": runs[:limit], "more": len(runs) > limit})
+
     @app.get("/api/queue/{item_id}/log", dependencies=auth)
     def load_log(item_id: str, after: int = 0) -> dict[str, Any]:
         """A queued load's queries, requests and steps, from entry `after` on."""

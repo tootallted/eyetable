@@ -160,6 +160,10 @@
   @keyframes spin { to { transform: rotate(360deg); } }
   /* the load queue */
   .q-list { display: grid; gap: 10px; }
+  .q-empty { color: var(--muted); font-size: 14px; padding: 6px 0; }
+  .runs-filters { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; align-items: end; }
+  .runs-filters .runs-quick { grid-column: 1 / -1; font-size: 13px; color: var(--muted); }
+  .runs-table td.err { color: var(--err); white-space: normal; overflow-wrap: anywhere; max-width: 420px; font-size: 12.5px; }
   .q-item { border: 1px solid var(--border); border-left: 4px solid var(--accent); border-radius: 8px; padding: 10px 12px; display: grid; gap: 8px; background: var(--surface); }
   .q-item.q-queued { border-left-color: var(--muted); }
   .q-item.q-succeeded { border-color: color-mix(in srgb, var(--ok) 40%, transparent); border-left-color: var(--ok); background: var(--ok-soft); }
@@ -776,19 +780,6 @@
     </div>
   </section>
 
-  <section class="card" id="queue-card" data-fold="queue" hidden aria-labelledby="queue-title">
-    <div class="card-head">
-      <h2 id="queue-title"><button class="fold" type="button" aria-expanded="true" aria-controls="queue-body"><span class="tri"></span>Load queue</button></h2>
-      <span class="muted" id="queue-summary" style="font-size:13px"></span>
-      <button class="btn small" id="queue-clear" type="button" hidden>Clear finished</button>
-    </div>
-    <div class="card-body" id="queue-body">
-      <p class="hint" style="margin:0">Reloads run here in the background, so the page stays usable while big tables load. Each shows
-        its rows so far against the table&rsquo;s row count before the load.</p>
-      <div class="q-list" id="queue-list" aria-live="polite"></div>
-    </div>
-  </section>
-
   <section class="card" data-fold="sources" aria-labelledby="sources-title">
     <div class="card-head">
       <h2 id="sources-title"><button class="fold" type="button" aria-expanded="true" aria-controls="sources-body"><span class="tri"></span>Sources</button></h2>
@@ -964,6 +955,38 @@
       </form>
       <div class="tag-runs" id="tag-runs" hidden></div>
       <div class="table-wrap" id="groups-list"><div class="empty">Connect to see your groups.</div></div>
+    </div>
+  </section>
+
+  <section class="card" id="queue-card" data-fold="queue" hidden aria-labelledby="queue-title">
+    <div class="card-head">
+      <h2 id="queue-title"><button class="fold" type="button" aria-expanded="true" aria-controls="queue-body"><span class="tri"></span>Load queue</button></h2>
+      <span class="muted" id="queue-summary" style="font-size:13px"></span>
+      <button class="btn small" id="queue-clear" type="button" hidden>Clear finished</button>
+    </div>
+    <div class="card-body" id="queue-body">
+      <p class="hint" style="margin:0">Reloads, group runs and schedules load here in the background, so the page stays usable while big
+        tables load. Each shows its rows so far against the table&rsquo;s row count before the load.</p>
+      <div class="q-list" id="queue-list" aria-live="polite"></div>
+      <div class="q-empty" id="queue-empty" hidden>Nothing is loading now.</div>
+      <div><button class="btn small" id="runs-toggle" type="button" aria-expanded="false">Show earlier runs</button></div>
+      <div id="runs-panel" hidden style="display:grid; gap:10px">
+        <div class="runs-filters">
+          <label class="field">Source or table <input type="search" id="runs-text" placeholder="Part of a name" autocomplete="off" spellcheck="false"></label>
+          <label class="field">From <input type="datetime-local" id="runs-from"></label>
+          <label class="field">To <input type="datetime-local" id="runs-to"></label>
+          <label class="field">Status <select id="runs-status">
+            <option value="">Any</option><option value="succeeded">Succeeded</option><option value="failed">Failed</option>
+            <option value="running">Running</option></select></label>
+          <div class="runs-quick">Quick pick:
+            <button type="button" class="link" data-hours="24">last 24 hours</button> ·
+            <button type="button" class="link" data-hours="168">last 7 days</button> ·
+            <button type="button" class="link" data-hours="720">last 30 days</button> ·
+            <button type="button" class="link" data-hours="0">any time</button></div>
+        </div>
+        <div class="sf-note" id="runs-note" role="status"></div>
+        <div class="table-wrap db-list" id="runs-list"></div>
+      </div>
     </div>
   </section>
 
@@ -4345,7 +4368,10 @@
       var what = (opts.incremental ? 'Incremental load of ' : 'Reload of ') + (opts.label ? opts.label + ' (' + s.name + ')' : s.name);
       return api('/api/queue', { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify(payload) }).then(function (r) {
         upsertQueueItem(r.item);
-        msg.appendChild(banner('ok', r.added ? what + ' is in the load queue.' : what + ' was already in the load queue.'));
+        var see = el('button', { type: 'button', class: 'link', text: 'See it in the Load queue' });
+        see.addEventListener('click', function () { unfold('queue'); $('queue-card').scrollIntoView({ behavior: 'smooth', block: 'start' }); });
+        msg.appendChild(el('div', { class: 'banner ok' }, [(r.added ? what + ' is in the load queue, at the bottom of the page. '
+          : what + ' was already in the load queue. '), see]));
         setTimeout(function () { if (msg.firstChild && /load queue/.test(msg.textContent)) clear(msg); }, 6000);
       }, function (err) {
         msg.appendChild(s.type === 'gsheet'
@@ -4445,7 +4471,8 @@
         var lg = queueState.logs[id];
         if (lg.box) lg.scrollTop = lg.box.scrollTop;
       });
-      $('queue-card').hidden = !items.length;
+      $('queue-card').hidden = !state.connected;
+      $('queue-empty').hidden = !!items.length;
       var active = items.filter(function (i) { return QUEUE_ACTIVE[i.status]; });
       var running = active.filter(function (i) { return i.status === 'running'; }).length;
       var parts = [];
@@ -4639,6 +4666,76 @@
 
     // a background tab skips its queue checks; coming back, it catches up at once
     document.addEventListener('visibilitychange', function () { if (!document.hidden && state.connected) loadQueue(); });
+
+    // -- earlier runs: every load recorded in eyetable.runs, filtered --------------------
+    var runsState = { timer: null, loaded: false };
+
+    function localInput(d) {  // a Date as a datetime-local value
+      var two = function (n) { return (n < 10 ? '0' : '') + n; };
+      return d.getFullYear() + '-' + two(d.getMonth() + 1) + '-' + two(d.getDate()) + 'T' + two(d.getHours()) + ':' + two(d.getMinutes());
+    }
+
+    function loadRuns() {
+      var params = [];
+      var text = $('runs-text').value.trim(), from = $('runs-from').value, to = $('runs-to').value, status = $('runs-status').value;
+      if (text) params.push('source=' + encodeURIComponent(text));
+      if (from) params.push('since=' + encodeURIComponent(new Date(from).toISOString()));
+      if (to) params.push('until=' + encodeURIComponent(new Date(to).toISOString()));
+      if (status) params.push('status=' + status);
+      params.push('limit=200');
+      var note = clear($('runs-note')), list = $('runs-list');
+      note.textContent = 'Looking\u2026';
+      api('/api/runs?' + params.join('&')).then(function (r) {
+        runsState.loaded = true;
+        clear(note).appendChild(el('span', { text: r.runs.length ? (r.more ? 'The latest ' + fmtInt(r.runs.length) + ' matching runs (there are more: narrow the filters).'
+          : plural(r.runs.length, 'run') + ' match' + (r.runs.length === 1 ? 'es' : '') + '.') : 'No run matches.' }));
+        clear(list);
+        if (!r.runs.length) return;
+        var head = el('tr', null, ['Started', 'Source', 'Table', 'Load', 'Status', 'Rows', 'Took', 'Error'].map(function (h, i) {
+          return el('th', { class: i === 5 ? 'num' : '', text: h, scope: 'col' });
+        }));
+        list.appendChild(el('table', { class: 'runs-table' }, [el('thead', null, [head]), el('tbody', null, r.runs.map(function (run) {
+          var took = run.finished_at ? fmtDuration(new Date(run.finished_at) - new Date(run.started_at)) : '\u2014';
+          return el('tr', null, [
+            el('td', { class: 'nowrap', text: fmtTime(run.started_at) }),
+            el('td', { text: run.source }),
+            el('td', { class: 'mono', text: fullTable(run.target_table) }),
+            el('td', { text: run.mode === 'incremental' ? 'incremental' : run.mode === 'append' ? 'append' : 'full' }),
+            el('td', null, [statusPill(run.status, run.status === 'succeeded' ? 'Succeeded' : run.status === 'failed' ? 'Failed' : 'Running')]),
+            el('td', { class: 'num', text: run.status === 'succeeded' ? fmtInt(run.rows_written) : '\u2014' }),
+            el('td', { class: 'nowrap', text: took }),
+            el('td', { class: 'err', text: run.error || '', title: run.error || '' })
+          ]);
+        }))]));
+      }, function (err) { clear(note).appendChild(banner('err', err.message)); });
+    }
+
+    function queueRunsSoon() {
+      clearTimeout(runsState.timer);
+      runsState.timer = setTimeout(loadRuns, 350);
+    }
+
+    $('runs-toggle').addEventListener('click', function () {
+      var open = $('runs-panel').hidden;
+      $('runs-panel').hidden = !open;
+      $('runs-toggle').setAttribute('aria-expanded', String(open));
+      $('runs-toggle').textContent = open ? 'Hide earlier runs' : 'Show earlier runs';
+      if (open && !runsState.loaded) {
+        if (!$('runs-from').value) $('runs-from').value = localInput(new Date(Date.now() - 7 * 24 * 3600 * 1000));
+        loadRuns();
+      }
+    });
+    ['runs-text', 'runs-from', 'runs-to', 'runs-status'].forEach(function (id) {
+      $(id).addEventListener(id === 'runs-text' ? 'input' : 'change', queueRunsSoon);
+    });
+    document.querySelectorAll('.runs-quick [data-hours]').forEach(function (b) {
+      b.addEventListener('click', function () {
+        var hours = Number(b.getAttribute('data-hours'));
+        $('runs-from').value = hours ? localInput(new Date(Date.now() - hours * 3600 * 1000)) : '';
+        $('runs-to').value = '';
+        loadRuns();
+      });
+    });
 
     $('queue-clear').addEventListener('click', function () {
       api('/api/queue', { method: 'DELETE' }).then(loadQueue, function () { loadQueue(); });

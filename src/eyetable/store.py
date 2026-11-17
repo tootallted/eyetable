@@ -490,6 +490,24 @@ class CoreStore:
         with self.db.connect() as conn:
             return [Run(**r._mapping) for r in conn.execute(query).all()]
 
+    def search_runs(self, text: str | None = None, since: dt.datetime | None = None, until: dt.datetime | None = None,
+                    status: str | None = None, limit: int = 200) -> list[Run]:
+        """Past loads, newest first: whose source or table contains `text` (any case), that
+        started between `since` and `until`, with `status`."""
+        c = self.runs.c
+        query = sa.select(self.runs).order_by(c.id.desc()).limit(limit)
+        if text:
+            like = f"%{text.strip().lower()}%"
+            query = query.where(sa.or_(sa.func.lower(c.source).like(like), sa.func.lower(c.target_table).like(like)))
+        if since is not None:
+            query = query.where(c.started_at >= since)
+        if until is not None:
+            query = query.where(c.started_at <= until)
+        if status:
+            query = query.where(c.status == status)
+        with self.db.connect() as conn:
+            return [Run(**r._mapping) for r in conn.execute(query).all()]
+
     # -- groups ------------------------------------------------------------
 
     def create_group(self, name: str, members: list[str], schedule: dict | None, enabled: bool,
