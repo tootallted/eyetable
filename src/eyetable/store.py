@@ -21,7 +21,7 @@ import hashlib
 import json
 import secrets
 import threading
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -47,6 +47,8 @@ FROM_COLUMN = "ET_fromdt"
 TO_COLUMN = "ET_todt"
 HISTORY_COLUMNS = (ACTIVE_COLUMN, FROM_COLUMN, TO_COLUMN)
 FOREVER = dt.datetime(9999, 12, 31)
+# A statement set's rows say which statement brought them (eyetable.connectors.curl_source).
+STATEMENT_COLUMN = "ET_statement"
 RESERVED_COLUMNS = {c.lower() for c in (ID_COLUMN, TIMESTAMP_COLUMN, SOURCE_COLUMN, RUN_ID_COLUMN, *HISTORY_COLUMNS)}
 # Every loaded table: ET_id, then the source's own columns, then these.
 META_COLUMNS = {TIMESTAMP_COLUMN: "timestamptz", SOURCE_COLUMN: "varchar", RUN_ID_COLUMN: "bigint"}
@@ -963,6 +965,67 @@ class CoreStore:
                 f"ON n.{run} = :run AND n.{idc} > o.{idc} AND {same})"), {"run": run_id})
         return done.rowcount or 0
 
+    def replace_statements(self, table: str, batches: Iterable[list[dict[str, Any]]], run_id: int, origin: Any,
+                           labels: Callable[[], list[str]]) -> tuple[int, int]:
+        """An incremental load of a statement set: read the rows into <table>__incoming, then in one
+        transaction delete the table's rows of the statements that ran (ET_statement in `labels()`,
+        asked once every row is in) and add the new ones. If anything fails, the table is as it
+        was. Returns (rows added, rows deleted)."""
+        from eyetable import loadlog
+
+        schema, name = self.split(table)
+        incoming = self.ref(schema, f"{name[:50]}__incoming")
+        loadlog.step(f"Reading the statements into {incoming}; their old rows in {table} are replaced once every row is in")
+        rows = self.write(incoming, batches, "replace", run_id, origin=origin)
+        try:
+            ran = labels()
+            deleted = self._swap_statements(table, incoming, ran)
+        finally:
+            with self.db.begin() as conn:
+                conn.execute(sa.text(f"DROP TABLE IF EXISTS {self.qualified(incoming)}"))
+        loadlog.step(f"Replaced {len(ran):,} statement{'s' if len(ran) != 1 else ''} in {table}: "
+                     f"{deleted:,} old rows deleted, {rows:,} new rows added")
+        return rows, deleted
+
+    def _swap_statements(self, table: str, incoming: str, labels: list[str]) -> int:
+        db = self.db
+        q = db.dialect.identifier_preparer.quote
+        inc_cols = {c["name"]: c["type"] for c in self.columns(incoming)}
+        tgt_cols = {c["name"]: c["type"] for c in self.columns(table)}
+        if STATEMENT_COLUMN not in tgt_cols:
+            raise ValueError(f"{table} has no {STATEMENT_COLUMN} column to tell its statements apart; run a full load")
+        meta = {ID_COLUMN, *META_COLUMNS}
+        qt, qi = self.qualified(table), self.qualified(incoming)
+        with db.begin() as conn:
+            for c, typ in inc_cols.items():
+                if c in meta:
+                    continue
+                if c not in tgt_cols:  # a column first seen in this load
+                    conn.execute(sa.text(f"ALTER TABLE {qt} ADD COLUMN {q(c)} {typ.compile(dialect=db.dialect)}"))
+                    tgt_cols[c] = typ
+                    continue
+                current, new = kind_of(tgt_cols[c]), kind_of(typ)
+                widened = merge_kinds(current, new)
+                if widened != current and db.dialect.name != "sqlite":  # e.g. whole numbers that now have decimals
+                    ddl = sa_type(widened).compile(dialect=db.dialect)
+                    conn.execute(sa.text(f"ALTER TABLE {qt} ALTER COLUMN {q(c)} TYPE {ddl} USING {q(c)}::{ddl}"))
+                    tgt_cols[c] = sa_type(widened)
+            deleted = 0
+            if labels:
+                deleted = conn.execute(
+                    sa.text(f"DELETE FROM {qt} WHERE {q(STATEMENT_COLUMN)} IN :labels")
+                    .bindparams(sa.bindparam("labels", expanding=True)), {"labels": list(labels)}).rowcount or 0
+            cols = [c for c in inc_cols if c != ID_COLUMN]
+
+            def value(c: str) -> str:
+                if type(inc_cols[c]) is type(tgt_cols[c]) or db.dialect.name == "sqlite":
+                    return q(c)
+                return f"CAST({q(c)} AS {tgt_cols[c].compile(dialect=db.dialect)})"
+
+            conn.execute(sa.text(f"INSERT INTO {qt} ({', '.join(q(c) for c in cols)}) "
+                                 f"SELECT {', '.join(value(c) for c in cols)} FROM {qi} ORDER BY {q(ID_COLUMN)}"))
+        return deleted
+
     def delete_run_rows(self, table: str, run_id: int) -> None:
         """Take out the rows a failed incremental load had already added."""
         if not self.table_exists(table):
@@ -1268,7 +1331,7 @@ class _TableWriter:
 
     def _column_for(self, key: str) -> str:
         if key not in self.key_to_column:
-            name = column_name(key)
+            name = key if key == STATEMENT_COLUMN else column_name(key)
             if name.lower() in RESERVED_COLUMNS:
                 name = f"{name}_src"
             taken = set(self.key_to_column.values())

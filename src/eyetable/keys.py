@@ -21,14 +21,14 @@ from typing import Any
 import sqlalchemy as sa
 
 from . import incremental
-from .store import HISTORY_COLUMNS, ID_COLUMN, META_COLUMNS, CoreStore, kind_of
+from .store import HISTORY_COLUMNS, ID_COLUMN, META_COLUMNS, STATEMENT_COLUMN, CoreStore, kind_of
 
 MAX_SET_SIZE = 3
 PAIR_POOL = 12  # the pairs come from this many of the most varied columns
 TRIPLE_POOL = 8
 MAX_SETS = 10  # report at most this many column sets
 SET_SEARCH_SECONDS = 60.0  # stop looking for sets after this long and say the search was cut short
-ET_COLUMNS = {ID_COLUMN, *META_COLUMNS, *HISTORY_COLUMNS}
+ET_COLUMNS = {ID_COLUMN, *META_COLUMNS, *HISTORY_COLUMNS, STATEMENT_COLUMN}
 
 _ID_NAME = re.compile(r"(^|_)(id|key|guid|uuid|code|number|no|num)$", re.IGNORECASE)
 

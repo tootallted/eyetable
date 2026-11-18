@@ -400,6 +400,14 @@ def create_app(
                 summary["statement_count"] = statement_count(src.config["statements"])
             except ValueError:  # e.g. a fixed date range that "today" has moved past
                 summary["statement_count"] = 0
+            window = targets.statement_window(src)
+            if window:  # incremental loads run these statements and replace their rows
+                try:
+                    count = statement_count(window)
+                except ValueError:
+                    count = 0
+                start = next((p["incremental_from"] for p in src.config["statements"]["parts"] if p.get("incremental_from")), None)
+                summary["statement_window"] = {"from": start, "statements": count}
         summary["connection"] = connection_of(src)
         return summary
 

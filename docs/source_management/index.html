@@ -842,7 +842,7 @@
         <div style="display:grid; gap:10px">
           <h3 style="font-size:14px; margin:0">Run as a set of statements</h3>
           <p class="hint">Click a piece of the request above, such as a date or a number, to send the request once for each
-            value in a series. Every statement's rows go into this source's one table, and each run replaces the table with all of them.</p>
+            value in a series. Every statement's rows go into this source's one table, and a full load replaces the table with all of them. With an incremental window on a dates part, Incremental runs just its last days and replaces only their rows (each row's ET_statement says which statement it came from).</p>
           <div id="set-parts" style="display:grid; gap:10px"></div>
           <div id="set-more" hidden style="display:grid; gap:10px">
             <div class="set-options">
@@ -1676,6 +1676,7 @@
       var flags = [];
       if (t && t.key) flags.push(el('span', { class: 'flag pk', text: 'PK', title: 'Has a natural (primary) key' }));
       if (t && t.incremental) flags.push(el('span', { class: 'flag ic', text: 'IC', title: 'Incremental column: ' + t.incremental }));
+      else if (t && t.statement_window) flags.push(el('span', { class: 'flag ic', text: 'IC', title: windowText(t.statement_window) }));
       if (t && t.history) flags.push(el('span', { class: 'flag h', text: 'H', title: 'Keeps history: loads merge by the natural key' }));
       return el('td', { class: 'flags-col', 'data-label': flags.length ? 'Set up' : '' }, flags.length ? [el('span', { class: 'flags' }, flags)] : []);
     }
@@ -2531,6 +2532,8 @@
         fields.push(setField('From', setInput(part, 'from', 'text'), 'A date, or today-30 for a rolling start.'));
         fields.push(setField('To', setInput(part, 'to', 'text'), 'A date, or today.'));
         fields.push(setField('Days per statement', setInput(part, 'days', 'number', { min: '1', max: '366', step: '1' })));
+        fields.push(setField('Incremental loads go back to', setInput(part, 'incremental_from', 'text', { placeholder: 'e.g. today-4' }),
+          'Optional. today-4 makes Incremental run just the last 5 days and replace their rows; a full load still runs From to To. Needs 1 day per statement.'));
         var near = datesNear(part);
         var repeated = near.filter(function (p) { return p.text === part.find && p.count > 1; }).length > 0;
         var choices = near.filter(function (p) { return p.text !== part.find; }).map(function (p) { return p.text; });
@@ -4281,11 +4284,18 @@
 
     function reloadButton(s) { return loadButton(s, null, false); }
 
+    // An API source's incremental window, in words.
+    function windowText(w) {
+      return 'Incremental by statement: an incremental load runs the ' + plural(w.statements, 'statement') + ' from ' + w.from +
+        ' on and replaces just their rows (by ET_statement); a full load runs them all';
+    }
+
     // The tables an incremental load of a source (or of one table, `t`) would load.
     function incrementalTables(s, t) {
       if (s.type === 'file') return null;
       if (t) return t.incremental ? [t] : [];
       if (s.tables) return s.tables.filter(function (x) { return x.incremental; });
+      if (s.statement_window) return [{ table: s.table, incremental: s.incremental, window: s.statement_window }];
       return s.incremental ? [{ table: s.table, incremental: s.incremental }] : [];
     }
 
@@ -4339,6 +4349,8 @@
       var b = el('button', { type: 'button', class: 'btn small reload' + (busy ? ' busy' : ''), 'aria-label': (incremental ? 'Incremental load of ' : 'Reload ') + what });
       if (incremental) {
         b.title = !tables.length ? 'Choose an incremental column for ' + (target ? 'this table' : 'a table of this source') + ' in Preview Data first'
+          : tables[0].window ? 'Run the ' + plural(tables[0].window.statements, 'statement') + ' from ' + tables[0].window.from +
+            ' on and replace just their rows'
           : 'Add only the rows past the latest ' + tables.map(function (x) { return x.incremental; }).filter(function (c, i, all) { return all.indexOf(c) === i; }).join(' / ') + ' already loaded';
       } else {
         b.title = s.type === 'file' ? 'Load the stored files again' : s.type === 'gsheet' ? 'Fetch the tab from Google Sheets again'
@@ -4446,7 +4458,7 @@
       if (t.status === 'cancelled') return 'Cancelled' + (rows ? ' after ' + plural(rows, 'row') : '') + '; the table is as it was before';
       if (t.status === 'succeeded') {
         if (t.mode === 'incremental') {
-          if (!rows) return 'Done: nothing new after ' + fmtValue(t.since);
+          if (!rows) return 'Done: nothing new after ' + fmtValue(t.since) + (t.note ? '; ' + t.note : '');
           return 'Done: ' + plural(rows, 'row') + ' from ' + fmtValue(t.since) + ' on' +
             (t.replaced ? ' (' + fmtInt(rows - t.replaced) + ' new, ' + fmtInt(t.replaced) + ' replacing older copies)' : '') +
             (t.note ? '; ' + t.note : '');

@@ -23,7 +23,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
-from . import loadlog
+from . import loadlog, targets
 from .connectors.file import DATASET_KEY
 from .engine import Engine
 from .identifiers import table_name
@@ -82,7 +82,7 @@ class LoadQueue:
         if all(p["table"] in hidden for p in planned):
             raise ValueError(f"{planned[0]['label'] if table else source} is hidden in Sources; unhide it to load it")
         planned = [p for p in planned if p["table"] not in hidden]  # every load skips hidden tables
-        if incremental is True:
+        if incremental is True and targets.statement_window(src) is None:
             chosen = self.store.increments()
             planned = [p for p in planned if p["table"] in chosen]
             if not planned:
@@ -99,7 +99,8 @@ class LoadQueue:
         """Queue a reload; returns (the item, whether it is new). The same reload already waiting
         or running is returned instead of being queued twice."""
         planned = self.planned_tables(source, table, incremental)
-        src_type = self.store.get_source(source).type
+        src = self.store.get_source(source)
+        src_type = src.type
         with self._lock:
             for item in self._items if not resume else []:
                 if item["status"] in ACTIVE and (item["source"], item["table"], item["incremental"]) == (source, table, incremental):
@@ -109,7 +110,8 @@ class LoadQueue:
         for p in planned:
             # how many rows the table had: what a full load is measured against
             before = self.store.count_rows(p["table"])
-            by_increment = incremental is True or (incremental == "auto" and p["table"] in chosen and src_type != "file")
+            by_increment = incremental is True or (incremental == "auto" and src_type != "file" and (
+                p["table"] in chosen or targets.statement_window(src) is not None))
             tables.append({**p, "before": before, "expected": None if by_increment else before, "rows": 0,
                            "status": "waiting", "mode": None, "since": None, "replaced": 0, "error": None,
                            "started_at": None, "updated_at": None, "finished_at": None})

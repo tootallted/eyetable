@@ -191,6 +191,18 @@ def expand(plan: dict[str, Any], today: dt.date | None = None) -> Iterator[State
         yield Statement(" · ".join(label for label, _ in combination), [change for _, change in combination])
 
 
+def incremental_window(plan: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The set an incremental load runs: each dates part with an incremental window starts there
+    instead of at its "from" (today-4 instead of today-15, say). None if no part has a window.
+
+    Its statements are labelled like the full set's, one day each, so an incremental load can
+    delete the rows of exactly the statements it ran (their ET_statement) and put the new ones in."""
+    if not plan or not any(p.get("incremental_from") for p in plan.get("parts", [])):
+        return None
+    parts = [{**p, "from": p["incremental_from"]} if p.get("incremental_from") else p for p in plan["parts"]]
+    return {**plan, "parts": parts}
+
+
 def sets_paging(plan: dict[str, Any], paging: dict[str, Any] | None) -> bool:
     """Whether the set itself changes what automatic paging would, so paging must stay out of its way."""
     names = {paging.get(key) for key in _PAGING_PARAMS} if paging else set()
@@ -239,6 +251,16 @@ def _clean_part(part: dict[str, Any], url: str, body: dict | None, today: dt.dat
         if not 1 <= days <= 366:
             raise StatementError("days per statement must be between 1 and 366")
         out.update({"from": str(part.get("from") or "").strip(), "to": str(part.get("to") or "").strip(), "days": days})
+        window = str(part.get("incremental_from") or "").strip()
+        if window:
+            # an incremental load runs just the statements from here on and replaces their rows,
+            # which only lines up with the full load's statements when each is one day
+            if days != 1:
+                raise StatementError("an incremental window needs one day per statement, so its days line up with a full load's")
+            start, last = parse_day(window, today), parse_day(out["to"], today)
+            if start > last:
+                raise StatementError(f"incremental loads would go back to {start}, after the last day ({last}), so they'd run nothing")
+            out["incremental_from"] = window
         end_find = str(part.get("end_find") or "").strip()
         if end_find:
             if not date_format(end_find):

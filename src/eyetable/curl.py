@@ -46,7 +46,7 @@ from eyetable.connectors.postman import (
 )
 from eyetable.credentials import encrypt_secret
 from eyetable.identifiers import sanitize, source_name
-from eyetable.statements import encode_query, expand, normalize, pieces, rewrite, sets_paging
+from eyetable.statements import encode_query, expand, incremental_window, normalize, pieces, rewrite, sets_paging
 from eyetable.tls import covers, describe
 from eyetable.xmldata import XmlDocument
 from eyetable.types import infer_columns
@@ -685,6 +685,12 @@ def preview_statements(config: dict[str, Any], plan: dict[str, Any], limit: int 
     notes = []
     if sets_paging(plan, (config.get("pagination") or {}).get(REQUEST_NAME)):
         notes.append("Automatic paging is off for this source while the set changes its paging parameter.")
+    window = incremental_window(plan)
+    if window:
+        labels = [st.label for st in expand(window)]
+        span = labels[0] if len(labels) == 1 else f"{labels[0]} to {labels[-1]}"
+        notes.append(f"An incremental load runs {len(labels):,} statement{'s' if len(labels) != 1 else ''} ({span}) and "
+                     "replaces just those statements' rows; a full load runs them all and replaces the whole table.")
     return {"count": total, "first": seen, "last": last if total > limit else None, "notes": notes}
 
 

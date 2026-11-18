@@ -69,3 +69,13 @@ def parse(text: str, data_schema: str | None, meta_schema: str | None) -> tuple[
     if name.endswith("__stg"):
         raise ValueError("a table name can't end in __stg (eyetable's staging tables do)")
     return (schema or data_schema), name
+
+
+def statement_window(src: Any) -> dict[str, Any] | None:
+    """An API source's incremental window: the statements an incremental load runs (their rows
+    replacing the same statements' rows), or None if its statement set has no window."""
+    from .statements import incremental_window
+
+    if getattr(src, "type", None) != "curl":
+        return None
+    return incremental_window((src.config or {}).get("statements"))

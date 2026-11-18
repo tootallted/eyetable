@@ -20,7 +20,8 @@ from eyetable.connectors.file import DATASET_KEY, FileConnector
 from eyetable.credentials import decrypt_secrets, resolve_env
 from eyetable.identifiers import SOURCE_NAME, table_name
 from eyetable.models import ColumnInfo, DatasetInfo
-from eyetable.store import CoreStore, SourceNotFound
+from eyetable.statements import expand as expand_statements
+from eyetable.store import STATEMENT_COLUMN, CoreStore, SourceNotFound
 from eyetable.types import infer_columns
 
 log = logging.getLogger(__name__)
@@ -573,7 +574,8 @@ class Engine:
         auto = incremental == "auto"
         if auto:  # per table: incremental where set up, full elsewhere
             chosen = self.store.increments()
-            incremental = src.type != "file" and any(t in chosen for t in targets.tables(src))
+            incremental = src.type != "file" and (any(t in chosen for t in targets.tables(src))
+                                                  or targets.statement_window(src) is not None)
             if incremental and src.type != "dbtable":
                 incremental = True  # its one table has an incremental column
             elif src.type == "dbtable" and incremental:
@@ -999,9 +1001,11 @@ class Engine:
         unknown = [k for k in keys if k not in catalog]
         if unknown:
             raise UnknownDataset(f"not in {source!r} catalog (run discover?): {', '.join(unknown)}")
+        # an API source whose statement set has an incremental window loads incrementally by it
+        window = targets.statement_window(src)
         if mode == "incremental":
             chosen = self.store.increments()
-            keys = [k for k in keys if targets.table_for(src, catalog[k].name) in chosen]
+            keys = [k for k in keys if window or targets.table_for(src, catalog[k].name) in chosen]
             if not keys:
                 raise incremental_problem("no incremental column is chosen for this table; choose one in Preview Data")
 
@@ -1011,8 +1015,17 @@ class Engine:
             for key in keys:
                 table = targets.table_for(src, catalog[key].name)
                 # "auto": this table incrementally if it has an incremental column, else in full
-                key_mode = ("incremental" if table in chosen_columns else "replace") if mode == "auto" else mode
-                if key_mode == "incremental":
+                key_mode = ("incremental" if table in chosen_columns or window else "replace") if mode == "auto" else mode
+                full_note = None
+                if key_mode == "incremental" and window:
+                    if self._has_statement_column(table):
+                        results.append(self._ingest_statements(conn, source, key, table, window, batch_size))
+                        continue
+                    # rows loaded before they were tagged with their statement can't be told apart
+                    full_note = (f"the table had no {STATEMENT_COLUMN} column yet to tell its statements apart, so this "
+                                 "load ran in full; incremental loads replace just their statements from now on")
+                    loadlog.step(f"{table}: {full_note}")
+                elif key_mode == "incremental":
                     p = incremental.plan(self.store, table)
                     loadlog.step(f"{table}: incremental by {p.column}; " + (
                         f"rows with {p.column} {'>=' if p.inclusive else '>'} {p.since}"
@@ -1047,9 +1060,47 @@ class Engine:
                     results.append(RunResult(run_id, key, table, "failed", 0, error, detail=detail, resume=kept))
                 else:
                     self.store.finish_run(run_id, "succeeded", rows)
+                    note = "; ".join(n for n in (full_note, note) if n) or None
                     results.append(RunResult(run_id, key, table, "succeeded", rows, note=self._merge_note(note)))
                     self.scan_keys(table)
         return results
+
+    def _has_statement_column(self, table: str) -> bool:
+        return self.store.table_exists(table) and STATEMENT_COLUMN in {c["name"] for c in self.store.columns(table)}
+
+    def _ingest_statements(self, conn: Connector, source: str, key: str, table: str, window: dict[str, Any],
+                           batch_size: int) -> RunResult:
+        """An incremental load of a statement set: run just its incremental window (today-4 to today,
+        say) and, once every statement is in, replace the rows of those statements (by ET_statement)
+        with the new ones, in one transaction. No natural key is needed; a failure changes nothing."""
+        labels = [s.label for s in expand_statements(window)]
+        span = labels[0] if len(labels) == 1 else f"{labels[0]} to {labels[-1]}"
+        loadlog.step(f"{table}: incremental by its statement set: {len(labels):,} statement"
+                     f"{'s' if len(labels) != 1 else ''} ({span}), replacing their rows by {STATEMENT_COLUMN}")
+        run_id = self.store.start_run(source, key, table, "incremental")
+        origin = f"{source} - {conn.origin(key)}"
+        conn.window, conn.ran = True, []
+        try:
+            read = self._counted(table, conn.read(key, batch_size))
+            if self.store.has_history(table):  # a history table merges by its natural key; nothing is deleted
+                rows, deleted = self.store.write(table, read, "append", run_id, origin=origin), 0
+            else:
+                rows, deleted = self.store.replace_statements(table, read, run_id, origin, lambda: list(conn.ran))
+        except Exception as exc:
+            detail = traceback.format_exc()
+            error = f"{type(exc).__name__}: {exc}"
+            self.store.finish_run(run_id, "failed", 0, error)
+            return RunResult(run_id, key, table, "failed", 0, error, mode="incremental", since=labels[0], detail=detail)
+        finally:
+            conn.window = False
+        ran = len(conn.ran)
+        self.store.finish_run(run_id, "succeeded", rows)
+        if rows:
+            self.scan_keys(table)
+        note = (f"ran {ran:,} statement{'s' if ran != 1 else ''} ({span})"
+                + ("" if self.store.has_history(table) else f": their {deleted:,} old rows were replaced"))
+        return RunResult(run_id, key, table, "succeeded", rows, mode="incremental", since=labels[0],
+                         note=self._merge_note(note))
 
     def _ingest_increment(self, conn: Connector, source: str, key: str, dataset: DatasetInfo, table: str,
                           p: "incremental.Plan", batch_size: int) -> RunResult:

@@ -6,16 +6,26 @@ import httpx
 
 from eyetable.connectors.base import Record
 from eyetable.connectors.postman import PaginationLimitError, PostmanConnector, raw_url
-from eyetable.statements import count, expand, rewrite, sets_paging
+from eyetable.statements import count, expand, incremental_window, rewrite, sets_paging
+from eyetable.store import STATEMENT_COLUMN
 
 
 class CurlConnector(PostmanConnector):
     """A source made from a pasted curl command: a one-request Postman collection
     (see eyetable.curl, which builds its config). Its "statements" config runs the
     request as a set, every statement paging as usual (see eyetable.statements).
-    A statement that fails stops the run, so a replace keeps the table as it was."""
+    A statement that fails stops the run, so a replace keeps the table as it was.
+
+    Rows of a set carry their statement's label in ET_statement. With `window` set, only the
+    set's incremental window runs (see statements.incremental_window); `ran` lists the labels
+    of the statements that finished."""
 
     type = "curl"
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.window = False
+        self.ran: list[str] = []
 
     def pages(self, key: str, resume: dict | None = None) -> Iterator[list[Record]]:
         """The request's pages, or each statement's in turn; `resume` carries on from a statement
@@ -23,6 +33,8 @@ class CurlConnector(PostmanConnector):
         from eyetable import resume as resuming
 
         plan = self.config.get("statements")
+        if plan and self.window:
+            plan = incremental_window(plan) or plan
         if not plan:
             yield from super().pages(key, resume)
             return
@@ -44,12 +56,13 @@ class CurlConnector(PostmanConnector):
                 for records in self._pages(dataclasses.replace(request, url=url, body=body), paging, inner,
                                            {"statement": number, "statements": total}):
                     rows += len(records)
-                    yield records
+                    yield [{**r, STATEMENT_COLUMN: statement.label} for r in records]
             except httpx.HTTPStatusError as exc:
                 reply = f"the API answered {exc.response.status_code} {exc.response.reason_phrase}"
                 raise RuntimeError(f"statement {number} of {total} ({statement.label}): {reply}") from None
             except (httpx.HTTPError, PaginationLimitError) as exc:
                 raise RuntimeError(f"statement {number} of {total} ({statement.label}): {exc}") from None
             resuming.mark({"statement": number + 1, "statements": total})  # this statement is in
+            self.ran.append(statement.label)
             if not rows and plan.get("stop_when_empty"):
                 return

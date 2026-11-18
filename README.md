@@ -772,6 +772,32 @@ does. Pick a candidate, or any other column from **Another column…**, and clic
 * File sources have no incremental load: they get new rows by loading a file
   with **Append**.
 
+**API sources run as a set of day statements** can load incrementally by day,
+with no incremental column or natural key:
+
+* Every row a statement set loads has an `ET_statement` column holding its
+  statement's label, for example `2026-11-15`. It sits after the source's own
+  columns, before `ET_timestamp`.
+* On a dates part, set **Incremental loads go back to**, for example
+  `today-4`. The part needs **1** day per statement, so the incremental
+  statements line up with the full load's.
+* A **full load** runs every statement (From to To, say `today-15` to
+  `today`) and replaces the whole table, as before.
+* An **incremental load** runs only the window: `today-4` to `today` is 5
+  statements. The rows go into `<table>__incoming` first. Once every
+  statement is in, one transaction deletes the table's rows whose
+  `ET_statement` is one of those 5 days and adds the new rows. Rows for
+  earlier days are left alone. A day that now has fewer rows loses the
+  missing ones.
+* If any statement fails, nothing in the table changes.
+* A table loaded before its rows were tagged has no `ET_statement` column yet,
+  so its first incremental load runs in full and says so. Later incremental
+  loads use the window.
+* A table that keeps history merges the window's rows by its natural key
+  instead; nothing is deleted.
+* The source shows **IC**, and its **Incremental** button runs the window.
+  Groups and schedules set to incremental use it too.
+
 **Where to start one.** Every source row in **Sources** has **Reload** (full)
 and **Incremental**. Incremental loads the source's tables that have an
 incremental column and leaves the rest alone. Each table row of an opened
