@@ -593,6 +593,18 @@ How items run:
 
 * Up to two loads run at once. Two loads of the same source never overlap:
   the second waits its turn. The same reload asked for twice is queued once.
+* **Retrying a failed API load.** When a full load of an API source fails
+  partway, for example on statement 15 of a 16-statement set or page 15 of
+  a paged request, the pages that completed are kept. They wait in its staging
+  table (`<table>__stg`) while the live table stays as it was. The failed item
+  says how many rows were kept and offers **Retry from statement 15 of 16** (or
+  **page 15**). The retry is a new queue item: it reads only what's missing,
+  adds it to the kept rows, and swaps in the whole table. A retry that fails
+  again keeps its pages too, and can be retried in turn. A failure on the very
+  first page keeps nothing. A full load of the source started meanwhile
+  replaces the kept rows, so the retry then says to run a full load instead.
+  Where to carry on from stays on the server; only its description reaches the
+  page. API: `POST /api/queue/<id>/retry`.
 * **Cancel** stops a waiting load before it starts. A running load stops at its
   next batch and leaves the table as it was: a full load's half-built copy is
   dropped, and an incremental load's rows are taken back out.

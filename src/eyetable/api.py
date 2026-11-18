@@ -841,6 +841,16 @@ def create_app(
         except KeyError as exc:
             raise HTTPException(404, str(exc).strip("'\"")) from None
 
+    @app.post("/api/queue/{item_id}/retry", dependencies=auth, status_code=202)
+    def retry_load(item_id: str) -> dict[str, Any]:
+        """Carry on a failed load from the complete pages it kept (a new queue item)."""
+        try:
+            return jsonable_encoder({"item": load_queue.retry(item_id)})
+        except KeyError as exc:
+            raise HTTPException(404, str(exc).strip("'\"")) from None
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from None
+
     @app.post("/api/queue/{item_id}/cancel", dependencies=auth)
     def cancel_load(item_id: str) -> dict[str, Any]:
         try:

@@ -17,23 +17,32 @@ class CurlConnector(PostmanConnector):
 
     type = "curl"
 
-    def pages(self, key: str) -> Iterator[list[Record]]:
+    def pages(self, key: str, resume: dict | None = None) -> Iterator[list[Record]]:
+        """The request's pages, or each statement's in turn; `resume` carries on from a statement
+        (and a page within it) where a failed load stopped (see eyetable.resume)."""
+        from eyetable import resume as resuming
+
         plan = self.config.get("statements")
         if not plan:
-            yield from super().pages(key)
+            yield from super().pages(key, resume)
             return
         request = self._readable(key)
         paging = self.pagination.get(key)
         if sets_paging(plan, paging):
             paging = None
         total = count(plan)
+        start = (resume or {}).get("statement", 1)
         for number, statement in enumerate(expand(plan), 1):
-            if number > 1 and plan.get("pause_seconds"):
+            if number < start:
+                continue  # in already, from the load being retried
+            if number > start and plan.get("pause_seconds"):
                 time.sleep(plan["pause_seconds"])
             url, body = rewrite(raw_url(request.url), request.body, statement.changes)
             rows = 0
+            inner = (resume or {}).get("page") if number == start else None
             try:
-                for records in self._pages(dataclasses.replace(request, url=url, body=body), paging):
+                for records in self._pages(dataclasses.replace(request, url=url, body=body), paging, inner,
+                                           {"statement": number, "statements": total}):
                     rows += len(records)
                     yield records
             except httpx.HTTPStatusError as exc:
@@ -41,5 +50,6 @@ class CurlConnector(PostmanConnector):
                 raise RuntimeError(f"statement {number} of {total} ({statement.label}): {reply}") from None
             except (httpx.HTTPError, PaginationLimitError) as exc:
                 raise RuntimeError(f"statement {number} of {total} ({statement.label}): {exc}") from None
+            resuming.mark({"statement": number + 1, "statements": total})  # this statement is in
             if not rows and plan.get("stop_when_empty"):
                 return

@@ -1095,6 +1095,8 @@ class CoreStore:
         run_id: int = 0,
         *,
         origin: str,
+        keep_on_failure: bool = False,
+        resume: bool = False,
     ) -> int:
         """Write record batches into `table` in the data schema; return rows written.
 
@@ -1103,6 +1105,10 @@ class CoreStore:
         failed pull never leaves a half-empty table; ET_id restarts at 1 in the
         new table. `append` adds rows to the existing table, continuing ET_id
         and adding columns as needed.
+
+        A replace that fails drops its staging table, unless `keep_on_failure`:
+        then the rows written so far stay in it for a retry, which passes
+        `resume` to add the rest to them and swap the whole table in.
         """
         if mode not in ("replace", "append"):
             raise ValueError(f"unknown write mode {mode!r}")
@@ -1112,9 +1118,12 @@ class CoreStore:
         from eyetable import loadlog
 
         target = f"{table}__stg" if mode == "replace" else table
-        loadlog.step(f"Writing into {target}" + (f", to be swapped in for {table} when every row is in" if mode == "replace"
-                                                 else f" ({mode})"))
-        writer = _TableWriter(self, target, fresh=(mode == "replace"))
+        if resume and not self.table_exists(target):
+            raise ValueError(f"the rows kept from the failed load are gone ({target} isn't there any more, "
+                             "perhaps a full load ran since); run a full load instead")
+        loadlog.step(("Adding to the rows kept in " if resume else "Writing into ") + target
+                     + (f", to be swapped in for {table} when every row is in" if mode == "replace" else f" ({mode})"))
+        writer = _TableWriter(self, target, fresh=(mode == "replace" and not resume))
         rows = 0
         try:
             for batch in batches:
@@ -1122,9 +1131,8 @@ class CoreStore:
                 rows += writer.write(batch, meta)
             writer.finish(reorder=(mode == "replace"))
         except BaseException:
-            if mode == "replace":  # don't leave a half-built staging table behind
-                with self.db.begin() as conn:
-                    conn.execute(sa.text(f"DROP TABLE IF EXISTS {self.qualified(target)}"))
+            if mode == "replace" and not keep_on_failure:  # don't leave a half-built staging table behind
+                self.drop_staging(table)
             raise
         if mode == "replace":
             prep = self.db.dialect.identifier_preparer
@@ -1133,6 +1141,22 @@ class CoreStore:
                 conn.execute(sa.text(f"ALTER TABLE {self.qualified(target)} RENAME TO {prep.quote(self.split(table)[1])}"))
             loadlog.step(f"Swapped {target} in as {table}: {rows:,} rows, {len(writer.columns) + 1} columns")
         return rows
+
+    def drop_staging(self, table: str) -> None:
+        with self.db.begin() as conn:
+            conn.execute(sa.text(f"DROP TABLE IF EXISTS {self.qualified(table + '__stg')}"))
+
+    def trim_staging(self, table: str, keep: int) -> int:
+        """Keep the first `keep` rows of a table's staging table (the pages that were complete);
+        returns how many rows it then holds."""
+        stg = table + "__stg"
+        if not self.table_exists(stg):
+            return 0
+        q, idc = self.qualified(stg), self.db.dialect.identifier_preparer.quote(ID_COLUMN)
+        with self.db.begin() as conn:
+            conn.execute(sa.text(f"DELETE FROM {q} WHERE {idc} NOT IN "
+                                 f"(SELECT {idc} FROM (SELECT {idc} FROM {q} ORDER BY {idc} LIMIT :n) k)"), {"n": keep})
+            return conn.execute(sa.text(f"SELECT COUNT(*) FROM {q}")).scalar_one()
 
     def read_table(self, table: str, limit: int | None = None) -> list[dict[str, Any]]:
         schema, name = self.split(table)

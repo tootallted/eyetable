@@ -161,6 +161,8 @@
   /* the load queue */
   .q-list { display: grid; gap: 10px; }
   .q-empty { color: var(--muted); font-size: 14px; padding: 6px 0; }
+  .q-retry { display: flex; gap: 8px 12px; align-items: center; flex-wrap: wrap; padding: 8px 10px; border-radius: 6px;
+    background: var(--surface); border: 1px dashed color-mix(in srgb, var(--accent) 50%, transparent); font-size: 13px; }
   .runs-filters { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; align-items: end; }
   .runs-filters .runs-quick { grid-column: 1 / -1; font-size: 13px; color: var(--muted); }
   .runs-table td.err { color: var(--err); white-space: normal; overflow-wrap: anywhere; max-width: 420px; font-size: 12.5px; }
@@ -4538,6 +4540,7 @@
           el('span', { class: 'q-text', text: queueTableText(item, t) })
         ]));
       });
+      if (item.resumable) box.appendChild(retryBox(item));
       box.appendChild(queueLogPanel(item));
       if (item.errors.length) {
         box.appendChild(el('div', { class: 'q-errors' }, item.errors.map(function (e) {
@@ -4736,6 +4739,32 @@
         loadRuns();
       });
     });
+
+    // A full load that failed partway keeps its complete pages: offer to carry on from there.
+    function retryBox(item) {
+      var k = item.resumable;
+      var text = 'Kept ' + plural(k.rows, 'row') + ' from ' + plural(k.pages, 'complete page') + ' in ' + fullTable(k.table) + '__stg. ' +
+        (item.retried_by ? 'Retried: see the newer item above.' :
+          'The live table is unchanged. Retry carries on from ' + k.where + ' and, when the rest is in, swaps in the whole table.');
+      var wrap = el('div', { class: 'q-retry' }, [el('span', { text: text })]);
+      if (!item.retried_by) {
+        var b = el('button', { type: 'button', class: 'btn small primary', text: 'Retry from ' + k.where });
+        b.addEventListener('click', function () {
+          b.disabled = true;
+          b.textContent = 'Starting…';
+          api('/api/queue/' + item.id + '/retry', { method: 'POST' }).then(function (r) {
+            upsertQueueItem(r.item);
+            loadQueue();
+          }, function (err) {
+            b.disabled = false;
+            b.textContent = 'Retry from ' + k.where;
+            wrap.appendChild(banner('err', err.message));
+          });
+        });
+        wrap.appendChild(b);
+      }
+      return wrap;
+    }
 
     $('queue-clear').addEventListener('click', function () {
       api('/api/queue', { method: 'DELETE' }).then(loadQueue, function () { loadQueue(); });

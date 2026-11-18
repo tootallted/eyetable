@@ -471,8 +471,12 @@ class PostmanConnector(Connector):
             datasets.append(info)
         return datasets
 
-    def read(self, key: str, batch_size: int = 1000) -> Iterator[list[Record]]:
-        for records in self.pages(key):  # stream page by page; nothing is buffered
+    resumable = True  # read() can carry on from where a failed load stopped (see eyetable.resume)
+
+    def read(self, key: str, batch_size: int = 1000, resume: dict | None = None) -> Iterator[list[Record]]:
+        """Records in batches, page by page; with `resume` (a state from eyetable.resume.mark),
+        carry on from that page instead of the first."""
+        for records in self.pages(key, resume):  # stream page by page; nothing is buffered
             for start in range(0, len(records), batch_size):
                 yield records[start : start + batch_size]
 
@@ -480,9 +484,9 @@ class PostmanConnector(Connector):
         """The records of the first response only."""
         return next(self.pages(key), [])
 
-    def pages(self, key: str) -> Iterator[list[Record]]:
+    def pages(self, key: str, resume: dict | None = None) -> Iterator[list[Record]]:
         """Send a request and yield the records of each page it paginates through."""
-        yield from self._pages(self._readable(key), self.pagination.get(key))
+        yield from self._pages(self._readable(key), self.pagination.get(key), (resume or {}).get("page"))
 
     def _readable(self, key: str) -> PostmanRequest:
         request = self.requests.get(key)
@@ -494,28 +498,47 @@ class PostmanConnector(Connector):
             )
         return request
 
-    def _pages(self, request: PostmanRequest, paging: dict | None) -> Iterator[list[Record]]:
+    def _pages(self, request: PostmanRequest, paging: dict | None, resume_page: dict | None = None,
+               base: dict | None = None) -> Iterator[list[Record]]:
+        """Yield each page's records. After each page has been passed on (and so written), mark
+        where the next page starts (eyetable.resume), with `base` (a statement) around it;
+        `resume_page` starts from such a mark instead of the first page."""
+        from eyetable import resume as resuming
+
+        def mark(page: dict) -> None:
+            resuming.mark({**(base or {}), "page": page})
+
         key = request.key
         path = (self.config.get("records_path") or {}).get(key)
         built = self._build(request)
+        if resume_page and resume_page.get("done"):
+            return  # every page of this request was in already
         if paging is None:
             yield extract_records(parse_response(self._send(built)), path)
+            mark({"done": True, "number": 2})
             return
 
         kind = paging["type"]
         position = paging.get("start", 0)  # page number or row offset
+        if resume_page and resume_page.get("position") is not None:
+            position = resume_page["position"]
         if kind == "page":
             built = _with_params(built, {paging["param"]: position, paging.get("size_param"): paging.get("size")})
         elif kind == "offset":
             built = _with_params(built, {paging["offset_param"]: position, paging["limit_param"]: paging["limit"]})
+        elif resume_page and kind == "cursor" and resume_page.get("cursor") is not None:
+            built = _with_params(built, {paging["param"]: resume_page["cursor"]})
+        elif resume_page and resume_page.get("url"):
+            built = self._follow(request, built, resume_page["url"])
         followed: set[str] = set()  # cursors / next URLs already used, to stop on loops
         previous: list[Record] | None = None
-        count = 0
+        count = (resume_page or {}).get("number", 1) - 1
         while True:
             response = self._send(built)
             payload = parse_response(response)
             records = extract_records(payload, path)
             if records == previous:  # the API ignored the paging parameter
+                mark({"done": True, "number": count + 1})
                 return
             if records:
                 yield records
@@ -525,11 +548,14 @@ class PostmanConnector(Connector):
             if kind in ("page", "offset"):
                 size = paging.get("size") if kind == "page" else paging["limit"]
                 if not records or (size and len(records) < size):
+                    mark({"done": True, "number": count + 1})
                     return
                 position += 1 if kind == "page" else len(records)
                 param = paging["param"] if kind == "page" else paging["offset_param"]
                 built = _with_params(built, {param: position})
+                mark({"number": count + 1, "position": position})
             elif not records or (paging.get("page_size") and len(records) < paging["page_size"]):
+                mark({"done": True, "number": count + 1})
                 return  # a short (or empty) page is the last one, whatever links it carries
             elif kind == "cursor":
                 try:
@@ -537,15 +563,19 @@ class PostmanConnector(Connector):
                 except (KeyError, IndexError, TypeError, ValueError):
                     cursor = None
                 if cursor is None or cursor is False or cursor == "" or str(cursor) in followed:
+                    mark({"done": True, "number": count + 1})
                     return
                 followed.add(str(cursor))
                 built = _with_params(built, {paging["param"]: cursor})
+                mark({"number": count + 1, "cursor": cursor})
             else:
                 url = _next_link(response, payload, paging.get("next_path"))
                 if url is None or url in followed:
+                    mark({"done": True, "number": count + 1})
                     return
                 followed.add(url)
                 built = self._follow(request, built, url)
+                mark({"number": count + 1, "url": url})
 
             if count >= paging["max_pages"]:
                 raise PaginationLimitError(

@@ -92,7 +92,8 @@ class LoadQueue:
     # -- adding, listing, cancelling ----------------------------------------------
 
     def add(self, source: str, table: str | None = None, incremental: bool | str = False,
-            google_token: str | None = None, by: str | None = None) -> tuple[dict[str, Any], bool]:
+            google_token: str | None = None, by: str | None = None,
+            resume: dict[str, Any] | None = None) -> tuple[dict[str, Any], bool]:
         """Queue a reload: incremental=False (full), True (incremental tables only) or "auto"
         (incremental where a table has an incremental column, full elsewhere)."""
         """Queue a reload; returns (the item, whether it is new). The same reload already waiting
@@ -100,7 +101,7 @@ class LoadQueue:
         planned = self.planned_tables(source, table, incremental)
         src_type = self.store.get_source(source).type
         with self._lock:
-            for item in self._items:
+            for item in self._items if not resume else []:
                 if item["status"] in ACTIVE and (item["source"], item["table"], item["incremental"]) == (source, table, incremental):
                     return self._public(item), False
         chosen = self.store.increments() if incremental == "auto" else {}
@@ -118,6 +119,9 @@ class LoadQueue:
             "by": by,  # what started it, when not a click on Reload: "Group Nightly · scheduled"
             "status": "queued", "created_at": _now(), "started_at": None, "finished_at": None,
             "tables": tables, "errors": [], "cancel": False, "log": [], "log_dropped": 0,
+            "resume": resume,  # a retry: carries on a failed load from its kept pages (Engine.resume)
+            "resumable": None,  # this item failed with complete pages kept: what a retry would do
+            "retried_by": None,
         }
         with self._lock:
             self._items.append(item)
@@ -145,6 +149,24 @@ class LoadQueue:
             return {"id": item_id, "from": after, "entries": [dict(e) for e in item["log"][after:]],
                     "count": len(item["log"]), "dropped": item["log_dropped"], "status": item["status"],
                     "started_at": item["started_at"]}
+
+    def retry(self, item_id: str) -> dict[str, Any]:
+        """Carry on a failed load from the pages it kept (once the person asks): a new item that
+        reads the rest into the kept rows and swaps the whole table in."""
+        with self._lock:
+            item = self._find(item_id)
+            info = item.get("resumable")
+            if item["status"] != "failed" or not info:
+                raise ValueError("this load has nothing kept to carry on from")
+            if item.get("retried_by"):
+                raise ValueError("this load has been retried already")
+            busy = [i for i in self._items if i["status"] in ACTIVE and i["source"] == item["source"]]
+        if busy:
+            raise ValueError(f"a load of {item['source']} is in the queue; let it finish (a full load would replace the kept rows)")
+        new, _ = self.add(item["source"], by=f"Retry from {info['where']}", resume=info)
+        with self._lock:
+            item["retried_by"] = new["id"]
+        return new
 
     def cancel(self, item_id: str) -> dict[str, Any]:
         """Stop an item: one still waiting never starts; a running one stops at its next batch."""
@@ -215,8 +237,11 @@ class LoadQueue:
                 meta = {t.name for t in self.store.metadata.tables.values()}
                 with self.engine.reporting(progress), loadlog.capture(record, self.store.db, meta):
                     kwargs = {"sheet_fetch": fetch} if fetch else {}
-                    results = self.engine.reload_source(item["source"], incremental=item["incremental"],
-                                                        table=item["table"], **kwargs)
+                    if item["resume"]:
+                        results = self.engine.resume(item["source"], item["resume"])
+                    else:
+                        results = self.engine.reload_source(item["source"], incremental=item["incremental"],
+                                                            table=item["table"], **kwargs)
             except Exception as exc:
                 with self._lock:
                     item["errors"].append({"table": None, "message": describe(exc), "detail": traceback.format_exc()})
@@ -236,6 +261,8 @@ class LoadQueue:
                     # a file source's stored files all build one table: their rows add up
                     rows = r.rows + (entry["rows"] if r.table in seen and r.status == "succeeded" else 0)
                     seen.add(r.table)
+                    if r.resume:  # it failed, but its complete pages are kept: offer a retry
+                        item["resumable"] = dict(r.resume)
                     entry.update(status=r.status, rows=rows if r.status == "succeeded" else entry["rows"], mode=r.mode,
                                  since=r.since, replaced=r.replaced, error=r.error, note=r.note, finished_at=_now())
                     if r.status == "skipped":
@@ -291,7 +318,11 @@ class LoadQueue:
 
     @staticmethod
     def _public(item: dict[str, Any]) -> dict[str, Any]:
-        out = {k: v for k, v in item.items() if k not in ("cancel", "log")}
+        out = {k: v for k, v in item.items() if k not in ("cancel", "log", "resume", "resumable")}
+        # what a retry would do, without the bookmark itself (a next-page link can carry tokens)
+        info = item.get("resumable")
+        out["resumable"] = {k: info[k] for k in ("rows", "pages", "where", "table")} if info else None
+        out["retry_of"] = bool(item.get("resume"))
         out["log_count"] = len(item["log"])
         out["cancelling"] = item["cancel"] and item["status"] in ACTIVE
         out["tables"] = [dict(t) for t in item["tables"]]

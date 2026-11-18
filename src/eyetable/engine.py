@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from eyetable import filesets, gsheets, incremental, keys, loadlog, targets
+from eyetable import resume as resuming
 from eyetable.connectors import Connector, build_connector
 from eyetable.connectors.file import DATASET_KEY, FileConnector
 from eyetable.credentials import decrypt_secrets, resolve_env
@@ -49,6 +50,9 @@ class RunResult:
     replaced: int = 0  # older copies of rows an incremental load replaced (by natural key)
     detail: str | None = None  # a failure's full traceback, for the load queue's details
     note: str | None = None  # how it was read, when that's worth saying (in parts, say)
+    # a failed full load of an API source that kept its complete pages: what a retry needs
+    # ({key, table, state, rows, pages, where}; see Engine.resume)
+    resume: dict[str, Any] | None = None
 
 
 class UnknownDataset(KeyError):
@@ -117,16 +121,19 @@ class Engine:
     @staticmethod
     def _counted(table: str, batches):
         progress = getattr(_local, "progress", None)
-        if progress is None:
+        if progress is None and resuming.current() is None:
             return batches
 
         def counted():
             rows = 0
-            progress(table, 0)
+            if progress:
+                progress(table, 0)
             for batch in batches:
                 rows += len(batch)
                 yield batch
-                progress(table, rows)
+                resuming.counted(len(batch))  # written by now: a mark after this keeps it
+                if progress:
+                    progress(table, rows)
 
         return counted()
 
@@ -765,6 +772,52 @@ class Engine:
             name = new_name
         return name, warnings
 
+    # -- carrying on a load that failed partway (eyetable.resume) ----------------------------
+
+    def _keep_for_resume(self, key: str, table: str, marks: "resuming.Marks", base_rows: int) -> dict[str, Any] | None:
+        """After a failed full load: keep the staging table's complete pages for a retry and say
+        where to carry on, or drop it (nothing complete to keep)."""
+        if not marks.pages or not marks.state:
+            self.store.drop_staging(table)
+            return None
+        held = self.store.trim_staging(table, base_rows + marks.kept_rows)
+        if not held:
+            self.store.drop_staging(table)
+            return None
+        where = resuming.describe(marks.state)
+        loadlog.emit("warn", f"Kept the {held:,} rows of the complete pages in {table}__stg; a retry carries on from {where}")
+        return {"key": key, "table": table, "state": marks.state, "rows": held, "pages": marks.pages, "where": where}
+
+    def resume(self, source: str, info: dict[str, Any]) -> list[RunResult]:
+        """Carry on a failed full load from where it stopped (`info`: a RunResult's resume): read the
+        rest into the rows kept in the staging table, then swap the whole table in."""
+        key, table = info["key"], info["table"]
+        if not self.store.table_exists(f"{table}__stg"):
+            raise ValueError(f"the rows kept from the failed load of {table} are gone (a full load may have run "
+                             "since); run a full load instead")
+        loadlog.step(f"Retrying the load of {table} from {info['where']}, after the {info['rows']:,} rows kept")
+        run_id = self.store.start_run(source, key, table, "replace")
+        outer = getattr(_local, "progress", None)
+        with self.connector(source) as conn:
+            try:
+                # progress counts the kept rows too, so it reads as the whole table
+                with self.reporting((lambda t, n: outer(t, info["rows"] + n)) if outer else None), resuming.capture() as marks:
+                    added = self.store.write(table, self._counted(table, conn.read(key, resume=info["state"])), "replace", run_id,
+                                             origin=f"{source} - {conn.origin(key)}", keep_on_failure=True, resume=True)
+            except Exception as exc:
+                detail = traceback.format_exc()
+                kept = self._keep_for_resume(key, table, marks, info["rows"])
+                if kept:  # the earlier pages are still there: the next retry carries on from the new mark
+                    kept["pages"] += info.get("pages", 0)
+                error = f"{type(exc).__name__}: {exc}"
+                self.store.finish_run(run_id, "failed", 0, error)
+                return [RunResult(run_id, key, table, "failed", 0, error, detail=detail, resume=kept)]
+        rows = info["rows"] + added
+        self.store.finish_run(run_id, "succeeded", rows)
+        self.scan_keys(table)
+        return [RunResult(run_id, key, table, "succeeded", rows,
+                          note=f"retried from {info['where']}: {info['rows']:,} rows kept + {added:,} new")]
+
     def _merge_note(self, note: str | None) -> str | None:
         """Add what the last history merge on this thread did to a load's note."""
         stats = self.store.take_merge_stats()
@@ -972,18 +1025,26 @@ class Engine:
                 run_id = self.store.start_run(source, key, table, "replace" if key_mode == "incremental" else key_mode)
                 write_mode = "replace" if key_mode == "incremental" else key_mode
 
-                def write(split, key=key, table=table, run_id=run_id, write_mode=write_mode):
+                # an API source's full load keeps its complete pages if it fails, for a retry
+                keep = (write_mode == "replace" and getattr(conn, "resumable", False)
+                        and not self.store.has_history(table))
+
+                def write(split, key=key, table=table, run_id=run_id, write_mode=write_mode, keep=keep):
                     loadlog.step(f"Reading {conn.origin(key)} into {table}" + (f" in parts by {split}" if split else ""))
                     read = conn.read(key, batch_size, split=split) if split else conn.read(key, batch_size)
                     return self.store.write(table, self._counted(table, read), write_mode, run_id,
-                                            origin=f"{source} - {conn.origin(key)}")
+                                            origin=f"{source} - {conn.origin(key)}", keep_on_failure=keep)
 
                 try:
-                    rows, note = self._write_or_split(conn, source, key, catalog[key], write)
+                    with resuming.capture() as marks:
+                        rows, note = self._write_or_split(conn, source, key, catalog[key], write)
                 except Exception as exc:
+                    detail = traceback.format_exc()
+                    kept = self._keep_for_resume(key, table, marks, 0) if keep else None
                     error = f"{type(exc).__name__}: {exc}"
-                    self.store.finish_run(run_id, "failed", 0, error)
-                    results.append(RunResult(run_id, key, table, "failed", 0, error, detail=traceback.format_exc()))
+                    self.store.finish_run(run_id, "failed", 0, error + (f" ({kept['rows']:,} rows kept; a retry carries on "
+                                                                        f"from {kept['where']})" if kept else ""))
+                    results.append(RunResult(run_id, key, table, "failed", 0, error, detail=detail, resume=kept))
                 else:
                     self.store.finish_run(run_id, "succeeded", rows)
                     results.append(RunResult(run_id, key, table, "succeeded", rows, note=self._merge_note(note)))
