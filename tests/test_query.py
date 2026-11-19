@@ -107,7 +107,16 @@ def test_keyword_detection():
 
 def test_eyetable_internal_tables_are_off_limits(client):
     tables = {t["table"] for t in client.get("/api/schema", headers=AUTH).json()["tables"]}
-    assert tables == {"parts__data", "orders__data"}
-    for sql in ("SELECT * FROM uploads", "SELECT content FROM uploads", "SELECT * FROM sources", "SELECT * FROM runs"):
+    assert tables == {"parts__data", "orders__data", "runs", "group_runs"}  # the run logs are readable
+    for sql in ("SELECT * FROM uploads", "SELECT content FROM uploads", "SELECT * FROM sources",
+                "SELECT * FROM google_connection", "SELECT * FROM groups"):
         r = ask(client, sql)
         assert r.status_code == 400 and "prohibited" in r.json()["detail"], sql
+
+
+def test_the_run_logs_can_be_queried(client):
+    r = ask(client, "SELECT source, target_table, mode, status, rows_written FROM runs ORDER BY id")
+    assert r.status_code == 200, r.text
+    assert [row[:4] for row in r.json()["rows"]] == [["parts", "parts__data", "replace", "succeeded"],
+                                                       ["orders", "orders__data", "replace", "succeeded"]]
+    assert ask(client, "SELECT count(*) FROM group_runs").status_code == 200

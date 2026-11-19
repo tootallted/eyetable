@@ -911,8 +911,23 @@ server-side cursor inside a read-only transaction that is always rolled back,
 with a 30-second timeout (`EYETABLE_QUERY_TIMEOUT_S`). On Postgres it runs as
 `eyetable_reader` (`EYETABLE_QUERY_DATABASE_URL`, created by
 `scripts/setup-postgres.ps1`), a role that can only `SELECT` from
-`eyetable_raw` and cannot see eyetable's own `eyetable` schema (source configs
-and uploaded files).
+`eyetable_raw` (and the schemas tables were moved to). Of eyetable's own
+`eyetable` schema it can read only the run logs, which hold no credentials:
+
+* `eyetable.runs`: one row per table load, with its source, table, mode,
+  status, rows, start and finish times, and error.
+* `eyetable.group_runs`: one row per group run, with each member's outcome in
+  `results`.
+
+Everything else there (source settings and credentials, sign-ins, uploaded
+files) stays out of reach. The server grants this when it starts.
+
+```sql
+SELECT id, source, target_table, mode, status, rows_written, started_at, finished_at, error
+FROM eyetable.runs
+ORDER BY started_at DESC
+LIMIT 50;
+```
 
 ### Public access from the GitHub Pages page
 

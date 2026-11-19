@@ -12,12 +12,17 @@ API can be public, a query must never change anything:
   * A statement timeout stops runaway queries, and only `limit` rows are
     fetched, so a huge table never lands in memory.
 
+Of eyetable's own tables, only the run logs can be read (RUN_LOGS: `eyetable.runs`, one
+row per table load, and `eyetable.group_runs`, one per group run); they hold no credentials.
+The rest (sources and their settings, sign-ins, uploads) stay out of reach.
+
 Each file source can be queried by its own name: before the query runs, a
 temporary view named after the source (e.g. `parts_list`) is created over its
 table (`parts_list__data`). Every table in the data schema is also reachable by
 its plain name, since the data schema is the search path.
 """
 
+import logging
 import re
 import sqlite3
 import time
@@ -29,7 +34,11 @@ from sqlalchemy.pool import NullPool
 
 from eyetable.store import CoreStore
 
+log = logging.getLogger(__name__)
+
 READ_KEYWORDS = ("select", "with", "values", "table")
+# eyetable's own tables the query window may read: the run logs, which hold no secrets
+RUN_LOGS = ("runs", "group_runs")
 MAX_LIMIT = 10_000
 
 _LEADING_NOISE = re.compile(r"^(?:\s+|--[^\n]*(?:\n|$)|/\*.*?\*/|\()*", re.S)
@@ -74,6 +83,7 @@ class QueryRunner:
         self.reader = sa.make_url(url).username if url else None
         if self.reader and store.db.dialect.name == "postgresql":
             store.schema_hooks.append(self.share_schema)  # new schemas (a table's own, archives) can be queried
+            self.share_run_logs()
 
     def share_schema(self, schema: str) -> None:
         """Let the query window's read-only role read a schema's tables, now and later ones."""
@@ -84,11 +94,22 @@ class QueryRunner:
             conn.execute(sa.text(f"GRANT SELECT ON ALL TABLES IN SCHEMA {s} TO {r}"))
             conn.execute(sa.text(f"ALTER DEFAULT PRIVILEGES IN SCHEMA {s} GRANT SELECT ON TABLES TO {r}"))
 
+    def share_run_logs(self) -> None:
+        """Let the query window's read-only role read the run logs, and nothing else of eyetable's own."""
+        prep = self.store.db.dialect.identifier_preparer
+        s, r = prep.quote_schema(self.store.meta_schema), prep.quote(self.reader)
+        try:
+            with self.store.db.begin() as conn:
+                conn.execute(sa.text(f"GRANT USAGE ON SCHEMA {s} TO {r}"))
+                conn.execute(sa.text(f"GRANT SELECT ON {', '.join(f'{s}.{prep.quote(t)}' for t in RUN_LOGS)} TO {r}"))
+        except Exception as exc:  # the page still works; only the run logs can't be queried
+            log.warning("could not let %s read the run logs: %s", self.reader, exc)
+
     def _meta_tables(self) -> set[str]:
-        """eyetable's own tables, when they share a schema with the data (SQLite)."""
+        """eyetable's own tables (but the run logs), when they share a schema with the data (SQLite)."""
         if self.store.meta_schema != self.store.data_schema:
             return set()
-        return {t.name for t in self.store.metadata.tables.values()}
+        return {t.name for t in self.store.metadata.tables.values()} - set(RUN_LOGS)
 
     def tables(self) -> list[dict[str, Any]]:
         """Every table in the data schema with its columns, for the query window's sidebar."""
@@ -102,6 +123,12 @@ class QueryRunner:
                 cols = insp.get_columns(name, schema=schema)
                 # tables outside the data schema are queried by schema.table
                 out.append({"table": self.store.ref(schema, name),
+                            "columns": [{"name": c["name"], "type": str(c["type"])} for c in cols]})
+        meta = self.store.meta_schema
+        if meta and meta != self.store.data_schema:  # the run logs, queried as eyetable.runs
+            for name in RUN_LOGS:
+                cols = insp.get_columns(name, schema=meta)
+                out.append({"table": f"{meta}.{name}",
                             "columns": [{"name": c["name"], "type": str(c["type"])} for c in cols]})
         return out
 
