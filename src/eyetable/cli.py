@@ -270,6 +270,7 @@ def serve(
         cors_origins=origins or DEFAULT_CORS_ORIGINS,
         max_upload_bytes=int(max_mb) * 1024 * 1024 if max_mb else DEFAULT_MAX_UPLOAD_BYTES,
         query_runner=QueryRunner(store, query_url, float(os.environ.get("EYETABLE_QUERY_TIMEOUT_S", "30"))),
+        hook_key=os.environ.get("EYETABLE_HOOK_KEY") or None,
         google=GoogleConnection(
             store,
             os.environ.get("GOOGLE_CLIENT_ID"),

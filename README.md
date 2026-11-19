@@ -929,6 +929,41 @@ ORDER BY started_at DESC
 LIMIT 50;
 ```
 
+### Run webhook
+
+Processes outside eyetable can record their runs in `eyetable.runs`, so they
+show up next to eyetable's own loads in **Show earlier runs** and in queries.
+Each call to `/hook` on the API adds one row:
+
+```
+http://127.0.0.1:8765/hook?key=<EYETABLE_HOOK_KEY>&source=nightly_export&target_table=erp.orders&rows_written=1200&started_at=2026-11-19T06:02:13-08:00
+```
+
+| Parameter | Required | Stored as |
+|---|---|---|
+| `source` | yes | `webhook - <source>` (up to 54 characters given) |
+| `target_table` | yes | as given |
+| `mode` | no | as given; blank is NULL |
+| `status` | no | `succeeded` when left out. Words for success (success, successful, ok, ...) become `succeeded`; words for failure (fail, failure, error, ...) become `failed`; anything else is kept as given (up to 16 characters) |
+| `rows_written` | no | a whole number; 0 when left out |
+| `started_at` | no | an ISO time; NULL when left out |
+| `finished_at` | no | an ISO time; the time of the call when left out |
+| `error` | no | as given; blank is NULL |
+
+* `dataset_key` is `webhook` on these rows. A time without an offset is read
+  as the server's local time.
+* GET with query parameters, or POST with a JSON object or a form. The answer
+  is `201` with the row that was recorded. A bad value gets `400` saying what's
+  wrong, and nothing is recorded.
+* The call needs the webhook key, `EYETABLE_HOOK_KEY` in `.env`, as `key=...`,
+  an `X-Hook-Key` header or a Bearer token. The key can only add runs; it
+  opens nothing else. The API token works too. A header keeps the key out of
+  logs of the URL.
+* Address: `http://127.0.0.1:8765/hook` from this PC, or
+  `<tunnel URL>/hook` (the `API_BASE` the page uses) from elsewhere. The quick
+  tunnel's URL changes when the service restarts. The GitHub Pages site is
+  static, so it can't take webhook calls itself.
+
 ### Public access from the GitHub Pages page
 
 `scripts/run-public.ps1` makes the API on this PC reachable from the published

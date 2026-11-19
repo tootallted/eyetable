@@ -36,7 +36,7 @@ from eyetable.engine import SINGLE_TABLE_TYPES, Engine
 from eyetable.gsheets import SheetError, fetch_workbook, fetch_workbook_signed_in
 from eyetable.identifiers import SOURCE_NAME, normalize_tag, table_name
 from eyetable.query import MAX_LIMIT, QueryError, QueryRunner
-from eyetable import dbconnect, entra, filesets, keys, targets
+from eyetable import dbconnect, entra, filesets, hooks, keys, targets
 from eyetable.loadqueue import LoadQueue
 from eyetable.curl import auth_scheme, clean_statements, components, parse_curl, preview_statements, secret_places, stored_request
 from eyetable.curl import plan as curl_plan
@@ -248,6 +248,7 @@ def create_app(
     google: GoogleConnection | None = None,
     curl_client: Any = None,
     sheet_fetch: Callable[[str, str | None], Any] | None = None,
+    hook_key: str | None = None,
 ) -> FastAPI:
     if not token:
         raise ValueError("an API token is required")
@@ -287,7 +288,7 @@ def create_app(
     @app.middleware("http")
     async def limit_and_harden(request: Request, call_next):
         ip = client_ip(request)
-        if request.url.path.startswith("/api/"):
+        if request.url.path.startswith("/api/") or request.url.path == "/hook":
             wait = auth_failures.blocked(ip)
             if wait and request.method != "OPTIONS":
                 return too_many(wait, "failed sign-in attempts")
@@ -317,7 +318,7 @@ def create_app(
         CORSMiddleware,
         allow_origins=cors_origins if cors_origins is not None else DEFAULT_CORS_ORIGINS,
         allow_methods=["GET", "POST", "PUT", "DELETE"],
-        allow_headers=["Authorization", "Content-Type"],
+        allow_headers=["Authorization", "Content-Type", "X-Hook-Key"],
         allow_private_network=True,  # Chrome asks before a public https page may call http://localhost
     )
 
@@ -840,6 +841,45 @@ def create_app(
         limit = max(1, min(limit, 1000))
         runs = store.search_runs(source, since, until, status, limit + 1)
         return jsonable_encoder({"runs": runs[:limit], "more": len(runs) > limit})
+
+    def hook_caller_allowed(request: Request) -> None:
+        """The webhook takes its own key (EYETABLE_HOOK_KEY), or the API token: as key=..., an
+        X-Hook-Key header or a Bearer token."""
+        given = request.query_params.get("key") or request.headers.get("x-hook-key") or ""
+        header = request.headers.get("authorization", "")
+        if not given and header.lower().startswith("bearer "):
+            given = header[7:].strip()
+        keys = [k for k in (hook_key, token) if k]
+        if not given or not any(secrets.compare_digest(given.encode(), k.encode()) for k in keys):
+            auth_failures.hit(client_ip(request))
+            raise HTTPException(401, "missing or wrong webhook key", headers={"WWW-Authenticate": "Bearer"})
+
+    @app.api_route("/hook", methods=["GET", "POST"], status_code=201, include_in_schema=False)
+    @app.api_route("/api/hook", methods=["GET", "POST"], status_code=201)
+    async def run_hook(request: Request) -> dict[str, Any]:
+        """Record a run of a process outside eyetable in eyetable.runs (see eyetable.hooks): one
+        row per call, from query parameters or a JSON / form body."""
+        hook_caller_allowed(request)
+        values: dict[str, Any] = {k: v for k, v in request.query_params.items() if k != "key"}
+        if request.method == "POST":
+            kind = request.headers.get("content-type", "")
+            try:
+                if "json" in kind:
+                    body = await request.json()
+                    if not isinstance(body, dict):
+                        raise HTTPException(400, "send the run as a JSON object")
+                    values.update(body)
+                elif "form" in kind:
+                    values.update({k: v for k, v in (await request.form()).items() if k != "key"})
+            except ValueError:
+                raise HTTPException(400, "the body isn't valid JSON") from None
+        try:
+            row = hooks.run_from(values)
+        except hooks.HookError as exc:
+            raise HTTPException(400, str(exc)) from None
+        run_id = store.add_run(**row)
+        log.info("webhook recorded run %s for %s", run_id, row["source"])
+        return jsonable_encoder({"recorded": store.get_run(run_id)})
 
     @app.get("/api/queue/{item_id}/log", dependencies=auth)
     def load_log(item_id: str, after: int = 0) -> dict[str, Any]:

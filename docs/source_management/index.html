@@ -230,7 +230,7 @@
   .st.succeeded { background: var(--ok-soft); color: var(--ok); }
   .st.partial { background: var(--warn-soft); color: var(--warn); }
   .st.failed { background: var(--err-soft); color: var(--err); }
-  .st.skipped { background: var(--surface-2); color: var(--muted); }
+  .st.skipped, .st.other { background: var(--surface-2); color: var(--muted); }
   .hide-btn { color: var(--muted); }
   .hidden-note { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; font-size: 13px; padding: 8px 12px; margin-bottom: 8px;
     border-radius: 8px; background: var(--warn-soft); color: var(--warn); }
@@ -4710,14 +4710,17 @@
           return el('th', { class: i === 5 ? 'num' : '', text: h, scope: 'col' });
         }));
         list.appendChild(el('table', { class: 'runs-table' }, [el('thead', null, [head]), el('tbody', null, r.runs.map(function (run) {
-          var took = run.finished_at ? fmtDuration(new Date(run.finished_at) - new Date(run.started_at)) : '\u2014';
+          // a run recorded by the webhook may have no start, no mode and a status of its own
+          var took = run.finished_at && run.started_at ? fmtDuration(new Date(run.finished_at) - new Date(run.started_at)) : '\u2014';
+          var known = { succeeded: 'Succeeded', failed: 'Failed', running: 'Running' };
           return el('tr', null, [
-            el('td', { class: 'nowrap', text: fmtTime(run.started_at) }),
+            el('td', { class: 'nowrap', text: run.started_at ? fmtTime(run.started_at) : '\u2014',
+              title: run.started_at ? '' : 'No start time given; finished ' + fmtTime(run.finished_at) }),
             el('td', { text: run.source }),
-            el('td', { class: 'mono', text: fullTable(run.target_table) }),
-            el('td', { text: run.mode === 'incremental' ? 'incremental' : run.mode === 'append' ? 'append' : 'full' }),
-            el('td', null, [statusPill(run.status, run.status === 'succeeded' ? 'Succeeded' : run.status === 'failed' ? 'Failed' : 'Running')]),
-            el('td', { class: 'num', text: run.status === 'succeeded' ? fmtInt(run.rows_written) : '\u2014' }),
+            el('td', { class: 'mono', text: run.dataset_key === 'webhook' ? run.target_table : fullTable(run.target_table) }),
+            el('td', { text: !run.mode ? '\u2014' : run.mode === 'replace' ? 'full' : run.mode }),
+            el('td', null, [statusPill(known[run.status] ? run.status : 'other', known[run.status] || run.status)]),
+            el('td', { class: 'num', text: run.status === 'failed' || run.status === 'running' ? '\u2014' : fmtInt(run.rows_written) }),
             el('td', { class: 'nowrap', text: took }),
             el('td', { class: 'err', text: run.error || '', title: run.error || '' })
           ]);

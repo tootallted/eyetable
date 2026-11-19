@@ -195,10 +195,10 @@ class Run:
     source: str
     dataset_key: str
     target_table: str
-    mode: str
+    mode: str | None  # None only for a run a webhook recorded without one
     status: str
     rows_written: int
-    started_at: dt.datetime
+    started_at: dt.datetime | None
     finished_at: dt.datetime | None
     error: str | None
 
@@ -238,10 +238,10 @@ class CoreStore:
             sa.Column("source", sa.String(64), nullable=False),
             sa.Column("dataset_key", sa.Text, nullable=False),
             sa.Column("target_table", sa.Text, nullable=False),
-            sa.Column("mode", sa.String(16), nullable=False),
+            sa.Column("mode", sa.String(16)),  # eyetable's loads always say; a webhook's run may not
             sa.Column("status", sa.String(16), nullable=False),
             sa.Column("rows_written", sa.BigInteger, nullable=False, default=0),
-            sa.Column("started_at", UTCDateTime(), nullable=False),
+            sa.Column("started_at", UTCDateTime()),  # likewise
             sa.Column("finished_at", UTCDateTime()),
             sa.Column("error", sa.Text),
         )
@@ -359,6 +359,11 @@ class CoreStore:
             for schema in {self.meta_schema, self.data_schema} - {None}:
                 conn.execute(CreateSchema(schema, if_not_exists=True))
         self.metadata.create_all(self.db)
+        if self.db.dialect.name == "postgresql":  # runs made before webhooks could leave these out
+            with self.db.begin() as conn:
+                for col in ("mode", "started_at"):
+                    conn.execute(sa.text(f"ALTER TABLE {self.qualified(self.ref(self.meta_schema, 'runs'))} "
+                                         f"ALTER COLUMN {col} DROP NOT NULL"))
 
     # -- sources -----------------------------------------------------------
 
@@ -477,6 +482,20 @@ class CoreStore:
             )
             return result.inserted_primary_key[0]
 
+    def add_run(self, source: str, target_table: str, mode: str | None, status: str, rows_written: int,
+                started_at: dt.datetime | None, finished_at: dt.datetime, error: str | None,
+                dataset_key: str = "webhook") -> int:
+        """Record a finished run that happened outside eyetable (see eyetable.hooks)."""
+        with self.db.begin() as conn:
+            result = conn.execute(sa.insert(self.runs).values(
+                source=source, dataset_key=dataset_key, target_table=target_table, mode=mode, status=status,
+                rows_written=rows_written, started_at=started_at, finished_at=finished_at, error=error))
+            return result.inserted_primary_key[0]
+
+    def get_run(self, run_id: int) -> Run:
+        with self.db.connect() as conn:
+            return Run(**conn.execute(sa.select(self.runs).where(self.runs.c.id == run_id)).one()._mapping)
+
     def finish_run(self, run_id: int, status: str, rows_written: int, error: str | None = None) -> None:
         with self.db.begin() as conn:
             conn.execute(
@@ -501,10 +520,11 @@ class CoreStore:
         if text:
             like = f"%{text.strip().lower()}%"
             query = query.where(sa.or_(sa.func.lower(c.source).like(like), sa.func.lower(c.target_table).like(like)))
+        when = sa.func.coalesce(c.started_at, c.finished_at)  # a webhook's run may have no start
         if since is not None:
-            query = query.where(c.started_at >= since)
+            query = query.where(when >= since)
         if until is not None:
-            query = query.where(c.started_at <= until)
+            query = query.where(when <= until)
         if status:
             query = query.where(c.status == status)
         with self.db.connect() as conn:
