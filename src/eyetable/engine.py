@@ -292,6 +292,7 @@ class Engine:
                 self.store.save_source(plan.source, "gsheet", {
                     "spreadsheet_id": book.spreadsheet_id, "published": book.published, "url": book.url,
                     "file_title": book.title, "tab_title": tab.title,
+                    **({"provider": book.provider} if book.provider != "google" else {}),
                 })
             load.results.append(self._load_sheet_tab(book, tab, plan.source, plan.table, tab_mode))
         return load

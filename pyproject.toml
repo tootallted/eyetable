@@ -22,6 +22,7 @@ dependencies = [
     "cryptography>=42",  # encrypts stored secrets (Google authorization, passwords, API keys)
     "pyodbc>=5.1",  # SQL Server / Azure SQL and other ODBC connection strings
     "msal>=1.31",  # Microsoft Entra sign-in (MFA) for database connections
+    "pyjwt[crypto]>=2.8",  # checks Microsoft ID tokens when people sign in to the page (signin.py)
 ]
 
 [project.optional-dependencies]

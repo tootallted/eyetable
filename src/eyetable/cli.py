@@ -246,6 +246,7 @@ def serve(
     from eyetable.api import DEFAULT_CORS_ORIGINS, DEFAULT_MAX_UPLOAD_BYTES, create_app
     from eyetable.google_auth import GoogleConnection
     from eyetable.query import QueryRunner
+    from eyetable.signin import DEFAULT_GOOGLE_CLIENT_ID, SignIn
 
     s = load_settings()
     token = os.environ.get("EYETABLE_API_TOKEN", "")
@@ -271,6 +272,14 @@ def serve(
         max_upload_bytes=int(max_mb) * 1024 * 1024 if max_mb else DEFAULT_MAX_UPLOAD_BYTES,
         query_runner=QueryRunner(store, query_url, float(os.environ.get("EYETABLE_QUERY_TIMEOUT_S", "30"))),
         hook_key=os.environ.get("EYETABLE_HOOK_KEY") or None,
+        signin=SignIn(
+            token,
+            allowed=os.environ.get("EYETABLE_ALLOWED_USERS"),
+            google_client_id=os.environ.get("EYETABLE_GOOGLE_SIGNIN_CLIENT_ID") or DEFAULT_GOOGLE_CLIENT_ID,
+            ms_client_id=os.environ.get("EYETABLE_MS_CLIENT_ID"),
+            ms_tenant_id=os.environ.get("EYETABLE_MS_TENANT_ID"),
+            session_hours=float(os.environ.get("EYETABLE_SESSION_HOURS", "12")),
+        ),
         google=GoogleConnection(
             store,
             os.environ.get("GOOGLE_CLIENT_ID"),

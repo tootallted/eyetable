@@ -964,6 +964,69 @@ http://127.0.0.1:8765/hook?key=<EYETABLE_HOOK_KEY>&source=nightly_export&target_
   tunnel's URL changes when the service restarts. The GitHub Pages site is
   static, so it can't take webhook calls itself.
 
+### Signing in with Google or Microsoft
+
+Instead of typing the API token, people can sign in to the page with a Google
+account or a Microsoft (Entra ID) work account, by their email address:
+
+* **Connection** shows **Sign in with Google** and **Sign in with Microsoft**
+  once the server has an allow list. The API token still works as before.
+* The server checks the sign-in itself. For Google it asks Google about the
+  access token: it must be for eyetable's OAuth client and have a verified
+  email. For Microsoft it checks the ID token's signature against the
+  tenant's published keys, its audience (the app registration), its tenant and
+  its expiry. The person is the token's sign-in name (`preferred_username`).
+* Only emails on `EYETABLE_ALLOWED_USERS` get in. It takes addresses, and
+  `@domain` for everyone at a domain:
+  `EYETABLE_ALLOWED_USERS=ted@example.com,@example.com`. With no list, nobody
+  can sign in this way.
+* A sign-in gets a **session** the page uses in place of the token, for
+  `EYETABLE_SESSION_HOURS` (12 by default). It is signed with a key made from
+  the API token, so it survives restarts. Changing the API token ends every
+  session, and so does taking someone off the list. **Sign out** forgets it in
+  this browser; a copy of it kept elsewhere works until it expires.
+* The header shows who is signed in, and loads they start show their email
+  in the load queue.
+
+**Excel and CSV files in OneDrive or SharePoint** load like Google Sheets:
+paste the file's sharing link into the Google Sheet box. Every tab becomes its
+own source, and a CSV file is one tab. The file is read as the person signed in
+with Microsoft (**Microsoft files** in the header, Microsoft Graph,
+`Files.Read.All`), so it opens exactly as it would for them. Nothing about the
+sign-in is kept. Reload needs that sign-in too. Scheduled runs and group runs
+started without it can't read these files, and say so.
+
+**Setting up Microsoft sign-in** (once, in the Azure portal, by you or your
+Entra admin):
+
+1. **Microsoft Entra ID → App registrations → New registration.** Name it
+   `eyetable`, choose *Accounts in this organizational directory only*.
+2. Under *Redirect URI*, choose **Single-page application (SPA)** and enter
+   `https://tootallted.github.io/eyetable/source_management/msal-redirect.html`.
+   To sign in on a page served by the API itself, also add
+   `http://localhost:8765/source_management/msal-redirect.html` under
+   **Authentication → Single-page application**.
+3. **API permissions → Add a permission → Microsoft Graph → Delegated:**
+   `openid`, `profile`, `email`, `User.Read` and `Files.Read.All`. If your
+   organization doesn't let people consent to apps themselves, use **Grant
+   admin consent**.
+4. From **Overview**, copy the **Application (client) ID** and **Directory
+   (tenant) ID** into `.env`, then restart the service:
+
+   ```
+   EYETABLE_MS_CLIENT_ID=<Application (client) ID>
+   EYETABLE_MS_TENANT_ID=<Directory (tenant) ID>
+   EYETABLE_ALLOWED_USERS=you@yourcompany.com
+   ```
+
+Neither ID is a secret, and the registration needs no client secret.
+
+API: `GET /api/signin` (what the page may offer), `POST /api/session` with
+`{"provider": "google" | "microsoft", "token": "..."}` (a Google access token
+or a Microsoft ID token), and `GET /api/session` (who you are).
+`/api/gsheets`, `/api/gsheets/inspect`, reloads, the queue and group runs take
+`microsoft_token` next to `google_token`.
+
 ### Public access from the GitHub Pages page
 
 `scripts/run-public.ps1` makes the API on this PC reachable from the published

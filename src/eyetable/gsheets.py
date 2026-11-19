@@ -70,6 +70,7 @@ class Workbook:
     published: bool
     url: str
     tabs: list[Tab] = field(default_factory=list)
+    provider: str = "google"  # or "microsoft": an Excel / CSV file in OneDrive or SharePoint (msfiles)
 
 
 def parse_sheet_url(url: str) -> tuple[str, bool]:
@@ -154,13 +155,13 @@ def tab_from_rows(title: str, index: int, hidden: bool, rows: list[list[Any]]) -
     return Tab(title, index, headers, records, hidden)
 
 
-def parse_workbook(content: bytes) -> list[Tab]:
+def parse_workbook(content: bytes, what: str = "Google's export") -> list[Tab]:
     import openpyxl
 
     try:
         wb = openpyxl.load_workbook(io.BytesIO(content), read_only=True, data_only=True)
     except Exception as exc:
-        raise SheetError(f"Google's export could not be read as a spreadsheet ({type(exc).__name__})") from None
+        raise SheetError(f"{what} could not be read as a spreadsheet ({type(exc).__name__})") from None
     try:
         return [
             tab_from_rows(ws.title, index, ws.sheet_state != "visible", ws.iter_rows(values_only=True))

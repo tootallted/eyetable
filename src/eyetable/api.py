@@ -42,6 +42,8 @@ from eyetable.curl import auth_scheme, clean_statements, components, parse_curl,
 from eyetable.curl import plan as curl_plan
 from eyetable.google_auth import GoogleAuthError, GoogleConnection
 from eyetable.groups import GroupRunner
+from eyetable import msfiles
+from eyetable.signin import SignIn, SignInError
 from eyetable.ratelimit import SlidingWindow, client_ip
 from eyetable.schedule import ScheduleError, describe, next_runs, normalize
 from eyetable.statements import count as statement_count
@@ -177,6 +179,7 @@ class KeyIn(BaseModel):
 class ReloadIn(BaseModel):
     # For a Google Sheet source whose sheet is private (see SheetIn.google_token).
     google_token: str | None = Field(default=None, max_length=4096)
+    microsoft_token: str | None = Field(default=None, max_length=16384)  # an Excel / CSV file in OneDrive or SharePoint
     incremental: bool = False  # only the rows past each table's incremental column (incremental.py)
     table: str | None = Field(default=None, max_length=128)  # just this one of a database source's tables
 
@@ -186,6 +189,7 @@ class QueueIn(BaseModel):
     table: str | None = Field(default=None, max_length=128)  # one of a database source's tables
     incremental: bool = False
     google_token: str | None = Field(default=None, max_length=4096)  # a private Google Sheet
+    microsoft_token: str | None = Field(default=None, max_length=16384)  # a file in OneDrive or SharePoint
 
 
 class HiddenIn(BaseModel):
@@ -221,6 +225,21 @@ class SheetIn(BaseModel):
     # A short-lived Google access token from the page's "Sign in with Google", to read
     # private sheets as that person. Used for this request only; never stored or logged.
     google_token: str | None = Field(default=None, max_length=4096)
+    # Likewise a Microsoft Graph token from "Sign in with Microsoft", for a OneDrive / SharePoint file.
+    microsoft_token: str | None = Field(default=None, max_length=16384)
+
+
+class SessionIn(BaseModel):
+    provider: str = Field(pattern="^(google|microsoft)$")
+    token: str = Field(min_length=10, max_length=16384)  # Google: an access token; Microsoft: an ID token
+
+
+def sign_ins(body: Any) -> Any:
+    """The caller's sign-ins for reading sheets and files: the Google token alone, or both."""
+    if body is None:
+        return None
+    google, microsoft = getattr(body, "google_token", None), getattr(body, "microsoft_token", None)
+    return {"google": google, "microsoft": microsoft} if microsoft else google
 
 
 class QueryIn(BaseModel):
@@ -249,14 +268,21 @@ def create_app(
     curl_client: Any = None,
     sheet_fetch: Callable[[str, str | None], Any] | None = None,
     hook_key: str | None = None,
+    signin: SignIn | None = None,
 ) -> FastAPI:
     if not token:
         raise ValueError("an API token is required")
     store = engine.store
     queries = query_runner or QueryRunner(store)
     google = google or GoogleConnection(store, None, None, None)
+    signin = signin or SignIn(token)  # with no allow list, only the API token gets in
     if sheet_fetch is None:
-        def sheet_fetch(url: str, google_token: str | None = None):
+        def sheet_fetch(url: str, google_token: Any = None):
+            # `google_token`: the caller's Google token, or {"google": ..., "microsoft": ...} (sign_ins)
+            tokens = google_token if isinstance(google_token, dict) else {"google": google_token}
+            if msfiles.is_microsoft_url(url):
+                return msfiles.fetch_workbook(url, tokens.get("microsoft"), max_bytes=max_upload_bytes)
+            google_token = tokens.get("google")
             # Whose eyes read the sheet: the person using the page (their token), else the
             # Google account connected for scheduled runs, else nobody (link-shared only).
             if not google_token and google.is_connected():
@@ -327,9 +353,44 @@ def create_app(
     def authorized(
         request: Request, credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer)]
     ) -> None:
-        if credentials is None or not secrets.compare_digest(credentials.credentials.encode(), token.encode()):
+        given = credentials.credentials if credentials else ""
+        if given and secrets.compare_digest(given.encode(), token.encode()):
+            request.state.user = None  # the API token: no one in particular
+            return
+        person = signin.check_session(given) if given else None
+        if person is None:
             auth_failures.hit(client_ip(request))
-            raise HTTPException(401, "missing or wrong API token", headers={"WWW-Authenticate": "Bearer"})
+            raise HTTPException(401, "missing or wrong API token, or your sign-in has ended",
+                                headers={"WWW-Authenticate": "Bearer"})
+        request.state.user = person.email
+
+    def user_of(request: Request) -> str | None:
+        return getattr(request.state, "user", None)
+
+    @app.get("/api/signin")
+    def signin_options() -> dict[str, Any]:
+        """Whether the page may offer signing in with Google or Microsoft (nothing here is secret)."""
+        return signin.options()
+
+    @app.post("/api/session")
+    def start_session(body: SessionIn, request: Request) -> dict[str, Any]:
+        """Sign in with a Google access token or a Microsoft ID token; someone on the allow list gets a
+        session token to use in place of the API token."""
+        try:
+            return signin.sign_in(body.provider, body.token)
+        except SignInError as exc:
+            if exc.status in (401, 403):
+                auth_failures.hit(client_ip(request))
+            raise HTTPException(exc.status, str(exc)) from None
+
+    @app.get("/api/session")
+    def who_am_i(request: Request,
+                 credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer)]) -> dict[str, Any]:
+        """Who the caller is: a signed-in person, or the API token."""
+        authorized(request, credentials)
+        person = signin.check_session(credentials.credentials)
+        return {"email": person.email if person else None, "provider": person.provider if person else "token",
+                "name": person.name if person else None}
 
     auth = [Depends(authorized)]
 
@@ -392,6 +453,7 @@ def create_app(
                 key=table in store.keyed_tables(),
                 history=store.has_history(table),
                 incremental=store.get_increment(table),
+                provider=src.config.get("provider", "google") if src.type == "gsheet" else None,
                 rows=store.count_rows(table),
                 columns=len(datasets[0].columns) if datasets else None,
                 last_upload=uploads[0] if uploads else None,
@@ -418,7 +480,8 @@ def create_app(
         if src.type == "dbtable" and c.get("label"):
             return {"key": "db:" + c["label"].lower(), "label": c["label"]}
         if src.type == "gsheet" and c.get("spreadsheet_id"):
-            return {"key": "sheet:" + c["spreadsheet_id"], "label": c.get("file_title") or "Google Sheet"}
+            return {"key": "sheet:" + c["spreadsheet_id"],
+                    "label": c.get("file_title") or ("Excel file" if c.get("provider") == "microsoft" else "Google Sheet")}
         if src.type == "curl":
             try:
                 host = urllib.parse.urlsplit(stored_request(c)["url"]).hostname
@@ -474,7 +537,7 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from None
         try:
-            run_id = groups.run_tag(tag, google_token=body.google_token if body else None,
+            run_id = groups.run_tag(tag, google_token=sign_ins(body),
                                     incremental=bool(body and body.incremental))
         except LookupError as exc:
             raise HTTPException(404, str(exc).strip("'\"")) from None
@@ -522,7 +585,8 @@ def create_app(
                 secret["scheme"] = scheme.strip() if scheme else None
             out.update(secrets=secrets, certificate=identity, request=components(c))
         elif src.type == "gsheet":
-            out.update(url=c.get("url"), tab=c.get("tab_title"), file=c.get("file_title"))
+            out.update(url=c.get("url"), tab=c.get("tab_title"), file=c.get("file_title"),
+                       provider=c.get("provider", "google"))
         elif src.type == "file":
             uploads = store.list_uploads(src.name, limit=1)
             out.update(folder=c.get("folder"), pattern=c.get("pattern"),
@@ -691,7 +755,7 @@ def create_app(
     def inspect_gsheet(body: SheetIn) -> dict[str, Any]:
         """The tabs of a Google Sheet and the source each would become. Changes nothing."""
         try:
-            load = engine.plan_gsheet(sheet_fetch(body.url, body.google_token))
+            load = engine.plan_gsheet(sheet_fetch(body.url, sign_ins(body)))
         except SheetError as exc:
             raise sheet_error(exc) from None
         return jsonable_encoder(load)
@@ -766,7 +830,7 @@ def create_app(
         """Start reloading every source in the group; poll /api/group-runs/{run_id} for progress."""
         get_group(group_id)
         try:
-            run_id = groups.run(group_id, "manual", google_token=body.google_token if body else None,
+            run_id = groups.run(group_id, "manual", google_token=sign_ins(body),
                                 incremental=bool(body and body.incremental))
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from None
@@ -818,11 +882,12 @@ def create_app(
 
     # -- the load queue (loadqueue.py): reloads in the background, with progress ----
     @app.post("/api/queue", dependencies=auth, status_code=202)
-    def queue_load(body: QueueIn) -> dict[str, Any]:
+    def queue_load(body: QueueIn, request: Request) -> dict[str, Any]:
         """Queue a full or incremental reload of a source, or of one of its tables."""
         get_source(body.source)
         try:
-            item, added = load_queue.add(body.source, body.table, body.incremental, body.google_token)
+            item, added = load_queue.add(body.source, body.table, body.incremental, sign_ins(body),
+                                         by=user_of(request))
         except ValueError as exc:  # includes IncrementalProblem
             raise HTTPException(400, str(exc).strip("'\"")) from None
         return jsonable_encoder({"item": item, "added": added})
@@ -1197,7 +1262,7 @@ def create_app(
     def reload(name: str, body: ReloadIn | None = None) -> dict[str, Any]:
         """Load a source's data again: replay stored files, re-fetch a sheet tab, or re-pull."""
         get_source(name)
-        token_ = body.google_token if body else None
+        token_ = sign_ins(body)
         try:
             results = engine.reload_source(name, sheet_fetch=lambda url: sheet_fetch(url, token_),
                                            incremental=bool(body and body.incremental), table=body.table if body else None)
@@ -1236,7 +1301,7 @@ def create_app(
         if body.mode not in ("replace", "append"):
             raise HTTPException(400, "mode must be replace or append")
         try:
-            load = engine.ingest_gsheet(body.url, body.mode, fetch=lambda url: sheet_fetch(url, body.google_token))
+            load = engine.ingest_gsheet(body.url, body.mode, fetch=lambda url: sheet_fetch(url, sign_ins(body)))
         except SheetError as exc:
             raise sheet_error(exc) from None
         return jsonable_encoder(load)
@@ -1281,6 +1346,11 @@ def create_app(
         @app.get("/source_management/", include_in_schema=False)
         def source_management() -> FileResponse:
             return FileResponse(page)
+
+        @app.get("/source_management/msal-redirect.html", include_in_schema=False)
+        def msal_redirect() -> FileResponse:
+            """Where Microsoft's sign-in popup returns (the page that opened it reads the result)."""
+            return FileResponse(page.parent / "msal-redirect.html")
 
     app.state.group_runner = groups
     return app

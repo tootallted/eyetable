@@ -79,6 +79,11 @@
   .google-top { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); min-width: 0; }
   .google-top .who { color: var(--text); font-weight: 500; max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .google-top .g { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
+  .session-top { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); min-width: 0; }
+  .session-top .who { color: var(--text); font-weight: 500; max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .signin { display: grid; gap: 8px; padding-bottom: 12px; margin-bottom: 4px; border-bottom: 1px solid var(--border); }
+  .signin .actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .btn.microsoft svg, .btn.google svg { flex: none; }
   #top-msg:empty { display: none; }
 
   main { padding: 24px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 20px; }
@@ -546,7 +551,9 @@
 <header class="top">
   <div class="brand"><b>eyetable</b><span>Source management</span></div>
   <span class="pill" id="status"><span class="dot"></span><span id="status-text">Not connected</span></span>
+  <span class="session-top" id="session-top" aria-live="polite"></span>
   <span class="google-top" id="google-top" aria-live="polite"></span>
+  <span class="google-top" id="ms-top" aria-live="polite"></span>
   <button class="btn small" id="toggle-settings" type="button">Connection</button>
 </header>
 
@@ -557,6 +564,7 @@
     <div class="card-body">
       <p class="hint">This page runs in your browser and talks to the eyetable API you run with
         <code>eyetable serve</code>. Your data goes from this page straight to that API, nowhere else.</p>
+      <div class="signin" id="signin-box" hidden></div>
       <div class="row">
         <label class="field">API URL
           <input type="url" id="api-base" placeholder="http://localhost:8765" autocomplete="off" spellcheck="false">
@@ -631,16 +639,17 @@
       </div>
       <div id="load-result" role="status"></div>
 
-      <div class="or"><span>or a Google Sheet</span></div>
+      <div class="or"><span>or a Google Sheet, or an Excel or CSV file in OneDrive or SharePoint</span></div>
       <div class="gs">
-        <label class="field" for="gs-url">Google Sheet link</label>
+        <label class="field" for="gs-url">Google Sheet, OneDrive or SharePoint link</label>
         <div class="gs-row">
           <input type="url" id="gs-url" placeholder="https://docs.google.com/spreadsheets/d/…" autocomplete="off" spellcheck="false">
           <button class="btn" id="gs-check" type="button" disabled>Check tabs</button>
         </div>
         <p class="hint">Every tab becomes its own source, named <code>file name_tab name</code>. Paste or drop the
-          same link again later to refresh its tabs.</p>
+          same link again later to refresh its tabs. OneDrive and SharePoint files are read as you, signed in with Microsoft.</p>
         <div class="gs-google" id="gs-google"></div>
+        <div class="gs-google" id="gs-microsoft"></div>
         <div id="gs-plan" hidden style="display:grid; gap:12px">
           <div class="gs-title" id="gs-title"></div>
           <div class="table-wrap gs-tabs" id="gs-tabs"></div>
@@ -1176,9 +1185,10 @@
       $('status').title = text;
     }
 
-    function connect() {
+    function connect(given) {
       state.base = $('api-base').value.trim() || defaultBase();
-      state.token = $('api-token').value.trim();
+      state.token = typeof given === 'string' ? given : $('api-token').value.trim();
+      if (typeof given !== 'string') forgetSession();  // the API token typed in, not a sign-in
       var remember = $('remember').checked;
       write('localStorage', KEY_BASE, remember ? state.base : '');
       write('localStorage', KEY_TOKEN, remember ? state.token : '');
@@ -1282,6 +1292,10 @@
     function connectionHints(last) {
       var hints = [];
       var base = last.base || state.base;
+      if (last.error && last.error.status === 401 && isSession(state.token)) {
+        hints.push('Your sign-in has ended (or you were taken off the list of people allowed in): sign in again under Connection.');
+        return hints;
+      }
       if (last.error && last.error.status === 401) {
         hints.push('Enter the token again under Connection: it is EYETABLE_API_TOKEN in the .env file on the PC running eyetable.');
         return hints;
@@ -3819,9 +3833,232 @@
       renderGoogle();
     }
 
+    // -- Signing in to eyetable with Google or Microsoft --------------------------
+    // With an allow list on the server (EYETABLE_ALLOWED_USERS), the page can sign you in
+    // with Google or Microsoft instead of the API token: the server checks the sign-in and
+    // answers with a session, which this page then sends in place of the token. The
+    // session is kept where the token would be (this tab, or this browser with Remember).
+    var KEY_SESSION = 'eyetable.signedIn';  // who the session is for, to show it; not a credential
+    var signinOpts = null;  // GET /api/signin: what the server offers
+
+    function isSession(token) { return /^ets1\./.test(token || ''); }
+
+    function sessionInfo() {
+      try { return JSON.parse(read('sessionStorage', KEY_SESSION) || read('localStorage', KEY_SESSION) || 'null'); } catch (e) { return null; }
+    }
+
+    function apiRoot() { return ($('api-base').value.trim() || state.base || defaultBase()).replace(/\/+$/, ''); }
+
+    function loadSigninOptions() {
+      return fetch(apiRoot() + '/api/signin', { cache: 'no-store' })
+        .then(function (r) { return r.ok ? r.json() : null; }, function () { return null; })
+        .then(function (o) {
+          signinOpts = o;
+          if (o && o.microsoft) loadMsal().catch(function () { renderSignin(); renderMicrosoft(); });
+          renderSignin();
+          renderMicrosoft();
+          return o;
+        });
+    }
+
+    function renderSignin() {
+      var box = clear($('signin-box'));
+      var o = signinOpts;
+      box.hidden = !(o && o.enabled && (o.google || o.microsoft));
+      if (box.hidden) return;
+      box.appendChild(el('div', { class: 'hint', text: 'Sign in with your account, or use the API token below.' }));
+      var row = el('div', { class: 'actions' });
+      if (o.google) row.appendChild(googleButton('Sign in with Google', function (t) { startSession('google', t); }, 'signin-msg'));
+      if (o.microsoft) row.appendChild(microsoftButton('Sign in with Microsoft', null, 'signin-msg', true));
+      box.appendChild(row);
+      box.appendChild(el('div', { id: 'signin-msg', role: 'status' }));
+    }
+
+    function startSession(provider, token) {
+      clear($('signin-msg')).appendChild(el('span', { class: 'hint', text: 'Checking your sign-in…' }));
+      return fetch(apiRoot() + '/api/session', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                                 body: JSON.stringify({ provider: provider, token: token }) })
+        .then(function (res) {
+          return res.json().catch(function () { return null; }).then(function (body) {
+            if (!res.ok) throw new Error((body && body.detail) || res.status + ' ' + res.statusText);
+            return body;
+          });
+        })
+        .then(function (s) {
+          clear($('signin-msg'));
+          var who = JSON.stringify({ email: s.email, provider: s.provider, expires: s.expires });
+          var remember = $('remember').checked;
+          write('sessionStorage', KEY_SESSION, who);
+          write('localStorage', KEY_SESSION, remember ? who : '');
+          $('api-token').value = '';
+          connect(s.session);
+          renderSession();
+        }, function (err) {
+          clear($('signin-msg')).appendChild(banner('err', 'Not signed in: ' + err.message));
+        });
+    }
+
+    function forgetSession() {
+      write('sessionStorage', KEY_SESSION, '');
+      write('localStorage', KEY_SESSION, '');
+      renderSession();
+    }
+
+    function signOutSession() {
+      forgetSession();
+      state.token = '';
+      write('sessionStorage', KEY_TOKEN, '');
+      write('localStorage', KEY_TOKEN, '');
+      state.connected = false;
+      setStatus('err', 'Signed out');
+      $('settings').hidden = false;
+      $('settings-msg').textContent = 'Signed out. Sign in again, or enter the API token.';
+    }
+
+    // Who is signed in, in the header.
+    function renderSession() {
+      var top = clear($('session-top'));
+      var info = sessionInfo();
+      if (!info || !isSession(read('sessionStorage', KEY_TOKEN) || read('localStorage', KEY_TOKEN) || state.token)) return;
+      top.appendChild(el('span', { class: 'who', text: info.email,
+        title: 'Signed in to eyetable with ' + (info.provider === 'microsoft' ? 'Microsoft' : 'Google') +
+          (info.expires ? ' until ' + fmtTime(new Date(info.expires * 1000).toISOString()) : '') }));
+      var out = el('button', { type: 'button', class: 'link', text: 'Sign out' });
+      out.addEventListener('click', signOutSession);
+      top.appendChild(out);
+    }
+
+    // -- Sign in with Microsoft (Entra ID): eyetable itself, and OneDrive / SharePoint files ----
+    // Microsoft's own sign-in library (MSAL) runs the popup. Its cache stays in memory, so
+    // nothing of the sign-in outlives this page; reading files uses a short-lived Microsoft
+    // Graph token (Files.Read.All) sent with that load only.
+    var MSAL_SRC = 'https://cdn.jsdelivr.net/npm/@azure/msal-browser@3.30.0/lib/msal-browser.min.js';
+    var MSAL_SRI = 'sha384-YnOjsoOxSYo65h1BXWnSq24bFbqW8HfzMWSEQxYEMRmjW9Vl1J3HZI3iZxqNYvIi';
+    var GRAPH_FILES = 'https://graph.microsoft.com/Files.Read.All';
+    var MS_MARK = '<svg width="16" height="16" viewBox="0 0 21 21" aria-hidden="true"><path fill="#f25022" d="M1 1h9v9H1z"/><path fill="#7fba00" d="M11 1h9v9h-9z"/><path fill="#00a4ef" d="M1 11h9v9H1z"/><path fill="#ffb900" d="M11 11h9v9h-9z"/></svg>';
+    var msauth = { app: null, loading: null, failed: false, account: null, token: '', expires: 0, timer: null };
+
+    function microsoftToken() { return msauth.token && Date.now() < msauth.expires ? msauth.token : ''; }
+
+    function loadMsal() {
+      if (msauth.loading) return msauth.loading;
+      var o = signinOpts && signinOpts.microsoft;
+      if (!o) return Promise.reject(new Error('Microsoft sign-in is not set up on the eyetable server yet.'));
+      msauth.loading = new Promise(function (resolve, reject) {
+        if (window.msal) { resolve(); return; }
+        var script = el('script', { src: MSAL_SRC, integrity: MSAL_SRI, crossorigin: 'anonymous' });
+        script.onload = resolve;
+        script.onerror = function () { reject(new Error("Microsoft sign-in couldn't load (blocked by an extension, or offline?)")); };
+        document.head.appendChild(script);
+      }).then(function () {
+        msauth.app = new window.msal.PublicClientApplication({
+          auth: { clientId: o.client_id, authority: 'https://login.microsoftonline.com/' + o.tenant_id,
+                  redirectUri: location.origin + location.pathname.replace(/[^/]*$/, '') + 'msal-redirect.html' },
+          cache: { cacheLocation: 'memoryStorage' }
+        });
+        return msauth.app.initialize();
+      }).then(function () {
+        renderSignin();
+        renderMicrosoft();
+        return msauth.app;
+      }, function (err) {
+        msauth.failed = true;
+        msauth.loading = null;
+        throw err;
+      });
+      return msauth.loading;
+    }
+
+    function msError(err) {
+      var code = err && (err.errorCode || '');
+      if (code === 'user_cancelled') return new Error('Microsoft sign-in was closed before it finished.');
+      if (code === 'popup_window_error' || code === 'empty_window_error') return new Error('Your browser blocked the Microsoft sign-in popup; allow popups for this page.');
+      return new Error('Microsoft sign-in: ' + ((err && (err.errorMessage || err.message)) || 'it failed'));
+    }
+
+    function keepGraphToken(r) {
+      msauth.account = r.account || msauth.account;
+      msauth.token = r.accessToken;
+      msauth.expires = (r.expiresOn ? new Date(r.expiresOn).getTime() : Date.now() + 3600000) - 60000;
+      clearTimeout(msauth.timer);
+      // shortly before it lapses, get a fresh one quietly (no popup); if that can't be done, show "signed out"
+      msauth.timer = setTimeout(function () {
+        msauth.app.acquireTokenSilent({ scopes: [GRAPH_FILES], account: msauth.account })
+          .then(keepGraphToken, function () { msauth.token = ''; renderMicrosoft(); });
+      }, Math.max(msauth.expires - Date.now() - 120000, 5000));
+      renderMicrosoft();
+      return msauth.token;
+    }
+
+    // From a click, or the browser blocks the popup. `forPage`: sign in to eyetable itself.
+    function microsoftButton(label, then, messageArea, forPage) {
+      var b = el('button', { type: 'button', class: 'btn small microsoft' });
+      b.innerHTML = MS_MARK;
+      b.appendChild(document.createTextNode(label));
+      if (!msauth.app) {
+        b.disabled = true;
+        b.title = msauth.failed ? "Microsoft sign-in couldn't load (blocked by an extension, or offline?)"
+          : signinOpts && signinOpts.microsoft ? 'Loading Microsoft sign-in…' : 'Microsoft sign-in is not set up on the eyetable server yet';
+      }
+      b.addEventListener('click', function () {
+        var area = $(messageArea || 'top-msg');
+        if (area) clear(area);
+        var signing = forPage
+          ? msauth.app.loginPopup({ scopes: ['openid', 'profile', 'email'], prompt: 'select_account' }).then(function (r) {
+              msauth.account = r.account;
+              startSession('microsoft', r.idToken);
+              // files too, if that's already allowed for this account; otherwise its own button asks
+              msauth.app.acquireTokenSilent({ scopes: [GRAPH_FILES], account: r.account }).then(keepGraphToken, function () {});
+            })
+          : msauth.app.acquireTokenPopup({ scopes: [GRAPH_FILES], account: msauth.account || undefined,
+                                           prompt: msauth.account ? undefined : 'select_account' }).then(keepGraphToken);
+        signing.then(function (token) { if (then) then(token); }, function (err) {
+          if (area) area.appendChild(banner('err', msError(err).message));
+        });
+      });
+      return b;
+    }
+
+    function signOutMicrosoft() {
+      msauth.token = '';
+      msauth.expires = 0;
+      msauth.account = null;
+      clearTimeout(msauth.timer);
+      if (msauth.app && msauth.app.clearCache) msauth.app.clearCache();
+      renderMicrosoft();
+    }
+
+    // Reading OneDrive / SharePoint files: in the header and the sheet box.
+    function renderMicrosoft() {
+      var top = clear($('ms-top')), box = clear($('gs-microsoft'));
+      if (!(signinOpts && signinOpts.microsoft)) return;
+      if (microsoftToken()) {
+        var who = el('span', { class: 'g', title: 'Signed in with Microsoft: OneDrive and SharePoint files you can open will load' });
+        who.innerHTML = MS_MARK;
+        who.appendChild(el('span', { class: 'who', text: (msauth.account && msauth.account.username) || 'Microsoft account' }));
+        var out = el('button', { type: 'button', class: 'link', text: 'Sign out' });
+        out.addEventListener('click', signOutMicrosoft);
+        top.appendChild(who);
+        top.appendChild(out);
+        box.appendChild(document.createTextNode('Reading OneDrive and SharePoint files as '));
+        box.appendChild(el('span', { class: 'who', text: (msauth.account && msauth.account.username) || 'your Microsoft account' }));
+        return;
+      }
+      var b = microsoftButton('Microsoft files', null, 'top-msg');
+      if (msauth.app) b.title = 'Read Excel and CSV files in OneDrive or SharePoint with your Microsoft account';
+      top.appendChild(b);
+      box.appendChild(document.createTextNode('OneDrive or SharePoint file?'));
+      box.appendChild(microsoftButton('Sign in with Microsoft', null, 'gs-result'));
+    }
+
     // A sheet error, with a way past it when signing in with Google could help.
     function sheetErrorBanner(prefix, err, retry, area) {
       var b = banner('err', prefix + err.message);
+      if (err.status === 403 && /Microsoft|OneDrive|SharePoint/.test(err.message)) {
+        b.appendChild(el('div', null, [microsoftButton(microsoftToken() ? 'Sign in with Microsoft again' : 'Sign in with Microsoft and try again',
+          retry, area || 'gs-result')]));
+        return b;
+      }
       if (err.status === 403 && (!GOOGLE_CLIENT_ID || gauth.client)) {
         b.appendChild(el('div', null, [googleButton(googleToken() ? 'Sign in with another Google account' : 'Sign in with Google and try again', retry, area || 'gs-result')]));
       }
@@ -3943,6 +4180,7 @@
       var hasSheets = (g.sources || g.members).some(function (m) { return state.sources.some(function (s) { return s.name === m && s.type === 'gsheet'; }); });
       var payload = {};
       if (hasSheets && googleToken()) payload.google_token = googleToken();
+      if (hasSheets && microsoftToken()) payload.microsoft_token = microsoftToken();
       if (incremental) payload.incremental = true;  // incremental where set up, full for the rest
       g.lastIncremental = !!incremental;
       var body = JSON.stringify(payload);
@@ -4278,7 +4516,8 @@
       if (s.type === 'curl' && s.statement_count !== undefined) return 'Reload ' + s.name + '? All ' + plural(s.statement_count, 'statement') + ' are sent again (every page) and the table is replaced.';
       if (s.type === 'curl') return 'Reload ' + s.name + '? The API is called again (every page) and the table is replaced.';
       if (s.type === 'dbtable') return 'Reload ' + s.name + '? Its table or view is read again from the database and replaces what is here.';
-      if (s.type === 'gsheet') return 'Reload ' + s.name + ' from Google Sheets? Its table is replaced with the tab’s current contents.';
+      if (s.type === 'gsheet') return 'Reload ' + s.name + ' from ' + (s.provider === 'microsoft' ? 'its Excel file' : 'Google Sheets') +
+        '? Its table is replaced with the tab’s current contents.';
       return 'Reload ' + s.name + '? Every table it feeds is pulled again from the source and replaced.';
     }
 
@@ -4353,7 +4592,7 @@
             ' on and replace just their rows'
           : 'Add only the rows past the latest ' + tables.map(function (x) { return x.incremental; }).filter(function (c, i, all) { return all.indexOf(c) === i; }).join(' / ') + ' already loaded';
       } else {
-        b.title = s.type === 'file' ? 'Load the stored files again' : s.type === 'gsheet' ? 'Fetch the tab from Google Sheets again'
+        b.title = s.type === 'file' ? 'Load the stored files again' : s.type === 'gsheet' ? (s.provider === 'microsoft' ? 'Fetch the tab from the Excel file again (signed in with Microsoft)' : 'Fetch the tab from Google Sheets again')
           : target ? 'Load this table again in full' : 'Pull the data from the source again';
       }
       b.innerHTML = RELOAD_ICON;
@@ -4377,6 +4616,7 @@
       var msg = clear($('sources-msg'));
       var payload = { source: s.name };
       if (s.type === 'gsheet' && googleToken()) payload.google_token = googleToken();
+      if (s.type === 'gsheet' && microsoftToken()) payload.microsoft_token = microsoftToken();
       if (opts.incremental) payload.incremental = true;
       if (opts.table && s.tables && s.tables.length > 1) payload.table = opts.table;
       var what = (opts.incremental ? 'Incremental load of ' : 'Reload of ') + (opts.label ? opts.label + ' (' + s.name + ')' : s.name);
@@ -5144,6 +5384,7 @@
 
     // -- Google Sheets -----------------------------------------------------
     var SHEET_LINK = /docs\.google\.com\/spreadsheets\//;
+    var MS_LINK = /^https:\/\/([a-z0-9-]+\.)*(sharepoint\.com|sharepoint\.us|onedrive\.live\.com|1drv\.ms)(\/|$)/i;
     var sheet = { plan: null, url: '', busy: false };
 
     function loadableTabs() { return sheet.plan ? sheet.plan.tabs.filter(function (t) { return !t.problem; }) : []; }
@@ -5165,8 +5406,15 @@
       var url = $('gs-url').value.trim();
       clear($('gs-result'));
       if (!url || sheet.busy) return;
-      if (!SHEET_LINK.test(url) && !/^[A-Za-z0-9_-]{25,}$/.test(url)) {
-        $('gs-result').appendChild(banner('err', "That isn't a Google Sheets link. It should start with https://docs.google.com/spreadsheets/"));
+      if (!SHEET_LINK.test(url) && !MS_LINK.test(url) && !/^[A-Za-z0-9_-]{25,}$/.test(url)) {
+        $('gs-result').appendChild(banner('err', "That isn't a Google Sheets, OneDrive or SharePoint link. It should start with " +
+          'https://docs.google.com/spreadsheets/, or be a OneDrive / SharePoint sharing link to an Excel or CSV file.'));
+        return;
+      }
+      if (MS_LINK.test(url) && !microsoftToken()) {
+        var need = banner('warn', 'This file is in OneDrive or SharePoint, so it is read as you: sign in with Microsoft first.');
+        need.appendChild(el('div', null, [microsoftButton('Sign in with Microsoft and check it', checkSheet, 'gs-result')]));
+        $('gs-result').appendChild(need);
         return;
       }
       if (!state.connected) { $('gs-result').appendChild(banner('warn', 'Connect to the API first.')); return; }
@@ -5176,7 +5424,7 @@
       sheet.busy = true;
       renderSheetControls();
       $('gs-check').textContent = 'Checking…';
-      sheetRequest('/api/gsheets/inspect', { url: url, google_token: googleToken() || null }).then(function (plan) {
+      sheetRequest('/api/gsheets/inspect', { url: url, google_token: googleToken() || null, microsoft_token: microsoftToken() || null }).then(function (plan) {
         sheet.plan = plan;
         renderSheetPlan();
       }, function (err) {
@@ -5222,7 +5470,8 @@
       renderSheetControls();
       $('gs-load').textContent = 'Loading…';
       clear($('gs-result'));
-      sheetRequest('/api/gsheets', { url: sheet.url, mode: mode, google_token: googleToken() || null }).then(function (load) {
+      sheetRequest('/api/gsheets', { url: sheet.url, mode: mode, google_token: googleToken() || null,
+        microsoft_token: microsoftToken() || null }).then(function (load) {
         var loaded = [], skipped = [], failed = [];
         load.results.forEach(function (r, i) {
           var tab = load.tabs[i];
@@ -5327,14 +5576,15 @@
     document.querySelectorAll('input[name=mode]').forEach(function (r) { r.addEventListener('change', renderTarget); });
     $('load').addEventListener('click', load);
     $('refresh').addEventListener('click', function () { refresh().catch(function () {}); });
-    $('connect').addEventListener('click', connect);
+    $('connect').addEventListener('click', function () { connect(); });
     $('api-token').addEventListener('keydown', function (e) { if (e.key === 'Enter') connect(); });
+    $('api-base').addEventListener('change', function () { loadSigninOptions(); });
     $('toggle-settings').addEventListener('click', function () { $('settings').hidden = !$('settings').hidden; });
 
     // -- start -------------------------------------------------------------
     var savedBase = read('sessionStorage', KEY_BASE) || read('localStorage', KEY_BASE);
     var savedToken = read('sessionStorage', KEY_TOKEN) || read('localStorage', KEY_TOKEN);
-    $('api-token').value = savedToken;
+    $('api-token').value = isSession(savedToken) ? '' : savedToken;  // a sign-in's session isn't shown as a token
     $('remember').checked = !!read('localStorage', KEY_TOKEN);
     $('q-sql').value = read('localStorage', KEY_SQL);
     (function () {
@@ -5350,9 +5600,11 @@
     $('api-base').value = (ON_PAGES && API_BASE) || savedBase || defaultBase();
     latestApiBase().then(function (fresh) {
       if (fresh) $('api-base').value = fresh;
-      if (savedToken) { connect(); return; }
+      loadSigninOptions();
+      renderSession();
+      if (savedToken) { connect(savedToken); return; }
       $('settings').hidden = false;
-      $('settings-msg').textContent = 'Enter the API token. Tick Remember on this browser and the page connects by itself from then on.';
+      $('settings-msg').textContent = 'Sign in, or enter the API token. Tick Remember on this browser and the page connects by itself from then on.';
     });
   })();
 </script>

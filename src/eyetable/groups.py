@@ -44,7 +44,13 @@ def _now() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
 
 
-def _default_fetch(url: str, google_token: str | None = None) -> gsheets.Workbook:
+def _default_fetch(url: str, google_token: Any = None) -> gsheets.Workbook:
+    from eyetable import msfiles
+
+    tokens = google_token if isinstance(google_token, dict) else {"google": google_token}
+    if msfiles.is_microsoft_url(url):
+        return msfiles.fetch_workbook(url, tokens.get("microsoft"))
+    google_token = tokens.get("google")
     if google_token:
         return gsheets.fetch_workbook_signed_in(url, google_token)
     return gsheets.fetch_workbook(url)
