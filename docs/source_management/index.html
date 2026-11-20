@@ -3673,6 +3673,9 @@
       setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
     }
 
+    // Clicking Run would move focus to the button and drop the query box's highlight, so the
+    // whole box would run; keep focus (and the highlight) in the box, so Run runs just what's highlighted.
+    $('q-run').addEventListener('mousedown', function (e) { if (document.activeElement === $('q-sql')) e.preventDefault(); });
     $('q-run').addEventListener('click', runQuery);
     $('q-csv').addEventListener('click', downloadCsv);
     $('q-sql').addEventListener('input', saveSql);
