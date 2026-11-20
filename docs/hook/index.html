@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex">
+<title>eyetable run webhook</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #fff; --text: #1d2330; --muted: #5d6676; --border: #dde1e8;
+    --ok: #146c43; --ok-soft: #e3f4ea; --err: #b42318; --err-soft: #fdecea; --accent: #2457c5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #12151b; --card: #1a1f27; --text: #e6e9ef; --muted: #9aa3b2; --border: #2c333f;
+      --ok: #5fd19a; --ok-soft: #173326; --err: #ff8a80; --err-soft: #3a1d1b; --accent: #7aa2ff;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 640px; margin: 0 auto; padding: 32px 16px; display: grid; gap: 16px; }
+  h1 { font-size: 20px; margin: 0; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 16px; display: grid; gap: 10px; }
+  .status { font-weight: 600; }
+  .ok { color: var(--ok); } .err { color: var(--err); }
+  .card.ok { background: var(--ok-soft); border-color: transparent; } .card.err { background: var(--err-soft); border-color: transparent; }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; }
+  th, td { text-align: left; padding: 4px 8px 4px 0; vertical-align: top; overflow-wrap: anywhere; }
+  th { color: var(--muted); font-weight: 500; width: 9.5em; }
+  .hint { color: var(--muted); font-size: 13px; margin: 0; }
+  code { font-size: 13px; }
+  button { font: inherit; padding: 6px 14px; border-radius: 8px; border: 1px solid var(--border); background: var(--card); color: var(--accent); cursor: pointer; justify-self: start; }
+</style>
+</head>
+<body>
+<main>
+  <h1>eyetable run webhook</h1>
+  <div class="card" id="result" aria-live="polite"><span class="status">Recording the run…</span></div>
+  <p class="hint">This page passes the run in its address on to the eyetable API, which adds one row to
+    <code>eyetable.runs</code>. Opening the address again records the run again. Put the key after a <code>#</code>
+    (<code>…/hook/?source=…#key=…</code>) to keep it out of web server logs.</p>
+</main>
+<script>
+(function () {
+  'use strict';
+  // The webhook lives on the eyetable API, whose tunnel address changes when its PC restarts.
+  // GitHub Pages only serves files, so this page reads the API's current address from the
+  // published source management page and sends the run there, from your browser.
+  var ON_PAGES = /\.github\.io$/.test(location.hostname);
+  var LOCAL = /^(localhost|127\.0\.0\.1|\[::1\])$/.test(location.hostname);
+  var box = document.getElementById('result');
+
+  function params() {
+    var out = {};
+    [location.search.slice(1), location.hash.slice(1)].forEach(function (part) {
+      new URLSearchParams(part).forEach(function (v, k) { out[k] = v; });
+    });
+    return out;
+  }
+
+  function show(kind, title, rows, note) {
+    box.className = 'card ' + kind;
+    box.textContent = '';
+    var t = document.createElement('span');
+    t.className = 'status ' + kind;
+    t.textContent = title;
+    box.appendChild(t);
+    if (rows) {
+      var table = document.createElement('table');
+      rows.forEach(function (r) {
+        var tr = table.insertRow();
+        var th = document.createElement('th');
+        th.textContent = r[0];
+        tr.appendChild(th);
+        tr.insertCell().textContent = r[1] === null || r[1] === undefined || r[1] === '' ? '—' : String(r[1]);
+      });
+      box.appendChild(table);
+    }
+    if (note) {
+      var p = document.createElement('p');
+      p.className = 'hint';
+      p.textContent = note;
+      box.appendChild(p);
+    }
+  }
+
+  function when(iso) { return iso ? new Date(iso).toLocaleString() : null; }
+
+  function apiBase(given) {
+    // Only a page on this PC may be pointed at another API (for testing); a link can't send the key elsewhere.
+    if (given && LOCAL) return Promise.resolve(given);
+    if (!ON_PAGES) return Promise.resolve(location.origin);
+    var page = location.pathname.replace(/\/hook\/?.*$/, '/source_management/');
+    return fetch(page + '?fresh=' + Date.now(), { cache: 'no-store' })
+      .then(function (r) { if (!r.ok) throw new Error('the source management page answered ' + r.status); return r.text(); })
+      .then(function (html) {
+        var m = html.match(/var API_BASE\s*=\s*'([^']*)';/);
+        if (!m || !m[1]) throw new Error("the published page doesn't name the API's address yet");
+        return m[1];
+      });
+  }
+
+  function send() {
+    var p = params();
+    var key = p.key, api = p.api;
+    delete p.key;
+    delete p.api;
+    if (!key) {
+      show('err', 'Not recorded: the address has no key',
+        null, 'Add key=<EYETABLE_HOOK_KEY>, for example …/hook/?source=nightly&target_table=erp.orders#key=…');
+      return;
+    }
+    if (!p.source || !p.target_table) {
+      show('err', 'Not recorded: source and target_table are required', null,
+        'For example …/hook/?source=nightly_export&target_table=erp.orders&rows_written=1200#key=…');
+      return;
+    }
+    var base;
+    apiBase(api).then(function (b) {
+      base = b.replace(/\/+$/, '');
+      return fetch(base + '/hook?' + new URLSearchParams(p).toString(), { headers: { 'X-Hook-Key': key }, cache: 'no-store' });
+    }).then(function (res) {
+      return res.json().catch(function () { return null; }).then(function (body) {
+        if (!res.ok) throw new Error((body && body.detail) || res.status + ' ' + res.statusText);
+        return body.recorded;
+      });
+    }).then(function (run) {
+      show('ok', 'Recorded as run ' + run.id, [
+        ['source', run.source], ['target_table', run.target_table], ['mode', run.mode], ['status', run.status],
+        ['rows_written', run.rows_written], ['started_at', when(run.started_at)], ['finished_at', when(run.finished_at)], ['error', run.error]
+      ], 'It shows in eyetable under Show earlier runs, and in eyetable.runs.');
+    }, function (err) {
+      var reach = err instanceof TypeError;  // fetch itself failed: the API couldn't be reached
+      show('err', 'Not recorded: ' + (reach ? "the eyetable API can't be reached" + (base ? ' at ' + base : '') : err.message), null,
+        reach ? 'The PC running eyetable may be off or restarting (its address changes on restart; the new one is published about a minute later). Try again shortly.' : null);
+      if (reach) {
+        var again = document.createElement('button');
+        again.type = 'button';
+        again.textContent = 'Try again';
+        again.addEventListener('click', function () { show('', 'Recording the run…'); send(); });
+        box.appendChild(again);
+      }
+    });
+  }
+
+  // A browser may load an address in the background before you press Enter; record only when it's really opened.
+  if (document.prerendering) document.addEventListener('prerenderingchange', send, { once: true });
+  else send();
+})();
+</script>
+</body>
+</html>

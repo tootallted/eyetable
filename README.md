@@ -961,8 +961,21 @@ http://127.0.0.1:8765/hook?key=<EYETABLE_HOOK_KEY>&source=nightly_export&target_
   logs of the URL.
 * Address: `http://127.0.0.1:8765/hook` from this PC, or
   `<tunnel URL>/hook` (the `API_BASE` the page uses) from elsewhere. The quick
-  tunnel's URL changes when the service restarts. The GitHub Pages site is
-  static, so it can't take webhook calls itself.
+  tunnel's URL changes when the service restarts.
+* **From a web browser**, use the address that never changes:
+
+  ```
+  https://tootallted.github.io/eyetable/hook/?source=nightly_export&target_table=erp.orders&rows_written=1200#key=<EYETABLE_HOOK_KEY>
+  ```
+
+  GitHub Pages only serves files, so this page (`docs/hook/index.html`) does the
+  call from the browser: it reads the API's current address from the published
+  source management page, sends the run to `/hook` with the key in the
+  `X-Hook-Key` header, and shows the row that was recorded or what went wrong.
+  Put the key after `#`: the part after `#` never leaves the browser, so
+  GitHub doesn't see it. `?key=` works too. Each time the address is opened,
+  one run is recorded. It needs a browser that runs JavaScript; programs such
+  as curl or a scheduler call the API's `/hook` directly.
 
 ### Signing in with Google or Microsoft
 
