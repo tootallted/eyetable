@@ -80,7 +80,10 @@ class Mailer:
         sender = (env.get("EYETABLE_SMTP_FROM") or "").strip() or user
         if not sender:
             raise NotifyError("set EYETABLE_SMTP_FROM (or EYETABLE_SMTP_USER) to the address emails come from")
-        return cls(host, port, user, env.get("EYETABLE_SMTP_PASSWORD") or None, sender, security)
+        password = env.get("EYETABLE_SMTP_PASSWORD") or None
+        if user and not password:
+            raise NotifyError("EYETABLE_SMTP_USER is set but EYETABLE_SMTP_PASSWORD is empty")
+        return cls(host, port, user, password, sender, security)
 
     def send(self, to: list[str], subject: str, text: str, html_body: str | None = None) -> None:
         msg = EmailMessage()

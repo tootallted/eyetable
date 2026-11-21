@@ -54,7 +54,9 @@ def test_recipients_are_split_checked_and_deduplicated():
 
 def test_mailer_settings_come_from_env():
     assert Mailer.from_env({}) is None
-    m = Mailer.from_env({"EYETABLE_SMTP_HOST": "smtp.office365.com", "EYETABLE_SMTP_USER": "r@x.com"})
+    with pytest.raises(NotifyError, match="EYETABLE_SMTP_PASSWORD is empty"):
+        Mailer.from_env({"EYETABLE_SMTP_HOST": "smtp.gmail.com", "EYETABLE_SMTP_USER": "r@x.com", "EYETABLE_SMTP_PASSWORD": ""})
+    m = Mailer.from_env({"EYETABLE_SMTP_HOST": "smtp.office365.com", "EYETABLE_SMTP_USER": "r@x.com", "EYETABLE_SMTP_PASSWORD": "pw"})
     assert (m.host, m.port, m.security, m.sender, m.user) == ("smtp.office365.com", 587, "starttls", "r@x.com", "r@x.com")
     m = Mailer.from_env({"EYETABLE_SMTP_HOST": "h", "EYETABLE_SMTP_PORT": "465", "EYETABLE_SMTP_FROM": "f@x.com"})
     assert (m.port, m.security, m.sender, m.user) == (465, "ssl", "f@x.com", None)
