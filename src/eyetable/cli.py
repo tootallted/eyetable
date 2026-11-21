@@ -291,6 +291,14 @@ def serve(
     import logging
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    from eyetable.notify import Mailer, NotifyError
+
+    try:
+        app_.state.group_runner.mailer = Mailer.from_env()
+    except (NotifyError, ValueError) as exc:
+        console.print(f"[yellow]note:[/yellow] group run emails are off: {exc}")
+    mailer = app_.state.group_runner.mailer
+    console.print(f"group run emails: {'via ' + mailer.host + ':' + str(mailer.port) if mailer else 'off (no EYETABLE_SMTP_HOST)'}")
     app_.state.group_runner.start()  # scheduled group runs happen inside this process
     console.print("scheduler: running (checks for due groups every 30 s)")
     uvicorn.run(app_, host=host, port=port)

@@ -14,6 +14,10 @@ slot (atomically, so a group can't be started twice), and runs it. If the
 machine was off at a scheduled time, the group runs once when eyetable is
 back ("catch-up"), not once per missed slot.
 
+When a group has addresses under "Email results to", each finished run of it
+(manual or scheduled) is emailed to them with its basic numbers (see notify.py);
+whether that worked is saved on the run (group_runs.email).
+
 Scheduled runs have nobody signed in to Google, so a Google Sheet source in
 a scheduled group must be readable by link; private sheets reload only from
 "Run now" while you are signed in.
@@ -26,7 +30,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
-from eyetable import gsheets
+from eyetable import gsheets, notify
 from eyetable.engine import Engine
 from eyetable.identifiers import normalize_tag
 from eyetable.schedule import describe, next_runs, normalize
@@ -38,6 +42,7 @@ TRIGGER_WORDS = {"manual": "Run now", "schedule": "scheduled", "catch-up": "sche
 
 SheetFetch = Callable[[str, str | None], gsheets.Workbook]
 CATCH_UP_AFTER = dt.timedelta(minutes=10)
+KEEP: Any = object()  # update(): leave the group's email addresses as they are
 
 
 def _now() -> dt.datetime:
@@ -68,6 +73,7 @@ class GroupRunner:
         self._active: set[int | str] = set()  # group ids, and "#tag" for a tag run on its own
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self.mailer: notify.Mailer | None = None  # set by `eyetable serve` from EYETABLE_SMTP_*
 
     # -- defining groups ---------------------------------------------------
 
@@ -109,14 +115,19 @@ class GroupRunner:
         upcoming = next_runs(schedule, self.clock())
         return upcoming[0] if upcoming else None
 
-    def create(self, name: str, members: list[str], schedule: dict | None = None, enabled: bool = True) -> Group:
+    def create(self, name: str, members: list[str], schedule: dict | None = None, enabled: bool = True,
+               notify_to: str | None = None) -> Group:
         name, members, schedule = self._clean(name, members, schedule)
-        return self.store.create_group(name, members, schedule, enabled, self._next(schedule, enabled))
+        to = notify.clean_recipients(notify_to)
+        group = self.store.create_group(name, members, schedule, enabled, self._next(schedule, enabled))
+        return self.store.update_group(group.id, notify=to) if to else group
 
-    def update(self, group_id: int, name: str, members: list[str], schedule: dict | None, enabled: bool) -> Group:
+    def update(self, group_id: int, name: str, members: list[str], schedule: dict | None, enabled: bool,
+               notify_to: str | None = KEEP) -> Group:
         name, members, schedule = self._clean(name, members, schedule)
+        values: dict[str, Any] = {} if notify_to is KEEP else {"notify": notify.clean_recipients(notify_to)}
         return self.store.update_group(group_id, name=name, members=members, schedule=schedule, enabled=enabled,
-                                       next_run_at=self._next(schedule, enabled))
+                                       next_run_at=self._next(schedule, enabled), **values)
 
     def summary(self, group: Group) -> dict[str, Any]:
         runs = self.store.list_group_runs(group.id, limit=1)
@@ -133,6 +144,8 @@ class GroupRunner:
             "next_run_at": group.next_run_at if group.enabled else None,
             "running": group.id in self._active,
             "last_run": runs[0] if runs else None,
+            "notify": group.notify,  # who gets each run's result by email
+            "email_ready": self.mailer is not None,  # whether the server can send email at all
         }
 
     # -- running -----------------------------------------------------------
@@ -192,6 +205,7 @@ class GroupRunner:
             hidden = loads and all(r.status == "skipped" for r in loads)
             return {"status": "failed" if failed else "skipped" if hidden else "succeeded",
                     "rows": sum(r.rows for r in loads),
+                    "tables": sum(1 for r in loads if r.status == "succeeded"),
                     "load": "incremental" if any(r.mode == "incremental" for r in loads) else "full",
                     "error": "; ".join(f"{r.dataset_key}: {r.error}" for r in failed) or
                              ("hidden in Sources, so not loaded" if hidden else None)}
@@ -203,13 +217,14 @@ class GroupRunner:
             raise
         done = self.queue.wait(item["id"])  # one member at a time, as a group run always has
         rows = sum(t["rows"] for t in done["tables"] if t["status"] == "succeeded")
+        tables = sum(1 for t in done["tables"] if t["status"] == "succeeded")  # tables this source populated
         # what this source actually did: incremental if any of its tables loaded incrementally
         load = "incremental" if any(t.get("mode") == "incremental" for t in done["tables"]) else "full"
         if done["status"] == "succeeded":
-            return {"status": "succeeded", "rows": rows, "load": load, "error": None}
+            return {"status": "succeeded", "rows": rows, "tables": tables, "load": load, "error": None}
         if done["status"] == "cancelled":
-            return {"status": "failed", "rows": rows, "load": load, "error": "cancelled in the load queue"}
-        return {"status": "failed", "rows": rows, "load": load,
+            return {"status": "failed", "rows": rows, "tables": tables, "load": load, "error": "cancelled in the load queue"}
+        return {"status": "failed", "rows": rows, "tables": tables, "load": load,
                 "error": "; ".join(e["message"] for e in done["errors"]) or done["status"]}
 
     def _execute(self, key: int | str, name: str, members: list[str], run_id: int, google_token: str | None,
@@ -241,6 +256,38 @@ class GroupRunner:
         finally:
             with self._lock:
                 self._active.discard(key)
+        if isinstance(key, int):  # a saved group (a tag run has nowhere to set addresses)
+            self.email_result(key, run_id, by)
+
+    def email_result(self, group_id: int, run_id: int, how: str | None = None) -> str | None:
+        """Email a finished run to the group's addresses, and note on the run how that went.
+        Returns the note, or None when the group has no addresses. Never raises."""
+        try:
+            group = self.store.get_group(group_id)
+            to = notify.parse_recipients(group.notify)
+            if not to:
+                return None
+            if self.mailer is None:
+                note = "not sent: email isn't set up on the eyetable server (EYETABLE_SMTP_HOST in .env)"
+            else:
+                run = self.store.get_group_run(run_id)
+                tz = (group.schedule or {}).get("timezone")
+                how = how.split(" · ", 1)[-1] if how else None  # "Group X · Run now, incremental": the name is said already
+                subject, text, html_body = notify.group_run_message(group.name, run, how and how[0].upper() + how[1:], tz)
+                try:
+                    self.mailer.send(to, subject, text, html_body)
+                    note = "sent to " + ", ".join(to)
+                except Exception as exc:
+                    note = "not sent: " + notify.describe_error(exc)
+            log.info("group %s run %s email %s", group.name, run_id, note)
+        except Exception as exc:
+            log.exception("emailing group run %s failed", run_id)
+            note = "not sent: " + (str(exc) or type(exc).__name__)
+        try:
+            self.store.set_group_run_email(run_id, note)
+        except Exception:
+            log.exception("couldn't save the email note on group run %s", run_id)
+        return note
 
     # -- scheduling --------------------------------------------------------
 

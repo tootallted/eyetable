@@ -231,6 +231,11 @@
   .groups-table .actions { display: flex; gap: 6px; justify-content: flex-end; }
   .groups-table details { margin-top: 4px; font-size: 12px; color: var(--muted); }
   .groups-table details li { margin: 2px 0; }
+  .groups-table .mailto { font-size: 12px; color: var(--muted); margin-top: 2px; overflow-wrap: break-word; }
+  .groups-table .email-note { font-size: 12px; color: var(--muted); }
+  .groups-table .email-note.bad { color: var(--err); }
+  #ge-notify-msg { font-size: 13px; }
+  #ge-notify-msg.ok { color: var(--ok); } #ge-notify-msg.err { color: var(--err); }
   .st { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; white-space: nowrap; }
   .st.succeeded { background: var(--ok-soft); color: var(--ok); }
   .st.partial { background: var(--warn-soft); color: var(--warn); }
@@ -956,6 +961,17 @@
             <div class="preview" id="ge-preview" aria-live="polite"></div>
           </div>
         </fieldset>
+        <label class="field">Email results to
+          <input type="text" id="ge-notify" maxlength="2000" autocomplete="off" spellcheck="false"
+            placeholder="e.g. ops@example.com, you@example.com">
+          <span class="note" id="ge-notify-note">After every run of this group, Run now or scheduled, eyetable emails these addresses
+            whether it succeeded or failed, with the rows processed, tables populated, start and end times and duration.
+            Separate addresses with commas. Leave it empty for no email.</span>
+        </label>
+        <div class="row-inline" style="gap:8px">
+          <button type="button" class="btn small" id="ge-notify-test">Send a test email</button>
+          <span id="ge-notify-msg" role="status" class="muted"></span>
+        </div>
         <div class="actions">
           <button class="btn primary" type="submit" id="ge-save">Save group</button>
           <button class="btn" type="button" id="ge-cancel">Cancel</button>
@@ -4116,6 +4132,11 @@
         }))]);
         if (run.status !== 'succeeded') det.open = true;
         node.appendChild(det);
+        if (run.email) {
+          var sent = run.email.indexOf('sent to ') === 0;
+          node.appendChild(el('div', { class: 'email-note' + (sent ? '' : ' bad'), text: (sent ? '✉ Emailed to ' + run.email.slice(8) : '✉ Email ' + run.email),
+            title: run.email }));
+        }
       } else {
         node.appendChild(el('span', { class: 'muted', text: 'Never run' }));
       }
@@ -4162,7 +4183,8 @@
         var editBtn = el('button', { type: 'button', class: 'btn small', text: 'Edit' });
         editBtn.addEventListener('click', function () { openEditor(g); });
         return el('tr', null, [
-          el('td', null, [el('strong', { text: g.name })]),
+          el('td', null, [el('strong', { text: g.name })].concat(g.notify
+            ? [el('div', { class: 'mailto', text: '✉ ' + g.notify, title: 'Each run is emailed to ' + g.notify }) ] : [])),
           el('td', null, [el('div', { class: 'members' }, g.members.map(function (m) {
             if (m.charAt(0) !== '#') return el('span', { class: 'tag', text: m });
             var tagged = state.sources.filter(function (s) { return (s.tags || []).indexOf(m.slice(1)) >= 0; }).map(function (s) { return s.name; });
@@ -4236,7 +4258,7 @@
       unfold('groups');
       var e = defaultEditing();
       if (g) {
-        e.id = g.id; e.name = g.name; e.members = g.members.slice(); e.enabled = g.enabled;
+        e.id = g.id; e.name = g.name; e.members = g.members.slice(); e.enabled = g.enabled; e.notify = g.notify || '';
         var sc = g.schedule;
         if (sc) {
           e.kind = sc.type; e.days = sc.days.slice(); e.timezone = sc.timezone; e.load = sc.load || 'full';
@@ -4257,6 +4279,9 @@
       $('ge-enabled').checked = e.enabled;
       $('ge-load-inc').checked = e.load === 'incremental';
       $('ge-load-full').checked = e.load !== 'incremental';
+      $('ge-notify').value = e.notify || '';
+      clear($('ge-notify-msg'));
+      renderNotifyNote();
       clear($('ge-msg'));
       renderEditor();
       $('group-editor').hidden = false;
@@ -4362,7 +4387,8 @@
       ev.preventDefault();
       var e = groupsState.editing;
       var msg = clear($('ge-msg'));
-      var body = { name: $('ge-name').value.trim(), members: e.members, schedule: editorSchedule(), enabled: $('ge-enabled').checked };
+      var body = { name: $('ge-name').value.trim(), members: e.members, schedule: editorSchedule(), enabled: $('ge-enabled').checked,
+                   notify: $('ge-notify').value.trim() };
       if (!body.name) { msg.appendChild(banner('err', 'Give the group a name.')); return; }
       if (!body.members.length) { msg.appendChild(banner('err', 'Tick at least one tag or source.')); return; }
       $('ge-save').disabled = true;
@@ -4389,6 +4415,37 @@
     $('group-new').addEventListener('click', function () { openEditor(null); });
     $('group-editor').addEventListener('submit', saveGroup);
     $('ge-cancel').addEventListener('click', closeEditor);
+
+    // Whether the eyetable server can send email: every group says so; with none yet, we don't know.
+    function emailReady() {
+      return groupsState.list.length ? groupsState.list[0].email_ready : null;
+    }
+
+    function renderNotifyNote() {
+      var note = $('ge-notify-note');
+      var off = emailReady() === false;
+      note.className = 'note' + (off && $('ge-notify').value.trim() ? ' bad' : '');
+      note.textContent = 'After every run of this group, Run now or scheduled, eyetable emails these addresses whether it ' +
+        'succeeded or failed, with the rows processed, tables populated, start and end times and duration. Separate ' +
+        'addresses with commas. Leave it empty for no email.' +
+        (off ? " Email isn't set up on the eyetable server yet: add the EYETABLE_SMTP_ settings to its .env and restart it " +
+               '(see the README), or nothing is sent.' : '');
+    }
+    $('ge-notify').addEventListener('input', renderNotifyNote);
+
+    $('ge-notify-test').addEventListener('click', function () {
+      var to = $('ge-notify').value.trim();
+      var msg = clear($('ge-notify-msg'));
+      msg.className = 'muted';
+      if (!to) { msg.textContent = 'Type an address first.'; return; }
+      var btn = $('ge-notify-test');
+      btn.disabled = true;
+      msg.textContent = 'Sending…';
+      api('/api/notify/test', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ to: to }) })
+        .then(function (r) { msg.className = 'ok'; msg.textContent = 'Sent to ' + r.sent_to.join(', ') + '. Check the inbox (and junk folder).'; },
+              function (err) { msg.className = 'err'; msg.textContent = err.message; })
+        .then(function () { btn.disabled = false; });
+    });
     $('ge-delete').addEventListener('click', deleteGroup);
     $('ge-all').addEventListener('click', function () {
       var tags = groupsState.editing.members.filter(function (m) { return m.charAt(0) === '#'; });

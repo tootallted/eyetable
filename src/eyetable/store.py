@@ -169,6 +169,7 @@ class Group:
     next_run_at: dt.datetime | None
     created_at: dt.datetime
     updated_at: dt.datetime
+    notify: str | None = None  # who gets the result of each run by email: "a@x.com, b@y.com"
 
 
 @dataclass
@@ -180,6 +181,7 @@ class GroupRun:
     started_at: dt.datetime
     finished_at: dt.datetime | None
     results: list[dict[str, Any]]
+    email: str | None = None  # whether the result was emailed: "sent to ...", or "not sent: why"
 
 
 TAG_RUN_GROUP = 0  # group_runs.group_id of a run of a tag, which is no saved group
@@ -256,6 +258,7 @@ class CoreStore:
             sa.Column("next_run_at", UTCDateTime()),
             sa.Column("created_at", UTCDateTime(), nullable=False),
             sa.Column("updated_at", UTCDateTime(), nullable=False),
+            sa.Column("notify", sa.Text),
         )
         self.group_runs = sa.Table(
             "group_runs",
@@ -267,6 +270,7 @@ class CoreStore:
             sa.Column("started_at", UTCDateTime(), nullable=False),
             sa.Column("finished_at", UTCDateTime()),
             sa.Column("results", JSONType, nullable=False),
+            sa.Column("email", sa.Text),
         )
         # The latest run of each tag run on its own (Run by tag), in group_runs.
         self.tag_runs = sa.Table(
@@ -359,11 +363,25 @@ class CoreStore:
             for schema in {self.meta_schema, self.data_schema} - {None}:
                 conn.execute(CreateSchema(schema, if_not_exists=True))
         self.metadata.create_all(self.db)
+        self._add_new_columns()
         if self.db.dialect.name == "postgresql":  # runs made before webhooks could leave these out
             with self.db.begin() as conn:
                 for col in ("mode", "started_at"):
                     conn.execute(sa.text(f"ALTER TABLE {self.qualified(self.ref(self.meta_schema, 'runs'))} "
                                          f"ALTER COLUMN {col} DROP NOT NULL"))
+
+    def _add_new_columns(self) -> None:
+        """Columns added after a table was first made (create_all leaves existing tables as they are)."""
+        inspector = sa.inspect(self.db)
+        for table in (self.groups, self.group_runs):
+            have = {c["name"] for c in inspector.get_columns(table.name, schema=self.meta_schema)}
+            missing = [c for c in table.columns if c.name not in have]
+            if missing:
+                with self.db.begin() as conn:
+                    for col in missing:
+                        conn.execute(sa.text(
+                            f"ALTER TABLE {self.qualified(self.ref(self.meta_schema, table.name))} "
+                            f"ADD COLUMN {self.db.dialect.identifier_preparer.quote(col.name)} {col.type.compile(dialect=self.db.dialect)}"))
 
     # -- sources -----------------------------------------------------------
 
@@ -634,6 +652,10 @@ class CoreStore:
                  .order_by(self.group_runs.c.id.desc()).limit(limit))
         with self.db.connect() as conn:
             return [GroupRun(**r._mapping) for r in conn.execute(query).all()]
+
+    def set_group_run_email(self, run_id: int, email: str) -> None:
+        with self.db.begin() as conn:
+            conn.execute(sa.update(self.group_runs).where(self.group_runs.c.id == run_id).values(email=email))
 
     def fail_stale_group_runs(self) -> int:
         """Runs left "running" by a process that stopped mid-run (call at startup)."""

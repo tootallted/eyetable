@@ -881,9 +881,57 @@ only). This needs three settings in `.env`: `GOOGLE_CLIENT_ID`,
 `GOOGLE_CLIENT_SECRET` (from the "eyetable page" OAuth client) and
 `EYETABLE_SECRET_KEY`; API: `GET/DELETE /api/google`, `POST /api/google/connect`.
 
-API: `GET/POST /api/groups`, `PUT/DELETE /api/groups/<id>`,
-`POST /api/groups/<id>/run` (returns a run id), `GET /api/group-runs/<id>`,
-`POST /api/schedule/preview`.
+#### Emailing each run's result
+
+In a group's editor, **Email results to** takes one address or several,
+separated by commas (semicolons and spaces work too). After every run of that
+group finishes, whether from **Full load**, **Incremental** or its schedule,
+eyetable emails those addresses. The subject says whether the run succeeded,
+partly failed or failed, e.g. *eyetable: Finance morning succeeded*. The email
+gives:
+
+* the group's name and the result
+* start and end times (in the schedule's timezone, otherwise the server's), and
+  the duration
+* rows processed and tables populated, summed over the group
+* how many sources succeeded, failed or were skipped, and what started the run
+* a line for each source, with its tables, rows, full or incremental, and any
+  error
+
+Leave the box empty for no email. **Send a test email** checks the setup without
+running anything. The group's row shows its addresses. Under the last run,
+the row says *Emailed to …*, or why no email was sent (in red), for example
+if the SMTP server refused the sign-in. The same note is in
+`eyetable.group_runs.email`. Runs of a tag on its own send no email; make a
+group from the tag to get one.
+
+The eyetable server sends through an SMTP server you set in `.env`, and
+needs a restart afterwards:
+
+```
+EYETABLE_SMTP_HOST=smtp.office365.com    # or smtp.gmail.com, or your company's relay
+EYETABLE_SMTP_PORT=587                   # 465 for SSL, 25 for a relay without sign-in
+EYETABLE_SMTP_USER=reports@example.com   # leave out for a relay that takes no sign-in
+EYETABLE_SMTP_PASSWORD=...               # an app password where the provider has them
+EYETABLE_SMTP_FROM=reports@example.com   # defaults to the user
+EYETABLE_SMTP_SECURITY=starttls          # starttls (default), ssl (default on 465) or none
+```
+
+* **Microsoft 365:** the mailbox needs *Authenticated SMTP* turned on (Microsoft
+  365 admin center › Users › the user › Mail › Manage email apps). If security
+  defaults or MFA block basic sign-in, use an SMTP relay or a connector instead.
+* **Google Workspace:** use `smtp.gmail.com` with an app password, made at
+  myaccount.google.com › Security › App passwords, after turning on 2-Step
+  Verification.
+
+`eyetable serve` prints whether group run emails are on when it starts.
+Without `EYETABLE_SMTP_HOST` nothing is sent, and the editor warns you about
+that.
+
+API: `GET/POST /api/groups`, `PUT/DELETE /api/groups/<id>` (`notify`: the
+addresses), `POST /api/groups/<id>/run` (returns a run id),
+`GET /api/group-runs/<id>`, `POST /api/schedule/preview`,
+`POST /api/notify/test` (`{"to": "a@x.com, b@y.com"}`).
 
 ### Query window
 

@@ -41,7 +41,8 @@ from eyetable.loadqueue import LoadQueue
 from eyetable.curl import auth_scheme, clean_statements, components, parse_curl, preview_statements, secret_places, stored_request
 from eyetable.curl import plan as curl_plan
 from eyetable.google_auth import GoogleAuthError, GoogleConnection
-from eyetable.groups import GroupRunner
+from eyetable import notify
+from eyetable.groups import KEEP, GroupRunner
 from eyetable import msfiles
 from eyetable.signin import SignIn, SignInError
 from eyetable.ratelimit import SlidingWindow, client_ip
@@ -63,6 +64,11 @@ class GroupIn(BaseModel):
     members: list[str] = Field(max_length=200)
     schedule: dict[str, Any] | None = None
     enabled: bool = True
+    notify: str | None = Field(default=None, max_length=2000)  # emails for each run's result, comma-separated
+
+
+class NotifyTestIn(BaseModel):
+    to: str = Field(min_length=3, max_length=2000)
 
 
 class ScheduleIn(BaseModel):
@@ -803,7 +809,7 @@ def create_app(
     @app.post("/api/groups", dependencies=auth)
     def create_group(body: GroupIn) -> dict[str, Any]:
         try:
-            group = groups.create(body.name, body.members, body.schedule, body.enabled)
+            group = groups.create(body.name, body.members, body.schedule, body.enabled, body.notify)
         except ValueError as exc:  # includes ScheduleError
             raise HTTPException(400, str(exc).strip("'\"")) from None
         return jsonable_encoder(groups.summary(group))
@@ -812,7 +818,8 @@ def create_app(
     def update_group(group_id: int, body: GroupIn) -> dict[str, Any]:
         get_group(group_id)
         try:
-            group = groups.update(group_id, body.name, body.members, body.schedule, body.enabled)
+            group = groups.update(group_id, body.name, body.members, body.schedule, body.enabled,
+                                  body.notify if "notify" in body.model_fields_set else KEEP)
         except ValueError as exc:
             raise HTTPException(400, str(exc).strip("'\"")) from None
         return jsonable_encoder(groups.summary(group))
@@ -824,6 +831,24 @@ def create_app(
             raise HTTPException(409, "the group is running; delete it when the run finishes")
         store.delete_group(group_id)
         return {"deleted": group_id}
+
+    @app.post("/api/notify/test", dependencies=auth)
+    def notify_test(body: NotifyTestIn) -> dict[str, Any]:
+        """Send a test email to the addresses, so the Groups panel can check email works before a run."""
+        try:
+            to = notify.parse_recipients(body.to)
+        except notify.NotifyError as exc:
+            raise HTTPException(400, str(exc)) from None
+        if not to:
+            raise HTTPException(400, "give at least one email address")
+        if groups.mailer is None:
+            raise HTTPException(409, "email isn't set up on the eyetable server: set EYETABLE_SMTP_HOST (and the "
+                                     "other EYETABLE_SMTP_ settings) in .env and restart it")
+        try:
+            groups.mailer.send(to, *notify.test_message())
+        except Exception as exc:
+            raise HTTPException(502, "not sent: " + notify.describe_error(exc)) from None
+        return {"sent_to": to}
 
     @app.post("/api/groups/{group_id}/run", dependencies=auth, status_code=202)
     def run_group(group_id: int, body: ReloadIn | None = None) -> dict[str, Any]:
