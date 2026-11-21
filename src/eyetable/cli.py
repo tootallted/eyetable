@@ -267,6 +267,8 @@ def serve(
     if left:
         console.print(f"[yellow]note:[/yellow] history not kept for {', '.join(left)}: its natural key no longer "
                       "holds (blank or repeated values); fix the data or choose another key")
+    views = store.refresh_current_views()  # <table>_current beside every table: its current rows
+    console.print(f"views: {len(views)} <table>_current view{'s' if len(views) != 1 else ''} of current rows")
     query_url = os.environ.get("EYETABLE_QUERY_DATABASE_URL") or None
     if query_url is None and store.db.dialect.name == "postgresql":
         console.print(

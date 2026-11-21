@@ -3592,12 +3592,17 @@
       var nav = clear($('q-tables'));
       var schema = query.schema;
       if (!schema) return;
-      var byTable = {};
-      schema.tables.forEach(function (t) { byTable[t.table] = t.columns; });
+      var byTable = {}, viewOf = {};
+      schema.tables.forEach(function (t) { byTable[t.table] = t.columns; if (t.view_of) viewOf[t.view_of] = t; });
       var files = schema.sources.filter(function (s) { return s.table && byTable[s.table]; });
       var named = {};
       files.forEach(function (s) { named[s.table] = true; (s.tables || []).forEach(function (t) { named[t] = true; }); });
-      var others = schema.tables.filter(function (t) { return !named[t.table]; });
+      var others = schema.tables.filter(function (t) { return !named[t.table] && !t.view_of; });
+      // each table's <table>_current view (its current rows) goes right under it
+      function withView(ref, owner) {
+        var v = viewOf[ref];
+        if (v) nav.appendChild(tableEntry(v.table, null, v.columns, owner));
+      }
       if (!files.length && !others.length) {
         nav.appendChild(el('div', { class: 'none', text: 'Nothing to query yet. Load a file above.' }));
         return;
@@ -3606,14 +3611,15 @@
         nav.appendChild(el('h3', { text: 'Sources' }));
         files.forEach(function (s) {
           nav.appendChild(tableEntry(s.name, s.table, byTable[s.table]));
+          withView(s.table, s.name);
           (s.tables || []).forEach(function (t) {  // a database source's other tables, by their own names
-            if (t !== s.table && byTable[t]) nav.appendChild(tableEntry(t, null, byTable[t], s.name));
+            if (t !== s.table && byTable[t]) { nav.appendChild(tableEntry(t, null, byTable[t], s.name)); withView(t, s.name); }
           });
         });
       }
       if (others.length) {
         nav.appendChild(el('h3', { text: 'Other tables' }));
-        others.forEach(function (t) { nav.appendChild(tableEntry(t.table, null, t.columns)); });
+        others.forEach(function (t) { nav.appendChild(tableEntry(t.table, null, t.columns)); withView(t.table); });
       }
       renderTableTags();
       filterTables();

@@ -107,7 +107,8 @@ def test_keyword_detection():
 
 def test_eyetable_internal_tables_are_off_limits(client):
     tables = {t["table"] for t in client.get("/api/schema", headers=AUTH).json()["tables"]}
-    assert tables == {"parts__data", "orders__data", "runs", "group_runs"}  # the run logs are readable
+    assert tables == {"parts__data", "orders__data", "parts__data_current", "orders__data_current",
+                      "runs", "group_runs"}  # the run logs are readable, and each table's _current view
     for sql in ("SELECT * FROM uploads", "SELECT content FROM uploads", "SELECT * FROM sources",
                 "SELECT * FROM google_connection", "SELECT * FROM groups"):
         r = ask(client, sql)

@@ -117,13 +117,19 @@ class QueryRunner:
         hidden = self._meta_tables()
         out = []
         for schema in [self.store.data_schema, *self.store.other_schemas()]:
+            views = set(insp.get_view_names(schema=schema))
             for name in sorted(insp.get_table_names(schema=schema)):
                 if name.endswith("__stg") or name.startswith("et_reorder_") or name in hidden:
                     continue
                 cols = insp.get_columns(name, schema=schema)
                 # tables outside the data schema are queried by schema.table
-                out.append({"table": self.store.ref(schema, name),
-                            "columns": [{"name": c["name"], "type": str(c["type"])} for c in cols]})
+                ref = self.store.ref(schema, name)
+                out.append({"table": ref, "columns": [{"name": c["name"], "type": str(c["type"])} for c in cols]})
+                view = self.store.current_view(ref)
+                if self.store.split(view)[1] in views:  # its <table>_current view, listed right after it
+                    vcols = insp.get_columns(self.store.split(view)[1], schema=schema)
+                    out.append({"table": view, "view_of": ref,
+                                "columns": [{"name": c["name"], "type": str(c["type"])} for c in vcols]})
         meta = self.store.meta_schema
         if meta and meta != self.store.data_schema:  # the run logs, queried as eyetable.runs
             for name in RUN_LOGS:

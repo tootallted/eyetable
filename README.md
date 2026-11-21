@@ -729,9 +729,34 @@ versions. A load whose rows repeat a key, or have no value in it, is refused
 and changes nothing. Each load's queue item says how many rows were new,
 changed and unchanged.
 
-Key checks and scans look only at the current versions (`ET_isCurrent = 1`). To query
-the current rows: `WHERE "ET_isCurrent" = 1`. To see a key as it was at a time:
+Key checks and scans look only at the current versions (`ET_isCurrent = 1`).
+To see a key as it was at time `t`, query the table with
 `WHERE "ET_fromdate" <= t AND "ET_todate" > t`.
+
+**`<table>_current` views.** Every table of loaded data has a view beside it,
+in the same schema, named after it with `_current` added. For example,
+`eyetable_raw.parts__data` has `eyetable_raw.parts__data_current`. The view
+shows only current data, so anyone who doesn't need history can always query
+the `_current` name:
+
+* **For a history table:** `SELECT * FROM <table> WHERE "ET_isCurrent" = 1`.
+* **For any other table:** `SELECT * FROM <table>`, since every row is current.
+
+eyetable keeps the views up to date by itself:
+
+* **Around each load:** the view is dropped before the load, because Postgres
+  won't swap or widen a table that a view depends on. It's made again
+  afterwards, with any new columns, even if the load failed.
+* **When a table is dropped or archived:** its view goes with it.
+* **At startup:** `eyetable serve` makes any view that's missing, and says how
+  many there are.
+
+If a view name would be over Postgres's 63-character limit, the table name is
+shortened to fit. If a real table already has the view's name, no view is
+made.
+
+The query window lists each view under its table. The query role reads views
+the same way it reads tables.
 
 To change the key, clear it first. **Clear the natural key** asks before it
 goes ahead, because clearing it stops history: the next full load replaces the

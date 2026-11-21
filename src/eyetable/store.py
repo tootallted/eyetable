@@ -47,6 +47,9 @@ FROM_COLUMN = "ET_fromdate"
 TO_COLUMN = "ET_todate"
 HISTORY_COLUMNS = (ACTIVE_COLUMN, FROM_COLUMN, TO_COLUMN)
 # What they were called before (renamed in place at startup, see CoreStore._rename_history_columns)
+# Every data table has a view beside it, <table>_current, of its current rows: a history table's
+# ET_isCurrent = 1 rows, every row of any other table (see CoreStore.refresh_current_view).
+CURRENT_VIEW_SUFFIX = "_current"
 OLD_HISTORY_COLUMNS = {"ET_active": ACTIVE_COLUMN, "ET_fromdt": FROM_COLUMN, "ET_todt": TO_COLUMN}
 FOREVER = dt.datetime(9999, 12, 31)
 # A statement set's rows say which statement brought them (eyetable.connectors.curl_source).
@@ -778,7 +781,8 @@ class CoreStore:
             return {r.dataset_key: (r.finished_at, r.rows_written, r.mode) for r in conn.execute(query).all()}
 
     def drop_table(self, table: str) -> None:
-        """Delete a table of loaded data (a database source's table that was unchosen)."""
+        """Delete a table of loaded data (a database source's table that was unchosen), and its view."""
+        self.drop_current_view(table)
         with self.db.begin() as conn:
             conn.execute(sa.text(f"DROP TABLE IF EXISTS {self.qualified(table)}"))
             conn.execute(sa.delete(self.table_keys).where(self.table_keys.c.table_name == table))
@@ -1036,12 +1040,14 @@ class CoreStore:
         incoming = self.ref(schema, f"{name[:50]}__incoming")
         loadlog.step(f"Reading the statements into {incoming}; their old rows in {table} are replaced once every row is in")
         rows = self.write(incoming, batches, "replace", run_id, origin=origin)
+        self.drop_current_view(table)  # the swap may widen columns, which a view would block
         try:
             ran = labels()
             deleted = self._swap_statements(table, incoming, ran)
         finally:
             with self.db.begin() as conn:
                 conn.execute(sa.text(f"DROP TABLE IF EXISTS {self.qualified(incoming)}"))
+            self.refresh_current_view(table)
         loadlog.step(f"Replaced {len(ran):,} statement{'s' if len(ran) != 1 else ''} in {table}: "
                      f"{deleted:,} old rows deleted, {rows:,} new rows added")
         return rows, deleted
@@ -1173,6 +1179,7 @@ class CoreStore:
         eyetable_raw_archived.ledger_20261113_161034. Returns its new ref (None if there was no table)."""
         if not self.table_exists(ref):
             return None
+        self.drop_current_view(ref)  # the archived copy has no view; the next load makes one for the new table
         schema, name = self.split(ref)
         stamp = (when or dt.datetime.now()).strftime("%Y%m%d_%H%M%S")
         new_name = f"{name[:63 - len(stamp) - 1]}_{stamp}"
@@ -1188,6 +1195,60 @@ class CoreStore:
             conn.execute(sa.text(f"ALTER TABLE {prep.quote_schema(schema)}.{prep.quote(new_name)} "
                                  f"SET SCHEMA {prep.quote_schema(archive)}"))
         return f"{archive}.{new_name}"
+
+    # -- <table>_current views -----------------------------------------------------
+
+    @staticmethod
+    def is_work_table(table: str) -> bool:
+        """eyetable's in-between tables (staging, incoming rows), which get no view."""
+        name = table.rsplit(".", 1)[-1]
+        return name.endswith(("__stg", "__incoming")) or name.startswith("et_reorder_")
+
+    def current_view(self, table: str) -> str:
+        """The ref of a table's view of its current rows: eyetable_raw.parts__data_current."""
+        schema, name = self.split(table)
+        view = name + CURRENT_VIEW_SUFFIX
+        if len(view) > 63:  # Postgres names are at most 63 characters
+            view = name[:63 - len(CURRENT_VIEW_SUFFIX)] + CURRENT_VIEW_SUFFIX
+        return self.ref(schema, view)
+
+    def drop_current_view(self, table: str) -> None:
+        if self.is_work_table(table):
+            return
+        with self.db.begin() as conn:
+            conn.execute(sa.text(f"DROP VIEW IF EXISTS {self.qualified(self.current_view(table))}"))
+
+    def refresh_current_view(self, table: str) -> str | None:
+        """(Re)make <table>_current: SELECT * FROM the table, WHERE "ET_isCurrent" = 1 for a history
+        table. Returns the view's ref; None if there's no table, or a real table already has that name."""
+        if self.is_work_table(table) or not self.table_exists(table):
+            return None
+        view = self.current_view(table)
+        vschema, vname = self.split(view)
+        if vname in sa.inspect(self.db).get_table_names(schema=vschema):
+            return None
+        q = self.db.dialect.identifier_preparer.quote
+        history = ACTIVE_COLUMN in {c["name"] for c in self.columns(table)}
+        where = f" WHERE {q(ACTIVE_COLUMN)} = 1" if history else ""
+        with self.db.begin() as conn:
+            conn.execute(sa.text(f"DROP VIEW IF EXISTS {self.qualified(view)}"))
+            conn.execute(sa.text(f"CREATE VIEW {self.qualified(view)} AS SELECT * FROM {self.qualified(table)}{where}"))
+        return view
+
+    def data_tables(self) -> list[str]:
+        """Every table of loaded data: in the data schema and the other schemas sources load into."""
+        insp = sa.inspect(self.db)
+        mine = {t.name for t in self.metadata.tables.values()} if self.meta_schema == self.data_schema else set()
+        out = []
+        for schema in [self.data_schema, *(s for s in self.other_schemas() if not s.endswith("_archived"))]:
+            for name in sorted(insp.get_table_names(schema=schema)):
+                if name not in mine and not self.is_work_table(name):
+                    out.append(self.ref(schema, name))
+        return out
+
+    def refresh_current_views(self) -> list[str]:
+        """Make (or remake) every data table's <table>_current view; returns the views."""
+        return [v for v in (self.refresh_current_view(t) for t in self.data_tables()) if v]
 
     def move_table_settings(self, old: str, new: str) -> None:
         """A table's natural key and scan, incremental column and hidden flag follow it to a new name."""
@@ -1209,7 +1270,20 @@ class CoreStore:
             return f"{prep.quote_schema(schema)}.{prep.quote(name)}"
         return prep.quote(name)
 
-    def write(
+    def write(self, table: str, batches: Iterable[list[dict[str, Any]]], mode: str = "replace", run_id: int = 0,
+              **kwargs: Any) -> int:
+        """Write record batches into `table` (see _write), dropping its <table>_current view for the
+        load (Postgres won't swap or widen a table a view depends on) and making it again afterwards,
+        with any new columns, whether or not the load worked."""
+        if self.is_work_table(table):
+            return self._write(table, batches, mode, run_id, **kwargs)
+        self.drop_current_view(table)
+        try:
+            return self._write(table, batches, mode, run_id, **kwargs)
+        finally:
+            self.refresh_current_view(table)
+
+    def _write(
         self,
         table: str,
         batches: Iterable[list[dict[str, Any]]],
