@@ -42,10 +42,12 @@ RUN_ID_COLUMN = "ET_run_id"
 # Data columns may not take these names (compared case-insensitively, as SQLite does).
 # A history table's columns (see CoreStore._merge): which version of a row is current, and when
 # each version was current from and to (datetime, no zone; current versions run to 9999-12-31).
-ACTIVE_COLUMN = "ET_active"
-FROM_COLUMN = "ET_fromdt"
-TO_COLUMN = "ET_todt"
+ACTIVE_COLUMN = "ET_isCurrent"
+FROM_COLUMN = "ET_fromdate"
+TO_COLUMN = "ET_todate"
 HISTORY_COLUMNS = (ACTIVE_COLUMN, FROM_COLUMN, TO_COLUMN)
+# What they were called before (renamed in place at startup, see CoreStore._rename_history_columns)
+OLD_HISTORY_COLUMNS = {"ET_active": ACTIVE_COLUMN, "ET_fromdt": FROM_COLUMN, "ET_todt": TO_COLUMN}
 FOREVER = dt.datetime(9999, 12, 31)
 # A statement set's rows say which statement brought them (eyetable.connectors.curl_source).
 STATEMENT_COLUMN = "ET_statement"
@@ -364,6 +366,7 @@ class CoreStore:
                 conn.execute(CreateSchema(schema, if_not_exists=True))
         self.metadata.create_all(self.db)
         self._add_new_columns()
+        self._rename_history_columns()
         if self.db.dialect.name == "postgresql":  # runs made before webhooks could leave these out
             with self.db.begin() as conn:
                 for col in ("mode", "started_at"):
@@ -382,6 +385,20 @@ class CoreStore:
                         conn.execute(sa.text(
                             f"ALTER TABLE {self.qualified(self.ref(self.meta_schema, table.name))} "
                             f"ADD COLUMN {self.db.dialect.identifier_preparer.quote(col.name)} {col.type.compile(dialect=self.db.dialect)}"))
+
+    def _rename_history_columns(self) -> None:
+        """History tables made before the columns were renamed: ET_active, ET_fromdt, ET_todt become
+        ET_isCurrent, ET_fromdate, ET_todate (in place; the rows stay as they are)."""
+        q = self.db.dialect.identifier_preparer.quote
+        for table in sorted(self.histories()):
+            if not self.table_exists(table):
+                continue
+            have = {c["name"] for c in self.columns(table)}
+            renames = [(old, new) for old, new in OLD_HISTORY_COLUMNS.items() if old in have and new not in have]
+            if renames:
+                with self.db.begin() as conn:
+                    for old, new in renames:
+                        conn.execute(sa.text(f"ALTER TABLE {self.qualified(table)} RENAME COLUMN {q(old)} TO {q(new)}"))
 
     # -- sources -----------------------------------------------------------
 
@@ -854,8 +871,8 @@ class CoreStore:
     def _merge(self, table: str, batches: Iterable[list[dict[str, Any]]], run_id: int, origin: Any,
                key: list[str]) -> int:
         """Load batches into a history table by its natural key `key`: a key not there yet is added
-        (ET_active 1, ET_fromdt now, ET_todt 9999-12-31); a key whose other columns changed gets a
-        new version the same way and its current version is closed (ET_active 0, ET_todt now); an
+        (ET_isCurrent 1, ET_fromdate now, ET_todate 9999-12-31); a key whose other columns changed gets a
+        new version the same way and its current version is closed (ET_isCurrent 0, ET_todate now); an
         unchanged row is left as it is. Nothing is ever deleted. Returns the rows read."""
         from eyetable import loadlog
 

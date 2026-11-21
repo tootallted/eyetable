@@ -4,6 +4,7 @@ import datetime as dt
 import sqlite3
 
 import pytest
+import sqlalchemy as sa
 from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
 
@@ -18,7 +19,7 @@ KEY = Fernet.generate_key().decode()
 
 
 def versions(store, table="crm__data"):
-    return [(r["id"], r["name"], r["ET_active"], r["ET_todt"] == FOREVER) for r in store.read_table(table)]
+    return [(r["id"], r["name"], r["ET_isCurrent"], r["ET_todate"] == FOREVER) for r in store.read_table(table)]
 
 
 @pytest.fixture
@@ -46,15 +47,17 @@ def engine(store, crm):
     return engine
 
 
-def test_history_needs_a_natural_key(engine, store):
+def test_saving_a_natural_key_keeps_history(engine, store):
     with pytest.raises(keys.KeyProblem, match="natural key first"):
         keys.choose_history(store, "crm__data", True)
-    keys.choose_key(store, "crm__data", ["id"])
+    assert keys.choose_key(store, "crm__data", ["id"])["history"] is True  # on by itself
     assert keys.choose_history(store, "crm__data", True)["history"] is True
-    with pytest.raises(keys.KeyProblem, match="turn history off"):
-        keys.clear_key(store, "crm__data")
-    with pytest.raises(keys.KeyProblem, match="turn history off"):
+    with pytest.raises(keys.KeyProblem, match="clear the natural key to stop it"):
+        keys.choose_history(store, "crm__data", False)
+    with pytest.raises(keys.KeyProblem, match="clear the natural key first"):
         keys.choose_key(store, "crm__data", ["name"])
+    assert keys.clear_key(store, "crm__data")["history"] is False  # clearing the key stops it
+    assert keys.choose_key(store, "crm__data", ["name"])["history"] is True
 
 
 def test_full_loads_merge_new_and_changed_rows_and_keep_old_versions(engine, store, crm):
@@ -67,18 +70,18 @@ def test_full_loads_merge_new_and_changed_rows_and_keep_old_versions(engine, sto
     assert r.note == "history: 0 new, 0 changed, 2 unchanged"
     assert versions(store) == [(1, "Ada", 1, True), (2, "Grace", 1, True)]
     first = store.read_table("crm__data")[0]
-    assert isinstance(first["ET_fromdt"], dt.datetime) and first["ET_todt"] == dt.datetime(9999, 12, 31)
+    assert isinstance(first["ET_fromdate"], dt.datetime) and first["ET_todate"] == dt.datetime(9999, 12, 31)
 
     # a change to Ada, a new account, Grace unchanged
     source_sql(crm, "UPDATE accounts SET city = 'Paris' WHERE id = 1; INSERT INTO accounts VALUES (3, 'Linus', 'Helsinki');")
     [r] = engine.reload_source("crm")
     assert r.note == "history: 1 new, 1 changed, 1 unchanged"
     rows = store.read_table("crm__data")
-    assert [(x["id"], x["city"], x["ET_active"]) for x in rows] == [
+    assert [(x["id"], x["city"], x["ET_isCurrent"]) for x in rows] == [
         (1, "London", 0), (2, "Arlington", 1), (1, "Paris", 1), (3, "Helsinki", 1)]
     old, new = rows[0], rows[2]
-    assert old["ET_todt"] == new["ET_fromdt"] and old["ET_todt"] != FOREVER and new["ET_todt"] == FOREVER
-    assert old["ET_fromdt"] < old["ET_todt"] or old["ET_fromdt"] == old["ET_todt"]
+    assert old["ET_todate"] == new["ET_fromdate"] and old["ET_todate"] != FOREVER and new["ET_todate"] == FOREVER
+    assert old["ET_fromdate"] < old["ET_todate"] or old["ET_fromdate"] == old["ET_todate"]
 
     # nothing changed: nothing added; a row gone from the source is left as it is
     source_sql(crm, "DELETE FROM accounts WHERE id = 2;")
@@ -124,30 +127,59 @@ def test_incremental_loads_merge_too(engine, store, crm):
     source_sql(crm, "UPDATE accounts SET city = 'Paris', version = 2 WHERE id = 1;")
     [r] = engine.reload_source("crm", incremental=True)
     assert (r.status, r.mode) == ("succeeded", "incremental")
-    assert [(x["id"], x["city"], x["ET_active"]) for x in store.read_table("crm__data")] == [
+    assert [(x["id"], x["city"], x["ET_isCurrent"]) for x in store.read_table("crm__data")] == [
         (1, "London", 0), (2, "Arlington", 1), (1, "Paris", 1)]  # the old version kept, not deleted
 
 
-def test_turning_history_off_lets_the_next_full_load_replace_the_table(engine, store, crm):
+def test_clearing_the_key_lets_the_next_full_load_replace_the_table(engine, store, crm):
     keys.choose_key(store, "crm__data", ["id"])
-    keys.choose_history(store, "crm__data", True)
     engine.reload_source("crm")
     source_sql(crm, "UPDATE accounts SET city = 'Paris' WHERE id = 1;")
     engine.reload_source("crm")
     assert len(store.read_table("crm__data")) == 3
-    keys.choose_history(store, "crm__data", False)
+    keys.clear_key(store, "crm__data")
     engine.reload_source("crm")
     rows = store.read_table("crm__data")
-    assert len(rows) == 2 and "ET_active" not in rows[0]
+    assert len(rows) == 2 and "ET_isCurrent" not in rows[0]
 
 
 def test_the_api_and_the_source_flags(engine, store):
     client = TestClient(create_app(engine, TOKEN))
     assert client.put("/api/tables/crm__data/history", headers=AUTH, json={"on": True}).status_code == 400
-    client.put("/api/tables/crm__data/key", headers=AUTH, json={"columns": ["id"]})
-    r = client.put("/api/tables/crm__data/history", headers=AUTH, json={"on": True})
+    r = client.put("/api/tables/crm__data/key", headers=AUTH, json={"columns": ["id"]})
     assert r.status_code == 200 and r.json()["history"] is True
-    assert client.delete("/api/tables/crm__data/key", headers=AUTH).status_code == 400
+    assert client.put("/api/tables/crm__data/history", headers=AUTH, json={"on": False}).status_code == 400
     [t] = client.get("/api/sources", headers=AUTH).json()[0]["tables"]  # a database source: per table
     assert (t["key"], t["history"], t["incremental"]) == (True, True, None)
+    r = client.delete("/api/tables/crm__data/key", headers=AUTH)
+    assert r.status_code == 200 and r.json()["history"] is False
     assert client.put("/api/tables/nope__data/history", headers=AUTH, json={"on": True}).status_code == 404
+
+
+def test_tables_keyed_before_history_was_automatic_get_it(engine, store, crm):
+    engine.load_db_objects(f"sqlite:///{crm.as_posix()}", [{"schema": "main", "name": "accounts", "kind": "table", "source": "crm2"}])
+    store.save_table_key("crm__data", ["id"])  # saved the old way: a key without history
+    store.save_table_key("crm2__data", ["city"])
+    source_sql(crm, "INSERT INTO accounts VALUES (3, 'Linus', 'London');")
+    engine.reload_source("crm2")  # now two rows share city London: that key no longer holds
+    assert keys.keep_history_for_keyed(store) == (["crm__data"], ["crm2__data"])
+    assert store.histories() == {"crm__data"}
+    assert keys.keep_history_for_keyed(store) == ([], ["crm2__data"])
+
+
+def test_history_columns_from_before_are_renamed(engine, store, crm):
+    keys.choose_key(store, "crm__data", ["id"])
+    engine.reload_source("crm")
+    q = store.db.dialect.identifier_preparer.quote
+    with store.db.begin() as conn:  # put the table back as it was with the old column names
+        for old, new in (("ET_active", "ET_isCurrent"), ("ET_fromdt", "ET_fromdate"), ("ET_todt", "ET_todate")):
+            conn.execute(sa.text(f"ALTER TABLE {q('crm__data')} RENAME COLUMN {q(new)} TO {q(old)}"))
+    assert "ET_active" in store.read_table("crm__data")[0]
+    store.init()
+    store.init()  # again: nothing left to rename
+    source_sql(crm, "UPDATE accounts SET city = 'Paris' WHERE id = 1;")
+    [r] = engine.reload_source("crm")
+    assert r.note == "history: 0 new, 1 changed, 1 unchanged"
+    row = store.read_table("crm__data")[0]
+    assert "ET_active" not in row and {"ET_isCurrent", "ET_fromdate", "ET_todate"} <= set(row)
+    assert versions(store) == [(1, "Ada", 0, False), (2, "Grace", 1, True), (1, "Ada", 1, True)]

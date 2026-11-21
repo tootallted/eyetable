@@ -72,9 +72,14 @@ def test_choosing_a_key_checks_it_and_every_scan_checks_it_again(store):
         keys.choose_key(store, "parts__data", ["nope"])
 
     info = keys.choose_key(store, "parts__data", ["sku"])
-    assert info["key"] == ["sku"] and info["key_check"]["ok"] is True
+    assert info["key"] == ["sku"] and info["key_check"]["ok"] is True and info["history"] is True
 
-    # the next load repeats a sku: the key is kept but flagged
+    # the table keeps history by sku, so a load that repeats a sku is refused
+    with pytest.raises(ValueError, match="one row per sku"):
+        load(store, "parts__data", [{"sku": "x", "qty": 1}, {"sku": "x", "qty": 2}])
+
+    # without history (a key that no longer held at startup), such a load goes in: the key is kept but flagged
+    store.set_history("parts__data", False)
     load(store, "parts__data", [{"sku": "x", "qty": 1}, {"sku": "x", "qty": 2}, {"sku": None, "qty": 3}])
     info = keys.scan_and_save(store, "parts__data")
     assert info["key"] == ["sku"]

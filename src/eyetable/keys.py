@@ -219,36 +219,55 @@ def choose_key(store: CoreStore, table: str, columns: list[str]) -> dict[str, An
         raise KeyProblem(f"{', '.join(et)} {'is' if len(et) == 1 else 'are'} eyetable's own; choose columns from the source")
     saved = store.get_table_key(table)
     if store.has_history(table) and saved and saved.get("key") and saved["key"] != columns:
-        raise KeyProblem(f"{table} keeps history by {' + '.join(saved['key'])}; turn history off to change its natural key")
+        raise KeyProblem(f"{table} keeps history by {' + '.join(saved['key'])}; clear the natural key first "
+                         "(that stops its history) to choose another")
     check = check_set(store, table, columns)
     if check.get("missing"):
         raise KeyProblem(f"{table} has no column {', '.join(check['missing'])}")
     if not check["ok"]:
         raise KeyProblem(describe_problem(check))
     store.save_table_key(table, columns)
+    store.set_history(table, True)  # every table with a natural key keeps history, from its next load on
     return key_info(store, table)
 
 
 def clear_key(store: CoreStore, table: str) -> dict[str, Any]:
-    if store.has_history(table):
-        raise KeyProblem(f"{table} keeps history by its natural key; turn history off before clearing the key")
+    """Clear the natural key, which also stops the table's history: its next full load replaces it."""
+    store.set_history(table, False)
     store.save_table_key(table, None)
     return key_info(store, table)
 
 
-def choose_history(store: CoreStore, table: str, on: bool) -> dict[str, Any]:
-    """Keep (or stop keeping) a table's history. Keeping it needs a natural key that holds: from
-    then on loads merge into the table by that key and never replace it (see CoreStore._merge).
-    Stopping it lets the next full load replace the table, dropping its old versions."""
-    if on:
+def keep_history_for_keyed(store: CoreStore) -> tuple[list[str], list[str]]:
+    """Turn history on for every table with a natural key that doesn't keep it yet (tables keyed
+    before history was automatic). A table whose key no longer holds is left alone, since its loads
+    would be refused. Returns (turned on, left alone)."""
+    on, skipped = [], []
+    for table in sorted(store.keyed_tables() - store.histories()):
         saved = store.get_table_key(table)
-        if not saved or not saved.get("key"):
-            raise KeyProblem("choose the table's natural key first: history is kept per key")
-        if store.table_exists(table):
-            check = check_set(store, table, saved["key"])
-            if not check["ok"]:
-                raise KeyProblem(describe_problem(check) + "; fix that before keeping history")
-    store.set_history(table, on)
+        if store.table_exists(table) and not check_set(store, table, saved["key"])["ok"]:
+            skipped.append(table)
+            continue
+        store.set_history(table, True)
+        on.append(table)
+    return on, skipped
+
+
+def choose_history(store: CoreStore, table: str, on: bool) -> dict[str, Any]:
+    """Keep a table's history. It needs a natural key that holds: from then on loads merge into the
+    table by that key and never replace it (see CoreStore._merge). Saving a key turns this on by
+    itself; it stops only when the key is cleared (clear_key)."""
+    if not on:
+        raise KeyProblem("every table with a natural key keeps history; clear the natural key to stop it "
+                         "(the next full load then replaces the table, and its old versions go with it)")
+    saved = store.get_table_key(table)
+    if not saved or not saved.get("key"):
+        raise KeyProblem("choose the table's natural key first: history is kept per key")
+    if store.table_exists(table):
+        check = check_set(store, table, saved["key"])
+        if not check["ok"]:
+            raise KeyProblem(describe_problem(check) + "; fix that before keeping history")
+    store.set_history(table, True)
     return key_info(store, table)
 
 

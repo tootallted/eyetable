@@ -1068,7 +1068,7 @@
   (function () {
     'use strict';
     var SOURCE_NAME = /^[a-z][a-z0-9_]{0,62}$/;
-    var ET_COLUMNS = ['ET_id', 'ET_timestamp', 'ET_source', 'ET_run_id'];
+    var ET_COLUMNS = ['ET_id', 'ET_timestamp', 'ET_source', 'ET_run_id', 'ET_isCurrent', 'ET_fromdate', 'ET_todate', 'ET_statement'];
     var KEY_BASE = 'eyetable.apiBase', KEY_TOKEN = 'eyetable.apiToken';
 
     var state = { base: '', token: '', connected: false, sources: [], file: null, dest: 'new', selected: null, expanded: {} };
@@ -2857,42 +2857,20 @@
         'so it can\u2019t match a row from one load to the next.' }));
     }
 
-    // History: loads merge into the table by its natural key, keeping every version of a row
-    // (ET_active, ET_fromdt, ET_todt), and the table is never replaced while this is on.
+    // History: every table with a natural key keeps it. Loads merge into the table by the key, keeping
+    // every version of a row (ET_isCurrent, ET_fromdate, ET_todate); the table is never replaced.
     function historyControl(info) {
-      var table = keyView.table;
-      var box = el('input', { type: 'checkbox' });
-      box.checked = !!info.history;
-      var wrap = el('div', { class: 'history-box' + (info.history ? ' on' : '') }, [
-        el('label', { class: 'check', style: 'font-weight:600; color:var(--text)' }, [box,
-          ' Track history: keep every version of each row (by ' + keyText(info.key) + ')']),
+      var k = keyText(info.key);
+      return el('div', { class: 'history-box' + (info.history ? ' on' : '') }, [
+        el('div', { style: 'font-weight:600', text: info.history ? 'History is kept, by ' + k : 'History isn’t kept yet' }),
         el('p', { class: 'hint', style: 'margin:0', text: info.history
-          ? 'On. Loads (full and incremental) merge into this table by ' + keyText(info.key) + ' and never replace it. A new ' +
-            keyText(info.key) + ' is added with ET_active 1, ET_fromdt now and ET_todt 9999-12-31. When a row\u2019s other columns change, ' +
-            'its current version is closed (ET_active 0, ET_todt now) and the new version is added the same way. Unchanged rows are left as they are. ' +
-            'Untick to stop: the next full load then replaces the table, and its old versions go with it.'
-          : 'Off: a full load replaces the table. Tick to keep history from the next load on: this table is then never replaced, ' +
-            'new and changed rows are added as current versions (ET_active 1, ET_fromdt, ET_todt 9999-12-31) and changed rows\u2019 old versions are kept, closed.' })
+          ? 'Loads (full and incremental) merge into this table by ' + k + ' and never replace it. A new ' + k +
+            ' is added with ET_isCurrent 1, ET_fromdate now and ET_todate 9999-12-31. When a row’s other columns change, ' +
+            'its current version is closed (ET_isCurrent 0, ET_todate now) and the new version is added the same way. Unchanged rows, ' +
+            'and rows missing from a load, are left as they are. Clearing the natural key stops it.'
+          : 'Every table with a natural key keeps history, but this key doesn’t hold right now, so loads would be refused. ' +
+            'Fix the data, or choose another key, and history starts from the next load.' })
       ]);
-      box.addEventListener('change', function () {
-        var on = box.checked, msg = clear($('key-msg'));
-        if (!on && !confirm('Stop keeping history for ' + fullTable(table) + '? The next full load replaces the table, and its old versions are dropped.')) {
-          box.checked = true;
-          return;
-        }
-        box.disabled = true;
-        api(keyApi(table, '/history'), { method: 'PUT', headers: JSON_HEADERS, body: JSON.stringify({ on: on }) }).then(function (r) {
-          if (keyView.table !== table) return;
-          showKeys(r);
-          $('key-msg').appendChild(banner('ok', on ? 'History is kept for this table from its next load on.' : 'History is off: the next full load replaces the table.'));
-          refreshSourcesOnly();
-        }, function (err) {
-          box.checked = !on;
-          box.disabled = false;
-          msg.appendChild(banner('err', err.message));
-        });
-      });
-      return wrap;
     }
 
     function chosenKey() {
@@ -2980,7 +2958,8 @@
           api(keyApi(table, '/key'), { method: 'PUT', headers: JSON_HEADERS, body: JSON.stringify({ columns: cols }) }).then(function (r) {
             if (keyView.table !== table) return;
             showKeys(r);
-            msg.appendChild(banner('ok', keyText(cols) + ' is now the natural key of this table.'));
+            msg.appendChild(banner('ok', keyText(cols) + ' is now the natural key of this table. History is kept by it from the next load on.'));
+            refreshSourcesOnly();
           }, function (err) {
             msg.appendChild(banner('err', 'Not saved: ' + err.message));
             updateKeySave();
@@ -2988,12 +2967,15 @@
         });
         bar.appendChild(save);
       }
-      if (info.key && !info.history) {  // a history table merges by its key: it stays while history is kept
+      if (info.key) {
         var drop = el('button', { type: 'button', class: 'btn danger', text: 'Clear the natural key' });
         drop.addEventListener('click', function () {
+          if (info.history && !confirm('Clear the natural key of ' + fullTable(table) + '? That also stops its history: the next full load ' +
+                                       'replaces the table, and its old versions (ET_isCurrent 0) are dropped.')) return;
           var msg = clear($('key-msg'));
           api(keyApi(table, '/key'), { method: 'DELETE' }).then(function (r) {
-            if (keyView.table === table) { showKeys(r); msg.appendChild(banner('ok', 'The natural key is cleared.')); }
+            if (keyView.table === table) { showKeys(r); msg.appendChild(banner('ok', 'The natural key is cleared, and history is no longer kept.')); }
+            refreshSourcesOnly();
           }, function (err) { msg.appendChild(banner('err', err.message)); });
         });
         bar.appendChild(drop);

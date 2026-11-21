@@ -123,9 +123,10 @@ def test_a_database_table_loads_only_new_rows_and_asks_the_database_for_them(sto
     # nothing new: nothing added
     assert engine.reload_source("crm", incremental=True)[0].rows == 0
 
-    # with a natural key, a changed row replaces its older copy, and the boundary row is fetched again (>=)
+    # with a natural key but no history (a key saved before history was automatic, or one that no longer
+    # held at startup), a changed row replaces its older copy, and the boundary row is fetched again (>=)
     engine.reload_source("crm")  # full load: back to one row per account
-    keys.choose_key(store, "crm__data", ["accountid"])
+    store.save_table_key("crm__data", ["accountid"])
     source_sql(crm, "UPDATE accounts SET name = 'Grace H', modifiedon = '2026-11-05T10:00:00Z' WHERE accountid = 'a2';")
     [r] = engine.reload_source("crm", incremental=True)
     assert seen[-1] == ("modifiedon", "2026-11-04T10:00:00Z", True)
@@ -181,7 +182,7 @@ def test_a_sheet_keeps_only_the_newer_rows(store):
     engine.ingest_gsheet(LINK, fetch=fake_fetch(book))
     table = "general_ledger_2026_q2_actuals__data"
     store.save_increment(table, "updated")
-    keys.choose_key(store, table, ["account"])
+    store.save_table_key(table, ["account"])  # a key without history: newer rows replace older copies
     book = {"Q2 Actuals": [["Account", "Amount", "Updated"], ["Rent", 1250, "2026-04-01"], ["Travel", 95, "2026-04-05"],
                            ["Meals", 40, "2026-04-06"]]}
     [r] = engine.reload_source("general_ledger_2026_q2_actuals", sheet_fetch=fake_fetch(book), incremental=True)

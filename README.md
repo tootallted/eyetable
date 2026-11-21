@@ -685,9 +685,9 @@ Every later scan checks the saved key again. If a load breaks the key, the key
 is kept and flagged with the blank and repeated counts. **Scan again** runs a
 scan on demand.
 
-The natural key is stored per table in `eyetable.table_keys`. It is not used
-for loading yet; it is the groundwork for features that need to match rows
-across loads.
+The natural key is stored per table in `eyetable.table_keys`. Saving one
+makes the table keep history (see *History tables*): loads then merge by the
+key instead of replacing the table.
 
 API: `GET /api/tables/<table>/keys`, `POST /api/tables/<table>/keys/scan` (a
 background job), `PUT /api/tables/<table>/key` with `{"columns": [...]}`, and
@@ -695,38 +695,53 @@ background job), `PUT /api/tables/<table>/key` with `{"columns": [...]}`, and
 
 ### History tables
 
-A table with a natural key can **keep history**. Tick **Track history** under
-the natural key in Preview Data. From the next load on, the table is never
-replaced: every load, full or incremental, **merges** into it by the natural
-key. Three columns record each row's versions:
+**Every table with a natural key keeps history.** This applies to every table
+with a key, whenever the key was chosen, so there is nothing to turn on. Saving
+a key under **Natural key** in Preview Data starts history from the table's
+next load. Tables keyed before this was automatic get it when `eyetable serve`
+starts, which lists them. A table whose key no longer holds is left out, and
+listed too: with blank or repeated key values, its loads would be refused.
+
+A history table is never replaced. Every load, full or incremental, **merges**
+into it by the natural key, which can be one column or several. Three columns
+record each row's versions:
 
 | Column | Type | Meaning |
 |---|---|---|
-| `ET_active` | integer | 1 for the current version of a key, 0 for older versions |
-| `ET_fromdt` | datetime | when this version became current (the load's time on the server) |
-| `ET_todt` | datetime | when it stopped being current; `9999-12-31 00:00:00.000` while it is current |
+| `ET_isCurrent` | integer | 1 for the current version of a key, 0 for older versions |
+| `ET_fromdate` | datetime | when this version became current (the load's time on the server) |
+| `ET_todate` | datetime | when it stopped being current; `9999-12-31 00:00:00.000` while it is current |
 
 What a load does to each row:
 
-* **A key that isn't there yet** is added: ET_active 1, ET_fromdt now, ET_todt
-  9999-12-31.
+* **A key that isn't there yet** is added: ET_isCurrent 1, ET_fromdate now,
+  ET_todate 9999-12-31.
 * **A key whose other columns changed** gets a new version, added the same
-  way. Its current version is closed: ET_active 0, ET_todt now.
+  way. Its current version is closed: ET_isCurrent 0, ET_todate now (the same
+  time as the new version's ET_fromdate).
 * **An unchanged row** is left as it is.
-* **A row that's gone from the source** is left as it is; nothing is deleted.
+* **A row that's missing from the load** is left as it is. Nothing is deleted
+  or closed because a row is gone from the source.
 * A column first seen in a load is added to the table.
 
-The first load after history is turned on makes the table's rows their first
+The first load after the key is saved makes the table's rows their first
 versions. A load whose rows repeat a key, or have no value in it, is refused
 and changes nothing. Each load's queue item says how many rows were new,
 changed and unchanged.
 
-While history is kept, the natural key can't be cleared or changed. Key checks
-and scans look only at the current versions (`ET_active = 1`). Untick **Track
-history** to stop. The next full load then replaces the table, and its old
-versions go with it. To query the current rows: `WHERE "ET_active" = 1`.
+Key checks and scans look only at the current versions (`ET_isCurrent = 1`). To query
+the current rows: `WHERE "ET_isCurrent" = 1`. To see a key as it was at a time:
+`WHERE "ET_fromdate" <= t AND "ET_todate" > t`.
 
-API: `PUT /api/tables/<table>/history` with `{"on": true}`.
+To change the key, clear it first. **Clear the natural key** asks before it
+goes ahead, because clearing it stops history: the next full load replaces the
+table, and its old versions go with it. History tables made before these
+column names were `ET_active`, `ET_fromdt` and `ET_todt`. They are renamed in
+place when `eyetable serve` starts, and their rows stay as they are.
+
+API: saving a key (`PUT /api/tables/<table>/key`) turns history on and
+clearing it (`DELETE`) turns it off. `PUT /api/tables/<table>/history` with
+`{"on": true}` turns it on again for a keyed table; `{"on": false}` is refused.
 
 **Sources indicators.** A narrow column beside each source or table name
 shows how it's set up: **PK** for a natural key, **IC** for an incremental

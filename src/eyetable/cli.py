@@ -259,6 +259,14 @@ def serve(
     max_mb = os.environ.get("EYETABLE_MAX_UPLOAD_MB")
     store = CoreStore(s.database_url, s.meta_schema, s.data_schema)
     store.init()
+    from eyetable.keys import keep_history_for_keyed
+
+    turned_on, left = keep_history_for_keyed(store)  # every table with a natural key keeps history
+    if turned_on:
+        console.print(f"history: now kept for {', '.join(turned_on)} (from each table's next load)")
+    if left:
+        console.print(f"[yellow]note:[/yellow] history not kept for {', '.join(left)}: its natural key no longer "
+                      "holds (blank or repeated values); fix the data or choose another key")
     query_url = os.environ.get("EYETABLE_QUERY_DATABASE_URL") or None
     if query_url is None and store.db.dialect.name == "postgresql":
         console.print(
