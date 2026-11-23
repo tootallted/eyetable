@@ -2896,7 +2896,8 @@
       clear(wrap);
       var s = keyView.info.scan, cands = {};
       s.primary_key_candidates.forEach(function (n) { cands[n] = true; });
-      if (!keyView.sf) keyView.sf = { sort: null, dir: 1, filters: {} };
+      // most distinct values first: the columns likeliest to identify a row sit at the top
+      if (!keyView.sf) keyView.sf = { sort: 'distinct', dir: -1, filters: {} };
       var cols = keyCols(cands), body = el('tbody');
       var count = el('div', { class: 'sf-note', role: 'status' });
       var fill = function () {
