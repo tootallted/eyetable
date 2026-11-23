@@ -8,6 +8,11 @@ Creates eyetable's roles and database in a local Postgres, using .env:
                                   the data schema (EYETABLE_DATA_SCHEMA, default
                                   eyetable_raw), including tables created later, and
                                   every session it opens is read-only.
+  * EYETABLE_AUTHOR_DATABASE_URL  optional; the role that saves views and procedures from
+                                  the query window. It owns its own schema
+                                  (EYETABLE_VIEWS_SCHEMA, default eyetable_views), may
+                                  read the data schema, and nothing else: none of
+                                  eyetable's own tables.
 Safe to re-run: existing roles get their passwords reset to match .env, an
 existing database is left alone, and grants are re-applied. Then run
 `eyetable init`.
@@ -44,6 +49,11 @@ function Split-Url($name, $url) {
 $main = Split-Url "EYETABLE_DATABASE_URL" (Get-EnvValue "EYETABLE_DATABASE_URL")
 $readerUrl = Get-EnvValue "EYETABLE_QUERY_DATABASE_URL" -Optional
 $reader = if ($readerUrl) { Split-Url "EYETABLE_QUERY_DATABASE_URL" $readerUrl } else { $null }
+$authorUrl = Get-EnvValue "EYETABLE_AUTHOR_DATABASE_URL" -Optional
+$author = if ($authorUrl) { Split-Url "EYETABLE_AUTHOR_DATABASE_URL" $authorUrl } else { $null }
+$viewsSchema = Get-EnvValue "EYETABLE_VIEWS_SCHEMA" -Optional
+if (-not $viewsSchema) { $viewsSchema = "eyetable_views" }
+if ($viewsSchema -notmatch '^[a-z_][a-z0-9_]*$') { throw "EYETABLE_VIEWS_SCHEMA must be lowercase letters, digits and _" }
 $schema = Get-EnvValue "EYETABLE_DATA_SCHEMA" -Optional
 if (-not $schema) { $schema = "eyetable_raw" }
 if ($schema -notmatch '^\w+$') { throw "EYETABLE_DATA_SCHEMA must be a plain identifier" }
@@ -92,6 +102,32 @@ try {
             "ALTER ROLE $r SET statement_timeout = '60s'"
         )) { Invoke-Sql $main.Db $sql | Out-Null }
         Write-Host "role $r may only read $schema (now and for tables created later); its sessions are read-only"
+    }
+
+    if ($author) {
+        if ($author.User -eq $main.User -or ($reader -and $author.User -eq $reader.User)) {
+            throw "EYETABLE_AUTHOR_DATABASE_URL must use its own role, not eyetable's or the query window's"
+        }
+        Set-Role $author
+        $a = $author.User
+        $sqls = @(
+            "CREATE SCHEMA IF NOT EXISTS $schema AUTHORIZATION $($main.User)",
+            "CREATE SCHEMA IF NOT EXISTS $viewsSchema AUTHORIZATION $a",
+            "ALTER SCHEMA $viewsSchema OWNER TO $a",
+            "GRANT CONNECT ON DATABASE $($main.Db) TO $a",
+            "GRANT USAGE ON SCHEMA $schema TO $a",
+            "GRANT SELECT ON ALL TABLES IN SCHEMA $schema TO $a",
+            "ALTER DEFAULT PRIVILEGES FOR ROLE $($main.User) IN SCHEMA $schema GRANT SELECT ON TABLES TO $a",
+            "ALTER ROLE $a SET statement_timeout = '300s'"
+        )
+        if ($reader) {
+            $sqls += @(
+                "GRANT USAGE ON SCHEMA $viewsSchema TO $($reader.User)",
+                "ALTER DEFAULT PRIVILEGES FOR ROLE $a IN SCHEMA $viewsSchema GRANT SELECT ON TABLES TO $($reader.User)"
+            )
+        }
+        foreach ($sql in $sqls) { Invoke-Sql $main.Db $sql | Out-Null }
+        Write-Host "role $a owns $viewsSchema and may read $schema; it can't reach eyetable's own tables"
     }
 } finally {
     Remove-Item Env:\PGPASSWORD -ErrorAction SilentlyContinue

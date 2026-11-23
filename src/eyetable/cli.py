@@ -275,12 +275,29 @@ def serve(
             "[yellow]note:[/yellow] EYETABLE_QUERY_DATABASE_URL is not set, so the query window runs as the main "
             "database role (still read-only); scripts/setup-postgres.ps1 creates a SELECT-only role for it"
         )
+    runner = QueryRunner(store, query_url, float(os.environ.get("EYETABLE_QUERY_TIMEOUT_S", "30")))
+    author = None
+    author_url = os.environ.get("EYETABLE_AUTHOR_DATABASE_URL")
+    if author_url:  # saving views and procedures from the query window (authoring.py)
+        from eyetable.authoring import Author, AuthorError
+
+        try:
+            author = Author(store, author_url, os.environ.get("EYETABLE_VIEWS_SCHEMA") or "eyetable_views",
+                            reader=runner.reader)
+            author.setup()
+            runner.views_schema = author.schema if not author.problem else None
+            console.print(f"views: saving to {author.schema}" if not author.problem
+                          else f"[yellow]note:[/yellow] {author.problem}")
+        except AuthorError as exc:
+            console.print(f"[yellow]note:[/yellow] {exc}")
+            author = None
     app_ = create_app(
         Engine(store, scan_keys="background"),  # key scans after loads don't hold up the page
         token,
         cors_origins=origins or DEFAULT_CORS_ORIGINS,
         max_upload_bytes=int(max_mb) * 1024 * 1024 if max_mb else DEFAULT_MAX_UPLOAD_BYTES,
-        query_runner=QueryRunner(store, query_url, float(os.environ.get("EYETABLE_QUERY_TIMEOUT_S", "30"))),
+        query_runner=runner,
+        author=author,
         hook_key=os.environ.get("EYETABLE_HOOK_KEY") or None,
         signin=SignIn(
             token,

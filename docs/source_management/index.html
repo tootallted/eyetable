@@ -522,7 +522,19 @@
   .tbl-shown { display: flex; justify-content: space-between; gap: 8px; font-size: 11.5px; color: var(--muted); }
   .dock-tables { overflow: auto; padding: 6px 0 10px; font-size: 13px; min-height: 0; }
   .dock-tables h3 { margin: 8px 12px 4px; font-size: 11px; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); }
-  .dock-main { display: grid; grid-template-rows: minmax(64px, 36%) auto minmax(0, 1fr); min-width: 0; min-height: 0; }
+  .dock-main { display: grid; grid-template-rows: minmax(64px, 36%) auto auto minmax(0, 1fr); min-width: 0; min-height: 0; }
+  .q-save { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; padding: 6px 14px; font-size: 13px;
+            border-bottom: 1px solid var(--border); background: var(--surface-2); }
+  .q-save[hidden], .q-save [hidden] { display: none !important; }
+  .q-save-make, .q-save-deploy { display: inline-flex; gap: 6px; align-items: center; }
+  #q-save-name { width: 180px; padding: 3px 8px; font: 13px var(--mono); border-radius: 6px; border: 1px solid var(--border); background: var(--surface); }
+  .q-save-what { font-size: 12px; }
+  .q-save-msg { font-size: 12.5px; }
+  .q-save-msg.ok { color: var(--ok); } .q-save-msg.err { color: var(--err); white-space: pre-wrap; font-family: var(--mono); font-size: 12px; }
+  .obj-kind { font-size: 10.5px; padding: 0 6px; border-radius: 999px; background: var(--accent-soft); color: var(--accent); margin-left: auto; }
+  .obj-kind.procedure { background: var(--warn-soft); color: var(--warn); }
+  .obj-kind.table { background: var(--surface-2); color: var(--muted); }
+  .dock-tables .objs-none { padding: 2px 12px 6px; font-size: 12px; color: var(--muted); }
   #q-sql {
     width: 100%; height: 100%; resize: none; border: 0; border-bottom: 1px solid var(--border);
     padding: 10px 14px; background: var(--surface); color: var(--text);
@@ -1058,6 +1070,20 @@
     </div>
     <div class="dock-main">
       <textarea id="q-sql" spellcheck="false" autocomplete="off" aria-label="SQL query" placeholder="SELECT * FROM my_source LIMIT 100"></textarea>
+      <div class="q-save" id="q-save" hidden>
+        <span class="q-save-make" id="q-save-make">
+          <input type="text" id="q-save-name" maxlength="63" autocomplete="off" spellcheck="false" placeholder="name"
+            aria-label="Name for the view or procedure">
+          <button class="btn small" id="q-save-btn" type="button">Save as view</button>
+        </span>
+        <span class="q-save-deploy" id="q-save-deploy" hidden>
+          <button class="btn small primary" id="q-deploy" type="button">Deploy</button>
+          <button class="btn small" id="q-call" type="button" hidden>Run procedure</button>
+          <button class="btn small danger" id="q-drop" type="button" hidden>Drop</button>
+        </span>
+        <span class="q-save-what muted" id="q-save-what"></span>
+        <span class="q-save-msg" id="q-save-msg" role="status" aria-live="polite"></span>
+      </div>
       <div class="q-status" id="q-status" role="status" aria-live="polite">Connect to run queries.</div>
       <div class="q-results" id="q-results"></div>
     </div>
@@ -3483,12 +3509,14 @@
       $('q-run').disabled = !state.connected || query.running;
       $('q-run').firstChild.nodeValue = query.running ? 'Running… ' : 'Run ';
       $('q-csv').disabled = !query.result || !query.result.columns.length;
+      updateSaveBar();
       if (!state.connected && !query.running) {
         clear($('q-status')).appendChild(document.createTextNode('Connect to run queries.'));
       }
     }
 
     function loadSchema() {
+      loadObjects();
       return api('/api/schema').then(function (schema) {
         query.schema = schema;
         renderTables();
@@ -3613,6 +3641,7 @@
         var v = viewOf[ref];
         if (v) nav.appendChild(tableEntry(v.table, null, v.columns, owner));
       }
+      renderObjects(nav);
       if (!files.length && !others.length) {
         nav.appendChild(el('div', { class: 'none', text: 'Nothing to query yet. Load a file above.' }));
         return;
@@ -3651,6 +3680,8 @@
         body: JSON.stringify({ sql: sql, limit: Number($('q-limit').value) })
       }).then(function (r) {
         query.result = r;
+        query.lastSql = sql;  // what Save turns into a view: the query behind these results
+        updateSaveBar();
         var parts = [plural(r.row_count, 'row') + (r.truncated ? ' shown; the ' + fmtInt(r.limit) + '-row limit was reached' : ''), r.elapsed_ms + ' ms'];
         if (selected) parts.push('selection only');
         clear($('q-status')).appendChild(el('span', { class: 'ok', text: parts.join(' · ') }));
@@ -3663,11 +3694,186 @@
         query.result = null;
         clear($('q-status')).appendChild(el('span', { class: 'err', text: err.message }));
         clear($('q-results'));
+        updateSaveBar();
       }).then(function () {
         query.running = false;
         updateQueryControls();
       });
     }
+
+    // -- views and procedures saved from the query window (API: /api/objects) ---------
+    // Save makes the query behind the results (or, with none, the editor's SQL) a view in
+    // eyetable_views, or a procedure when it changes data. Opening one puts its CREATE OR REPLACE
+    // statement in the editor; Deploy runs the edited statement; a procedure can be run.
+    query.objects = { ready: false, list: [], schema: null, problem: null };
+    var DEFINITION = /^\s*create\s+(or\s+replace\s+)?(view|procedure)\s+(?:"?[\w$]+"?\s*\.\s*)?"?([\w$]+)"?/i;
+    var kindTimer = null, kindSeq = 0;
+
+    function loadObjects() {
+      return api('/api/objects').then(function (r) {
+        query.objects = { ready: r.ready, list: r.objects, schema: r.schema, problem: r.problem };
+        if (query.schema) renderTables();
+        updateSaveBar();
+      }, function () { query.objects = { ready: false, list: [], schema: null, problem: null }; updateSaveBar(); });
+    }
+
+    function renderObjects(nav) {
+      var o = query.objects;
+      if (!o.ready && !o.list.length) return;
+      nav.appendChild(el('h3', { text: 'Views & procedures' }));
+      var box = nav;  // entries sit right under the heading, as the table filter expects
+      if (!o.list.length) {
+        var none = el('div', { class: 'tbl objs-none', text: 'None yet: run a query, name it below the editor and Save.' });
+        none.searchText = '';
+        none.tags = [];
+        box.appendChild(none);
+      }
+      o.list.forEach(function (obj) {
+        var open = el('button', { type: 'button', class: 'name', text: obj.name,
+          title: obj.kind === 'table' ? 'Query ' + obj.ref + ' (a table a procedure made)' : 'Open ' + obj.ref + ' in the editor to change and deploy it' });
+        open.addEventListener('click', function () { openObject(obj); });
+        var entry = el('div', { class: 'tbl' }, [el('div', { class: 'tbl-head' }, [open, el('span', { class: 'obj-kind ' + obj.kind, text: obj.kind })])]);
+        entry.searchText = (obj.name + ' ' + obj.ref).toLowerCase();
+        entry.tags = [];
+        box.appendChild(entry);
+      });
+    }
+
+    function openObject(obj) {
+      var ta = $('q-sql');
+      api('/api/objects/' + encodeURIComponent(obj.name)).then(function (r) {
+        if (ta.value.trim() && ta.value.trim() !== r.sql.trim() &&
+            !confirm('Replace the SQL in the editor with ' + r.ref + '?')) return;
+        ta.value = r.sql;
+        saveSql();
+        ta.focus();
+        ta.setSelectionRange(0, 0);
+        ta.scrollTop = 0;
+        setSaveMsg('', obj.kind === 'table' ? 'Press Run to see ' + r.ref + '.'
+          : 'Opened ' + r.ref + '. Change it and press Deploy' + (obj.kind === 'procedure' ? ', or Run procedure to run it as it is.' : '.'));
+        updateSaveBar();
+      }, function (err) { setSaveMsg('err', err.message); });
+    }
+
+    // the SQL Save would use: the query behind the results showing, else the editor's text
+    function saveSource() {
+      if (query.result && query.lastSql) return { sql: query.lastSql, what: 'the query behind these results' };
+      var ta = $('q-sql');
+      return { sql: ta.value, what: 'the SQL in the editor' };
+    }
+
+    function setSaveMsg(kind, text) {
+      var m = $('q-save-msg');
+      m.className = 'q-save-msg' + (kind ? ' ' + kind : '');
+      m.textContent = text || '';
+    }
+
+    function updateSaveBar() {
+      var bar = $('q-save'), o = query.objects || { ready: false, list: [] };
+      bar.hidden = !state.connected || (!o.ready && !o.problem);
+      if (bar.hidden) return;
+      if (!o.ready) {
+        $('q-save-make').hidden = true;
+        $('q-save-deploy').hidden = true;
+        $('q-save-what').textContent = 'Saving views isn\u2019t available: ' + (o.problem || 'not set up');
+        return;
+      }
+      var text = $('q-sql').value, def = DEFINITION.exec(text);
+      $('q-save-make').hidden = !!def;
+      $('q-save-deploy').hidden = !def;
+      if (def) {
+        var name = def[3].toLowerCase(), kind = def[2].toLowerCase();
+        var existing = o.list.filter(function (x) { return x.name === name; })[0];
+        $('q-deploy').textContent = 'Deploy ' + name;
+        $('q-call').hidden = !(existing && existing.kind === 'procedure');
+        $('q-drop').hidden = !existing;
+        $('q-save-what').textContent = (existing ? 'Changes the ' + existing.kind : 'Makes a new ' + kind) + ' ' + (o.schema || '') + '.' + name;
+        return;
+      }
+      var src = saveSource();
+      $('q-save-what').textContent = src.sql.trim() ? 'Saves ' + src.what + ' in ' + o.schema : '';
+      $('q-save-btn').disabled = !src.sql.trim();
+      clearTimeout(kindTimer);
+      var seq = ++kindSeq;
+      kindTimer = setTimeout(function () {  // view or procedure? the API decides, as Save will
+        if (!src.sql.trim()) return;
+        api('/api/objects/kind', { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify({ sql: src.sql }) }).then(function (k) {
+          if (seq !== kindSeq) return;
+          $('q-save-btn').textContent = k.kind === 'view' ? 'Save as view' : 'Save as procedure';
+          $('q-save-btn').title = k.kind === 'view' ? 'A view: one query that only reads'
+            : 'A procedure: this SQL changes data or has several statements, so it can\u2019t be a view';
+        }, function () {});
+      }, 250);
+    }
+
+    function saveObject() {
+      var o = query.objects, name = $('q-save-name').value.trim().toLowerCase(), src = saveSource();
+      if (!/^[a-z_][a-z0-9_]{0,62}$/.test(name)) {
+        setSaveMsg('err', 'Name it first: lowercase letters, digits and _, starting with a letter.');
+        $('q-save-name').focus();
+        return;
+      }
+      var existing = o.list.filter(function (x) { return x.name === name; })[0];
+      if (existing && !confirm('Replace the ' + existing.kind + ' ' + existing.ref + '?')) return;
+      $('q-save-btn').disabled = true;
+      setSaveMsg('', 'Saving\u2026');
+      api('/api/objects', { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify({ name: name, sql: src.sql, replace: !!existing }) })
+        .then(function (r) {
+          setSaveMsg('ok', 'Saved ' + r.ref + ' as a ' + r.kind + (r.kind === 'view' ? '. Query it as ' + r.name + ', or open it on the left to change it.'
+            : '. Open it on the left to run it or change it.'));
+          $('q-save-name').value = '';
+          return loadObjects();
+        }, function (err) { setSaveMsg('err', err.message); })
+        .then(function () { $('q-save-btn').disabled = false; });
+    }
+
+    function deployObject() {
+      var btn = $('q-deploy');
+      btn.disabled = true;
+      setSaveMsg('', 'Deploying\u2026');
+      api('/api/objects/deploy', { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify({ sql: $('q-sql').value }) })
+        .then(function (r) {
+          setSaveMsg('ok', 'Deployed ' + r.ref + ' (' + r.kind + ').');
+          $('q-sql').value = r.sql;  // as the database now has it
+          saveSql();
+          return loadObjects();
+        }, function (err) { setSaveMsg('err', err.message); })
+        .then(function () { btn.disabled = false; });
+    }
+
+    function currentObject() {
+      var def = DEFINITION.exec($('q-sql').value);
+      return def ? query.objects.list.filter(function (x) { return x.name === def[3].toLowerCase(); })[0] : null;
+    }
+
+    function callObject() {
+      var obj = currentObject();
+      if (!obj) return;
+      var btn = $('q-call');
+      btn.disabled = true;
+      setSaveMsg('', 'Running ' + obj.ref + '\u2026');
+      api('/api/objects/' + encodeURIComponent(obj.name) + '/call', { method: 'POST' })
+        .then(function (r) {
+          setSaveMsg('ok', 'Ran ' + r.ref + ' in ' + fmtInt(r.elapsed_ms) + ' ms' + (r.notices && r.notices.length ? ': ' + r.notices.join(' \u00b7 ') : '.'));
+          return loadObjects();
+        }, function (err) { setSaveMsg('err', err.message); })
+        .then(function () { btn.disabled = false; });
+    }
+
+    function dropObject() {
+      var obj = currentObject();
+      if (!obj || !confirm('Drop the ' + obj.kind + ' ' + obj.ref + '? This can\u2019t be undone (its CREATE statement stays in the editor).')) return;
+      api('/api/objects/' + encodeURIComponent(obj.name), { method: 'DELETE' })
+        .then(function () { setSaveMsg('ok', 'Dropped ' + obj.ref + '. Deploy puts it back.'); return loadObjects(); },
+              function (err) { setSaveMsg('err', err.message); });
+    }
+
+    $('q-save-btn').addEventListener('click', saveObject);
+    $('q-save-name').addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); saveObject(); } });
+    $('q-deploy').addEventListener('click', deployObject);
+    $('q-call').addEventListener('click', callObject);
+    $('q-drop').addEventListener('click', dropObject);
+    $('q-sql').addEventListener('input', function () { updateSaveBar(); });
 
     function downloadCsv() {
       var r = query.result;

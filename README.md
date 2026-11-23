@@ -1027,6 +1027,63 @@ ORDER BY started_at DESC
 LIMIT 50;
 ```
 
+#### Saving queries as views and procedures
+
+Below the editor, a bar saves a query in one step: type a name and press
+**Save** (or Enter).
+
+* **Which SQL is saved:** with results showing, the query that produced them.
+  Otherwise, the text in the editor.
+* **View:** one statement that only reads (`SELECT`, `WITH`, `VALUES`, `TABLE`)
+  becomes a **view**. This is the default, and the button says **Save as view**.
+* **Procedure:** SQL that a view can't hold becomes a **procedure**, and the
+  button says **Save as procedure**. That covers `INSERT`, `UPDATE`, `DELETE`,
+  `SELECT … INTO`, `CREATE TABLE`, a cursor, or several statements. Such SQL
+  can't be run in the read-only window, but it can be saved. Its body is your
+  SQL, inside `BEGIN … END` unless it starts with `DECLARE` or `BEGIN`.
+* **Source names:** a source's name (`FROM parts`) is saved as its real table
+  (`eyetable_raw.parts__data`), because a saved view can't depend on the
+  query window's temporary names.
+* **Saving over a name** that's already in use asks before replacing it.
+
+Saved objects are listed at the top of the sidebar under **Views &
+procedures**, each marked view, procedure or table. A procedure may create
+tables, and those are listed there too.
+
+* **Opening one:** click it to put its `CREATE OR REPLACE` statement in the
+  editor. The bar then offers:
+  * **Deploy <name>** runs your edited statement. A view whose columns
+    changed is dropped and made again.
+  * **Run procedure** runs a procedure (`CALL`) and says how long it took.
+  * **Drop** removes the object. The statement stays in the editor, so Deploy
+    can put it back.
+* **Querying a view:** the query window reads views by name, for example
+  `SELECT * FROM order_parts`.
+
+They're created in their own schema, `eyetable_views` (`EYETABLE_VIEWS_SCHEMA`),
+by a separate role, `eyetable_author` (`EYETABLE_AUTHOR_DATABASE_URL`). That
+role owns `eyetable_views` and can read the data schemas, and nothing else. It
+can't change loaded tables or see eyetable's own tables (sources,
+credentials, runs), so a procedure can only write in `eyetable_views`.
+
+Views are made with `security_invoker = true`: they read with the rights of
+whoever queries them, so a view never shows more than that role could read
+directly. Deploy accepts only `CREATE [OR REPLACE] VIEW|PROCEDURE` for that
+schema.
+
+To set it up:
+
+1. Put `EYETABLE_AUTHOR_DATABASE_URL` in `.env`. It's like
+   `EYETABLE_DATABASE_URL`, with the role `eyetable_author` and its own password.
+2. Run `scripts/setup-postgres.ps1` as an administrator. It creates the role and
+   schema, and the grants.
+3. Restart eyetable. `eyetable serve` says `views: saving to eyetable_views`,
+   or why saving isn't available. Until then the bar says what's missing.
+
+API: `GET/POST /api/objects`, `GET/DELETE /api/objects/<name>`,
+`POST /api/objects/deploy`, `POST /api/objects/<name>/call`,
+`POST /api/objects/kind`.
+
 ### Run webhook
 
 Processes outside eyetable can record their runs in `eyetable.runs`, so they

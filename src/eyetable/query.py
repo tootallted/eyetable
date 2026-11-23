@@ -81,6 +81,7 @@ class QueryRunner:
         self.db = sa.create_engine(url, poolclass=NullPool) if url else store.db
         self.timeout_ms = int(timeout_s * 1000)
         self.reader = sa.make_url(url).username if url else None
+        self.views_schema: str | None = None  # saved views and procedures (authoring.py): queryable by name too
         if self.reader and store.db.dialect.name == "postgresql":
             store.schema_hooks.append(self.share_schema)  # new schemas (a table's own, archives) can be queried
             self.share_run_logs()
@@ -194,7 +195,8 @@ class QueryRunner:
         with raw.cursor() as cur:
             cur.execute(f"SET statement_timeout = {self.timeout_ms}")
             if schema:
-                cur.execute(f"SET search_path TO {prep.quote_schema(schema)}")
+                path = [schema] + ([self.views_schema] if self.views_schema else [])
+                cur.execute(f"SET search_path TO {', '.join(prep.quote_schema(s) for s in path)}")
             cur.execute("SELECT tablename FROM pg_tables WHERE schemaname = %s", (schema or "public",))
             existing = {r[0] for r in cur.fetchall()}
             for statement in self._view_statements(aliases, existing):

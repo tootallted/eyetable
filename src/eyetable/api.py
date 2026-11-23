@@ -253,6 +253,16 @@ class QueryIn(BaseModel):
     limit: int = Field(default=1000, ge=1, le=MAX_LIMIT)
 
 
+class SaveObjectIn(BaseModel):
+    name: str = Field(max_length=63)
+    sql: str = Field(max_length=100_000)
+    replace: bool = False
+
+
+class DeployIn(BaseModel):
+    sql: str = Field(max_length=200_000)
+
+
 def _json_safe(value: Any) -> Any:
     if isinstance(value, (bytes, bytearray, memoryview)):
         return bytes(value).hex()
@@ -275,6 +285,7 @@ def create_app(
     sheet_fetch: Callable[[str, str | None], Any] | None = None,
     hook_key: str | None = None,
     signin: SignIn | None = None,
+    author: Any = None,
 ) -> FastAPI:
     if not token:
         raise ValueError("an API token is required")
@@ -752,6 +763,60 @@ def create_app(
             "limit": body.limit,
             "elapsed_ms": result.elapsed_ms,
         })
+
+    # -- views and procedures saved from the query window (see authoring.py) --------
+
+    def authored(fn: Callable[[], Any]) -> Any:
+        from eyetable.authoring import AuthorError
+
+        if author is None:
+            raise HTTPException(503, "saving views and procedures isn't set up: set EYETABLE_AUTHOR_DATABASE_URL in "
+                                     ".env, run scripts/setup-postgres.ps1 as an administrator, and restart eyetable")
+        try:
+            return jsonable_encoder(fn())
+        except AuthorError as exc:
+            raise HTTPException(exc.status, str(exc)) from None
+
+    @app.get("/api/objects", dependencies=auth)
+    def list_objects() -> dict[str, Any]:
+        """The saved views and procedures, or why saving isn't available."""
+        if author is None or author.problem:
+            return {"ready": False, "schema": author.schema if author else None, "objects": [],
+                    "problem": author.problem if author else "saving views and procedures isn't set up (see the README)"}
+        return authored(lambda: {"ready": True, "schema": author.schema, "problem": None,
+                                 "objects": [o.as_dict() for o in author.objects()]})
+
+    @app.post("/api/objects/kind", dependencies=auth)
+    def object_kind(body: QueryIn) -> dict[str, Any]:
+        """Whether the SQL would be saved as a view or a procedure (or is a CREATE statement to deploy)."""
+        from eyetable.authoring import definition_target, kind_for
+
+        target = definition_target(body.sql)
+        return {"kind": kind_for(body.sql), "deploy": bool(target), "target": target[2] if target else None}
+
+    @app.post("/api/objects", dependencies=auth)
+    def save_object(body: SaveObjectIn) -> dict[str, Any]:
+        """Save the SQL as a view, or a procedure when it can't be one."""
+        return authored(lambda: author.save(body.name.strip(), body.sql, file_aliases(), body.replace))
+
+    @app.post("/api/objects/deploy", dependencies=auth)
+    def deploy_object(body: DeployIn) -> dict[str, Any]:
+        """Run an edited CREATE [OR REPLACE] VIEW / PROCEDURE statement."""
+        return authored(lambda: author.deploy(body.sql))
+
+    @app.get("/api/objects/{name}", dependencies=auth)
+    def get_object(name: str) -> dict[str, Any]:
+        """A saved object's CREATE OR REPLACE statement, to edit in the query window."""
+        return authored(lambda: author.definition(name))
+
+    @app.post("/api/objects/{name}/call", dependencies=auth)
+    def call_object(name: str) -> dict[str, Any]:
+        """Run a saved procedure."""
+        return authored(lambda: author.call(name))
+
+    @app.delete("/api/objects/{name}", dependencies=auth)
+    def drop_object(name: str) -> dict[str, Any]:
+        return authored(lambda: {"dropped": author.drop(name).as_dict()})
 
     def sheet_error(exc: SheetError) -> HTTPException:
         # 403 tells the page that signing in with Google (again) may get past this.
