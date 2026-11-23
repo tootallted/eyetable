@@ -323,6 +323,8 @@
   .tag-runs .title { font-size: 13px; font-weight: 600; }
   .tag-run { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: baseline; font-size: 13px; }
   .tag-run .status { display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: baseline; min-width: 0; }
+  .tag-ask { display: grid; gap: 6px; margin: -2px 0 4px 12px; padding: 8px 12px; border-left: 3px solid var(--accent);
+             background: var(--accent-soft); border-radius: 0 8px 8px 0; font-size: 13px; }
   .hash.run { padding: 3px 12px; }
   .hash.run::before { content: ""; margin-right: 6px; border-left: 7px solid currentColor;
     border-top: 4px solid transparent; border-bottom: 4px solid transparent; }
@@ -4148,11 +4150,46 @@
         var button = el('button', { type: 'button', class: 'hash run', text: '#' + t.tag + ' · ' + t.count,
           title: 'Reload ' + plural(t.count, 'source') + ': ' + run.sources.join(', ') });
         button.disabled = !!run.running || !state.connected;
-        button.addEventListener('click', function () { runGroup(run); });
+        button.setAttribute('aria-expanded', String(groupsState.tagAsk === t.tag));
+        button.addEventListener('click', function () {  // ask how to load: incremental first, full one click away
+          groupsState.tagAsk = groupsState.tagAsk === t.tag ? null : t.tag;
+          groupsState.tagAskFocus = !!groupsState.tagAsk;
+          renderTagRuns();
+        });
         var status = el('div', { class: 'status' });
         fillRunStatus(status, run);
         wrap.appendChild(el('div', { class: 'tag-run' }, [button, status]));
+        if (groupsState.tagAsk === t.tag && !run.running) wrap.appendChild(tagRunChoice(t.tag, run));
       });
+    }
+
+    // Under a clicked tag: run it incrementally (the default, focused) or in full, or not at all.
+    function tagRunChoice(tag, run) {
+      var tables = [];
+      run.sources.forEach(function (name) {
+        var s = state.sources.filter(function (x) { return x.name === name; })[0];
+        if (s) tables = tables.concat(s.tables && s.tables.length ? s.tables : [s]);
+      });
+      var inc = tables.filter(function (x) { return x.incremental; }).length;
+      var close = function () { groupsState.tagAsk = null; renderTagRuns(); };
+      var go = function (incremental) { groupsState.tagAsk = null; runGroup(run, incremental); };
+      var incBtn = el('button', { type: 'button', class: 'btn small primary', text: 'Run incremental' });
+      incBtn.addEventListener('click', function () { go(true); });
+      var fullBtn = el('button', { type: 'button', class: 'btn small', text: 'Full load' });
+      fullBtn.addEventListener('click', function () { go(false); });
+      var cancel = el('button', { type: 'button', class: 'btn small', text: 'Cancel' });
+      cancel.addEventListener('click', close);
+      var box = el('div', { class: 'tag-ask', role: 'group', 'aria-label': 'How to load #' + tag }, [
+        el('div', { class: 'row-inline', style: 'gap:6px' }, [incBtn, fullBtn, cancel]),
+        el('p', { class: 'hint', style: 'margin:0', text: 'Reload ' + plural(run.sources.length, 'source') + ' tagged #' + tag + '. ' +
+          (inc ? 'Run incremental loads only new rows for ' + (inc === tables.length ? (tables.length === 1 ? 'its table' : 'all ' + tables.length + ' tables')
+            : inc + ' of ' + plural(tables.length, 'table')) + ' (those with an incremental column)' + (inc < tables.length ? '; the rest load in full' : '') + '.'
+            : 'None of its tables has an incremental column yet, so Run incremental loads them in full too.') +
+          ' Full load reloads every table in full.' })
+      ]);
+      box.addEventListener('keydown', function (e) { if (e.key === 'Escape') { e.preventDefault(); close(); } });
+      if (groupsState.tagAskFocus) { groupsState.tagAskFocus = false; setTimeout(function () { incBtn.focus(); }, 0); }
+      return box;
     }
 
     function renderGroups() {

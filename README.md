@@ -857,9 +857,19 @@ commas, and press Enter. Tags are lowercase letters, digits, `_` and `-`
 (`#Base`, `base` and ` base ` all mean `#base`). Click a tag on any row to
 show only the sources that have it; from there, **Make a group from #base**
 creates a group for it in one click. To reload everything with a tag right
-now, click the tag under **Run everything with a tag** in the Groups card; no
-group is needed, and its last result shows beside it. API:
-`PUT /api/sources/<name>/tags`, `GET /api/tags`, `POST /api/tags/<tag>/run`.
+now, click the tag under **Run everything with a tag** in the Groups card. No
+group is needed, and the tag's last result shows beside it. Clicking the tag
+opens a choice under it:
+
+* **Run incremental** is the default. It has the focus, so Enter runs it. Each
+  table with an incremental column loads only its new rows, and every other
+  table loads in full. The choice says how many of the tag's tables load
+  incrementally.
+* **Full load** reloads every table in full.
+* **Cancel**, or Esc, closes the choice without running anything.
+
+API: `PUT /api/sources/<name>/tags`, `GET /api/tags`,
+`POST /api/tags/<tag>/run` (`{"incremental": true}` for an incremental run).
 
 ### Groups and schedules
 
