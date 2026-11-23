@@ -372,6 +372,9 @@
   .sources-table tr.conn.open .conn-caret { transform: rotate(90deg); }
   @media (prefers-reduced-motion: reduce) { .conn-caret { transition: none; } }
   .sources-table tr.member > td:nth-child(2) { padding-left: 18px; }
+  /* a bar down the left of every top-level item (a source on its own, or a connection's header row, with
+     their own open rows), so what sits inside a connection, without the bar, reads as belonging to it */
+  .sources-table tbody tr:not(.member) > td:first-child:not(.empty) { box-shadow: inset 4px 0 0 var(--accent); }
   .sources-table tr.sub td { background: var(--surface-2); font-size: 12.5px; padding-top: 5px; padding-bottom: 5px; }
   .sources-table .sub-name { display: inline-block; padding-left: 18px; font-family: var(--mono); }
   .tbl-count { display: inline-flex; align-items: center; gap: 6px; }
@@ -454,6 +457,9 @@
     .sources-table td > * { justify-self: start; }
     .sources-table tr.sub { margin-left: 14px; border-left: 3px solid var(--border); }
     .sources-table tr.member { margin-left: 10px; border-left: 3px solid var(--accent-soft); }
+    /* stacked rows: the top-level bar runs down the whole row, not just its first cell */
+    .sources-table tbody tr:not(.member) > td:first-child:not(.empty) { box-shadow: none; }
+    .sources-table tbody tr:not(.member):not(.sub):not(:has(> td.empty)) { border-left: 4px solid var(--accent); }
     .sources-table tr.member > td:nth-child(2) { padding-left: 0; }
     /* the Hide and load-button cells have no label: they take the whole width */
     .sources-table td.actions, .sources-table td.hide-col { display: block; width: auto; padding: 4px 0; }
