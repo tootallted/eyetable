@@ -533,7 +533,8 @@
   .q-status .err { color: var(--err); white-space: pre-wrap; font-family: var(--mono); font-size: 12px; }
   .q-status .ok { color: var(--ok); }
   .q-results { overflow: auto; min-height: 0; }
-  .q-results table { font-size: 12.5px; }
+  /* as wide as its columns need, not the whole pane: a few narrow columns stay together at the left */
+  .q-results table { font-size: 12.5px; width: auto; }
   .q-results th { z-index: 1; }
   .q-results .empty { padding: 20px 16px; }
   .tbl-head { display: flex; align-items: center; gap: 2px; padding: 1px 8px 1px 6px; }
