@@ -824,10 +824,11 @@ class Engine:
     def _merge_note(self, note: str | None) -> str | None:
         """Add what the last history merge on this thread did to a load's note."""
         stats = self.store.take_merge_stats()
-        if not stats:
-            return note
-        text = f"history: {stats['new']:,} new, {stats['changed']:,} changed, {stats['unchanged']:,} unchanged"
-        return f"{note}; {text}" if note else text
+        parts = [note] if note else []
+        if stats:
+            parts.append(f"history: {stats['new']:,} new, {stats['changed']:,} changed, {stats['unchanged']:,} unchanged")
+        parts += ["warning: " + w for w in self.store.take_load_warnings()]
+        return "; ".join(parts) or None
 
     def _table_of(self, source: str, name: str = DATASET_KEY) -> str:
         """The table a source's dataset loads into (named after the source if there's no source yet)."""

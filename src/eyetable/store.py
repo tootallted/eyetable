@@ -865,6 +865,52 @@ class CoreStore:
         self._merges.stats = None
         return stats
 
+    def take_load_warnings(self) -> list[str]:
+        """Warnings from the last load on this thread (once): columns kept empty, views not updated."""
+        warnings = getattr(self._merges, "warnings", None) or []
+        self._merges.warnings = []
+        return warnings
+
+    def _warn(self, text: str) -> None:
+        from eyetable import loadlog
+
+        loadlog.step("Warning: " + text)
+        if not getattr(self._merges, "warnings", None):
+            self._merges.warnings = []
+        self._merges.warnings.append(text)
+
+    def _warn_missing(self, table: str, missing: list[str], deps: list[str]) -> None:
+        """Columns the table has but this load doesn't: kept, and NULL in the rows it writes."""
+        if not missing:
+            return
+        cols = ", ".join(missing)
+        many = len(missing) != 1
+        text = (f"{cols} {'are' if many else 'is'} no longer in the source, so {'they were' if many else 'it was'} kept in "
+                f"{table} and loaded as NULL")
+        if deps:
+            text += (f" (views depend on {table}: {', '.join(deps)}); check that "
+                     f"{'those views' if len(deps) != 1 else 'the view'} still give{'s' if len(deps) == 1 else ''} what you expect")
+        self._warn(text)
+
+    def dependent_views(self, table: str) -> list[str]:
+        """Views built on the table or on its <table>_current view (other than that view itself), e.g. a
+        view saved from the query window. While there are any, loads change the table in place instead of
+        swapping it, and keep its columns (see write). Postgres only; [] elsewhere."""
+        if self.db.dialect.name != "postgresql" or self.is_work_table(table):
+            return []
+        refs = [self.qualified(table), self.qualified(self.current_view(table))]
+        with self.db.connect() as conn:
+            oids = [o for o in (conn.execute(sa.text("SELECT to_regclass(:r)::oid"), {"r": r}).scalar() for r in refs) if o]
+            if not oids:
+                return []
+            rows = conn.execute(sa.text(
+                "SELECT DISTINCT dn.nspname || '.' || dc.relname FROM pg_depend d "
+                "JOIN pg_rewrite rw ON rw.oid = d.objid JOIN pg_class dc ON dc.oid = rw.ev_class "
+                "JOIN pg_namespace dn ON dn.oid = dc.relnamespace "
+                "WHERE d.classid = 'pg_rewrite'::regclass AND d.refobjid = ANY(:oids) AND dc.oid <> ALL(:oids) ORDER BY 1"),
+                {"oids": oids}).scalars().all()
+        return list(rows)
+
     def current_rows(self, ref: str) -> str:
         """A table as SQL to select from: a history table's current versions only, else the table."""
         if self.has_history(ref) and ACTIVE_COLUMN in {c["name"] for c in self.columns(ref)}:
@@ -934,6 +980,7 @@ class CoreStore:
                                          f"{typ.compile(dialect=db.dialect)}"))
                     tgt_cols[c] = typ
             data = [c for c in tgt_cols if c not in meta]
+            self._warn_missing(table, [c for c in data if c not in inc_cols and c not in key], self.dependent_views(table))
             t, i = q(name), "i"
             text = "TEXT"
             distinct = "IS DISTINCT FROM" if db.dialect.name == "postgresql" else "IS NOT"
@@ -1040,7 +1087,8 @@ class CoreStore:
         incoming = self.ref(schema, f"{name[:50]}__incoming")
         loadlog.step(f"Reading the statements into {incoming}; their old rows in {table} are replaced once every row is in")
         rows = self.write(incoming, batches, "replace", run_id, origin=origin)
-        self.drop_current_view(table)  # the swap may widen columns, which a view would block
+        if not self.dependent_views(table):
+            self.drop_current_view(table)  # the swap may widen columns, which a view would block
         try:
             ran = labels()
             deleted = self._swap_statements(table, incoming, ran)
@@ -1061,6 +1109,8 @@ class CoreStore:
             raise ValueError(f"{table} has no {STATEMENT_COLUMN} column to tell its statements apart; run a full load")
         meta = {ID_COLUMN, *META_COLUMNS}
         qt, qi = self.qualified(table), self.qualified(incoming)
+        deps = self.dependent_views(table)
+        self._warn_missing(table, [c for c in tgt_cols if c not in meta and c not in inc_cols], deps)
         with db.begin() as conn:
             for c, typ in inc_cols.items():
                 if c in meta:
@@ -1071,7 +1121,8 @@ class CoreStore:
                     continue
                 current, new = kind_of(tgt_cols[c]), kind_of(typ)
                 widened = merge_kinds(current, new)
-                if widened != current and db.dialect.name != "sqlite":  # e.g. whole numbers that now have decimals
+                # views on the table block changing a column's type: the values are cast to it instead
+                if widened != current and db.dialect.name != "sqlite" and not deps:  # e.g. whole numbers that now have decimals
                     ddl = sa_type(widened).compile(dialect=db.dialect)
                     conn.execute(sa.text(f"ALTER TABLE {qt} ALTER COLUMN {q(c)} TYPE {ddl} USING {q(c)}::{ddl}"))
                     tgt_cols[c] = sa_type(widened)
@@ -1230,9 +1281,20 @@ class CoreStore:
         q = self.db.dialect.identifier_preparer.quote
         history = ACTIVE_COLUMN in {c["name"] for c in self.columns(table)}
         where = f" WHERE {q(ACTIVE_COLUMN)} = 1" if history else ""
+        select = f"SELECT * FROM {self.qualified(table)}{where}"
+        if self.db.dialect.name == "postgresql" and vname in sa.inspect(self.db).get_view_names(schema=vschema):
+            try:  # keeps views built on it: only adds the table's new columns at its end
+                with self.db.begin() as conn:
+                    conn.execute(sa.text(f"CREATE OR REPLACE VIEW {self.qualified(view)} AS {select}"))
+                return view
+            except Exception as exc:
+                if self.dependent_views(table):
+                    self._warn(f"{view} couldn't be updated ({str(exc).splitlines()[0]}); it shows {table} as it was "
+                               "before this load's column changes")
+                    return view
         with self.db.begin() as conn:
             conn.execute(sa.text(f"DROP VIEW IF EXISTS {self.qualified(view)}"))
-            conn.execute(sa.text(f"CREATE VIEW {self.qualified(view)} AS SELECT * FROM {self.qualified(table)}{where}"))
+            conn.execute(sa.text(f"CREATE VIEW {self.qualified(view)} AS {select}"))
         return view
 
     def data_tables(self) -> list[str]:
@@ -1274,12 +1336,26 @@ class CoreStore:
               **kwargs: Any) -> int:
         """Write record batches into `table` (see _write), dropping its <table>_current view for the
         load (Postgres won't swap or widen a table a view depends on) and making it again afterwards,
-        with any new columns, whether or not the load worked."""
+        with any new columns, whether or not the load worked.
+
+        When other views are built on the table or on its _current view (a view saved from the query
+        window, say), neither can be dropped: the load then changes the table in place instead. A full
+        load empties and refills it rather than swapping in a new table, new columns are added, columns
+        the source no longer has are kept and loaded as NULL (with a warning), and values are cast to
+        a column's existing type. The _current view gets any new columns at its end."""
         if self.is_work_table(table):
             return self._write(table, batches, mode, run_id, **kwargs)
-        self.drop_current_view(table)
+        from eyetable import loadlog
+
+        self._merges.warnings = []  # this load's own (an earlier failed load's don't carry over)
+        deps = self.dependent_views(table)
+        if deps:
+            loadlog.step(f"Views are built on {table} ({', '.join(deps)}), so it's loaded in place: its columns "
+                         "stay as they are, and its _current view is kept")
+        else:
+            self.drop_current_view(table)
         try:
-            return self._write(table, batches, mode, run_id, **kwargs)
+            return self._write(table, batches, mode, run_id, in_place_for=deps, **kwargs)
         finally:
             self.refresh_current_view(table)
 
@@ -1293,6 +1369,7 @@ class CoreStore:
         origin: str,
         keep_on_failure: bool = False,
         resume: bool = False,
+        in_place_for: list[str] | None = None,
     ) -> int:
         """Write record batches into `table` in the data schema; return rows written.
 
@@ -1330,13 +1407,49 @@ class CoreStore:
             if mode == "replace" and not keep_on_failure:  # don't leave a half-built staging table behind
                 self.drop_staging(table)
             raise
-        if mode == "replace":
+        if mode == "replace" and in_place_for and self.table_exists(table):
+            self._refill(table, target, in_place_for)
+            loadlog.step(f"Refilled {table} from {target} in place: {rows:,} rows")
+        elif mode == "replace":
             prep = self.db.dialect.identifier_preparer
             with self.db.begin() as conn:
                 conn.execute(sa.text(f"DROP TABLE IF EXISTS {self.qualified(table)}"))
                 conn.execute(sa.text(f"ALTER TABLE {self.qualified(target)} RENAME TO {prep.quote(self.split(table)[1])}"))
             loadlog.step(f"Swapped {target} in as {table}: {rows:,} rows, {len(writer.columns) + 1} columns")
         return rows
+
+    def _refill(self, table: str, staged: str, deps: list[str]) -> None:
+        """A full load of a table that views depend on: in one transaction, add the staged load's new
+        columns, empty the table (ET_id starts again at 1) and copy the staged rows in, casting to the
+        table's column types; columns the load doesn't have stay, as NULL. Then drop the staging table.
+        If anything fails, the table is as it was."""
+        db = self.db
+        q = db.dialect.identifier_preparer.quote
+        tgt = {c["name"]: c["type"] for c in self.columns(table)}
+        src = {c["name"]: c["type"] for c in self.columns(staged)}
+        meta = {ID_COLUMN, *META_COLUMNS, *HISTORY_COLUMNS}
+        self._warn_missing(table, [c for c in tgt if c not in src and c not in meta], deps)
+        qt, qs = self.qualified(table), self.qualified(staged)
+        cols = [c for c in src if c != ID_COLUMN]
+
+        def value(c: str) -> str:
+            if c not in tgt or tgt[c].compile(dialect=db.dialect) == src[c].compile(dialect=db.dialect):
+                return q(c)
+            return f"CAST({q(c)} AS {tgt[c].compile(dialect=db.dialect)})"
+
+        try:
+            with db.begin() as conn:
+                for c in cols:
+                    if c not in tgt:  # a column first seen in this load
+                        conn.execute(sa.text(f"ALTER TABLE {qt} ADD COLUMN {q(c)} {src[c].compile(dialect=db.dialect)}"))
+                conn.execute(sa.text(f"TRUNCATE {qt} RESTART IDENTITY"))
+                conn.execute(sa.text(f"INSERT INTO {qt} ({', '.join(q(c) for c in cols)}) "
+                                     f"SELECT {', '.join(value(c) for c in cols)} FROM {qs} ORDER BY {q(ID_COLUMN)}"))
+        except Exception as exc:
+            raise ValueError(f"{table} couldn't be loaded in place (views depend on it: {', '.join(deps)}), so it was "
+                             f"left as it was: {str(exc).splitlines()[0]}") from exc
+        with db.begin() as conn:
+            conn.execute(sa.text(f"DROP TABLE IF EXISTS {qs}"))
 
     def drop_staging(self, table: str) -> None:
         with self.db.begin() as conn:

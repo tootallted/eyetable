@@ -758,6 +758,32 @@ made.
 The query window lists each view under its table. The query role reads views
 the same way it reads tables.
 
+**Tables with views built on them.** Your own views can be built on a table
+or on its `_current` view, for example a view saved from the query window.
+While any exist, Postgres won't let eyetable drop the `_current` view, swap the
+table, or change a column's type. So the table's loads change it in place
+instead:
+
+* **The `_current` view is kept.** The table's new columns are added at its
+  end.
+* **A full load empties the table and refills it** in one transaction, rather
+  than swapping in a new table. `ET_id` starts again at 1, and if anything
+  fails, the table is left as it was.
+* **A new column** in the source is added to the table.
+* **A column the source no longer has stays in the table** and is loaded as
+  NULL, so the views built on it keep working. The load's note in the Load
+  queue and its log carry a warning. It names the column and the views to
+  check, for example: *warning: colour is no longer in the source, so it was
+  kept in parts__data and loaded as NULL (views depend on parts__data:
+  eyetable_views.big); check that the view still gives what you expect*.
+* **A column whose values now have another type** keeps its type, and the
+  values are cast to it. A value that can't be cast fails the load, and the
+  table is left as it was.
+
+History tables already merge in place. They give the same warning when a
+column is missing from a load, with or without views on them. A table with no
+views on it loads as before: swapped, with its columns following the source.
+
 To change the key, clear it first. **Clear the natural key** asks before it
 goes ahead, because clearing it stops history: the next full load replaces the
 table, and its old versions go with it. History tables made before these
