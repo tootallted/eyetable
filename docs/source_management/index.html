@@ -512,9 +512,14 @@
   .dock-bar .controls { display: flex; align-items: center; gap: 8px; margin-left: auto; }
   #q-limit { width: auto; padding: 3px 6px; font-size: 13px; }
   kbd { font-family: var(--mono); font-size: 11px; padding: 0 4px; border-radius: 4px; border: 1px solid currentColor; opacity: .75; }
-  .dock-body { display: grid; grid-template-columns: 250px minmax(0, 1fr); min-height: 0; }
+  .dock-body { display: grid; grid-template-columns: var(--side-w, 250px) minmax(0, 1fr); min-height: 0; }
   .dock.collapsed .dock-body { display: none; }
-  .dock-side { display: grid; grid-template-rows: auto minmax(0, 1fr); border-right: 1px solid var(--border); min-height: 0; min-width: 0; }
+  .dock-side { display: grid; grid-template-rows: auto minmax(0, 1fr); border-right: 1px solid var(--border); min-height: 0; min-width: 0; position: relative; }
+  /* drag the table list's right edge to widen it (double-click: fit the longest name) */
+  .side-resize { position: absolute; top: 0; bottom: 0; right: -5px; width: 10px; cursor: ew-resize; touch-action: none; z-index: 3; }
+  .side-resize::after { content: ""; position: absolute; top: 0; bottom: 0; left: 4px; width: 2px; background: transparent; transition: background .12s; }
+  .side-resize:hover::after, .side-resize:focus-visible::after, .side-resize.dragging::after { background: var(--accent); }
+  .side-resize:focus-visible { outline: none; }
   .tbl-filter { display: grid; gap: 6px; padding: 8px 10px; border-bottom: 1px solid var(--border); }
   .tbl-filter input { width: 100%; padding: 5px 8px; border-radius: 6px; border: 1px solid var(--border); background: var(--surface); font-size: 13px; }
   .tbl-tags { display: flex; flex-wrap: wrap; gap: 4px; max-height: 58px; overflow: auto; }
@@ -566,6 +571,7 @@
   @media (max-width: 760px) {
     .dock-body { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(96px, 35%) minmax(0, 1fr); }
     .dock-side { display: block; overflow: auto; border-right: 0; border-bottom: 1px solid var(--border); }
+    .side-resize { display: none; }
     .dock-side .dock-tables { overflow: visible; }
     .dock-bar .hint, .dock-bar .wide-only, .dock-bar kbd { display: none; }
     .dock-bar { padding: 6px 12px; }
@@ -1061,6 +1067,8 @@
   </div>
   <div class="dock-body" id="dock-body">
     <div class="dock-side">
+      <div class="side-resize" id="side-resize" role="separator" aria-orientation="vertical" tabindex="0"
+        aria-label="Resize the table list (arrow keys; double-click to fit the longest name)" title="Drag to resize; double-click to fit the longest name"></div>
       <div class="tbl-filter">
         <input type="search" id="q-find" placeholder="Find a table" autocomplete="off" spellcheck="false" aria-label="Find a table by any part of its name">
         <div class="tbl-tags" id="q-tags" role="group" aria-label="Show tables with any of these tags" hidden></div>
@@ -3915,7 +3923,51 @@
         }
       });
     })();
-    window.addEventListener('resize', function () { setDock(query.height, query.collapsed); });
+    window.addEventListener('resize', function () { setDock(query.height, query.collapsed); setSide(query.side); });
+
+    // The table list's width: dragged on its right edge, remembered on this browser.
+    var KEY_SIDE = 'eyetable.dockSide';
+    function setSide(width, save) {
+      var total = $('dock-body').getBoundingClientRect().width || window.innerWidth;
+      var max = Math.max(200, Math.round(total - 320));  // always leave room for the editor and results
+      query.side = Math.max(160, Math.min(Math.round(width || 250), max));
+      $('dock-body').style.setProperty('--side-w', query.side + 'px');
+      if (save) write('localStorage', KEY_SIDE, String(query.side));
+    }
+    (function () {
+      var handle = $('side-resize'), dragging = false;
+      handle.addEventListener('pointerdown', function (e) {
+        dragging = true;
+        handle.classList.add('dragging');
+        handle.setPointerCapture(e.pointerId);
+        e.preventDefault();
+      });
+      handle.addEventListener('pointermove', function (e) {
+        if (dragging) setSide(e.clientX - $('dock-body').getBoundingClientRect().left, false);
+      });
+      var stop = function () {
+        if (!dragging) return;
+        dragging = false;
+        handle.classList.remove('dragging');
+        setSide(query.side, true);
+      };
+      handle.addEventListener('pointerup', stop);
+      handle.addEventListener('pointercancel', stop);
+      handle.addEventListener('keydown', function (e) {
+        if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+          e.preventDefault();
+          setSide(query.side + (e.key === 'ArrowRight' ? 32 : -32), true);
+        }
+      });
+      handle.addEventListener('dblclick', function () {  // just wide enough for the longest name
+        var extra = 0;
+        Array.prototype.forEach.call(document.querySelectorAll('#q-tables .tbl-head .name, #q-tables .tbl .alias'), function (n) {
+          if (n.offsetParent) extra = Math.max(extra, n.scrollWidth - n.clientWidth);
+        });
+        setSide(query.side + extra + 4, true);
+      });
+      setSide(Number(read('localStorage', KEY_SIDE)) || 250, false);
+    })();
 
 
 

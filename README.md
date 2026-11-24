@@ -998,6 +998,9 @@ WHERE p."ET_timestamp" > now() - interval '1 day';
 * The sidebar lists each source with its columns: click a name to insert it,
   ▶ to see its first 100 rows. The physical table (`eyetable_raw.parts__data`)
   works too.
+* Drag the table list's right edge to make it wider when long names are cut
+  off. Double-click the edge to fit the longest name, or focus it and use the
+  arrow keys. The width is remembered on this browser.
 * **Run** or **Ctrl+Enter** (⌘↩ on a Mac) runs the query; if text is highlighted, only the
   selection runs. Results show up to 100 / 1,000 / 10,000 rows and can be
   downloaded as CSV. Drag the panel's top edge to resize it, or collapse it.
