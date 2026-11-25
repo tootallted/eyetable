@@ -263,6 +263,18 @@ class DeployIn(BaseModel):
     sql: str = Field(max_length=200_000)
 
 
+class DestinationIn(BaseModel):
+    name: str = Field(max_length=40)
+    connection: str = Field(default="", max_length=4000)  # blank on a change: keep the stored one
+    schema_: str | None = Field(default=None, max_length=63, alias="schema")
+
+
+class DestinationTestIn(BaseModel):
+    id: str | None = Field(default=None, max_length=40)
+    connection: str = Field(default="", max_length=4000)
+    schema_: str | None = Field(default=None, max_length=63, alias="schema")
+
+
 def _json_safe(value: Any) -> Any:
     if isinstance(value, (bytes, bytearray, memoryview)):
         return bytes(value).hex()
@@ -447,6 +459,7 @@ def create_app(
             "updated_at": src.updated_at,
             "last_loaded_at": store.last_loaded(src.name),
             "datasets": len(datasets),
+            "destination": (src.config or {}).get("destination") or "eyetable",  # where its data loads (destinations.py)
         }
         if src.type == "dbtable":
             tables = db_source_tables(src, datasets)
@@ -763,6 +776,42 @@ def create_app(
             "limit": body.limit,
             "elapsed_ms": result.elapsed_ms,
         })
+
+    # -- destinations: the databases sources load into (see destinations.py) --------
+
+    from eyetable.destinations import Destinations, DestinationError
+
+    dests = Destinations(store, engine.secret_key)
+
+    def dest_call(fn: Callable[[], Any]) -> Any:
+        try:
+            return jsonable_encoder(fn())
+        except DestinationError as exc:
+            raise HTTPException(exc.status, str(exc)) from None
+
+    @app.get("/api/destinations", dependencies=auth)
+    def list_destinations() -> list[dict[str, Any]]:
+        """Every destination (eyetable's own first), with the sources routed to each."""
+        return dest_call(dests.list)
+
+    @app.post("/api/destinations/test", dependencies=auth)
+    def test_destination(body: DestinationTestIn) -> dict[str, Any]:
+        """Connect to a destination (saved, or a connection string not saved yet) and report what's there."""
+        return dest_call(lambda: dests.test(body.id, body.connection, body.schema_))
+
+    @app.post("/api/destinations", dependencies=auth)
+    def add_destination(body: DestinationIn) -> dict[str, Any]:
+        if not body.connection.strip():
+            raise HTTPException(400, "paste the destination's connection string")
+        return dest_call(lambda: dests.add(body.name, body.connection, body.schema_))
+
+    @app.put("/api/destinations/{dest_id}", dependencies=auth)
+    def update_destination(dest_id: str, body: DestinationIn) -> dict[str, Any]:
+        return dest_call(lambda: dests.update(dest_id, body.name, body.connection, body.schema_))
+
+    @app.delete("/api/destinations/{dest_id}", dependencies=auth)
+    def remove_destination(dest_id: str) -> dict[str, Any]:
+        return dest_call(lambda: {"removed": dests.remove(dest_id)})
 
     # -- views and procedures saved from the query window (see authoring.py) --------
 

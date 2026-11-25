@@ -897,6 +897,54 @@ opens a choice under it:
 API: `PUT /api/sources/<name>/tags`, `GET /api/tags`,
 `POST /api/tags/<tag>/run` (`{"incremental": true}` for an incremental run).
 
+### Destinations
+
+A **destination** is a database a source's data can be loaded into. Every
+source loads into exactly one. The built-in destination, **eyetable**, is
+eyetable's own Postgres database (`EYETABLE_DATABASE_URL`, data schema
+`eyetable_raw`). Everything has loaded there so far, and it's where a source
+goes unless it names another.
+
+The **Destinations** card lists each destination with:
+
+* its kind (SQL Server, Postgres)
+* its server and database
+* the schema its tables go into
+* the sources routed to it
+
+**Add destination** takes a name, a connection string and a schema.
+Connection strings come in the same forms as in Load data: ODBC for SQL Server,
+JDBC `sqlserver://`, or a URL such as `postgresql://…`.
+
+* **Use the SQL Server on this PC** fills in a connection to the local default
+  instance with Windows authentication:
+
+  ```
+  Driver={ODBC Driver 17 for SQL Server};Server=localhost;Database=eyetable;Trusted_Connection=yes;Encrypt=no;
+  ```
+
+  The EyetableApi service runs as your Windows account, so it signs in to SQL
+  Server as you.
+* **The schema** defaults to `dbo` on SQL Server and `public` on Postgres.
+* **A password** in the string is kept encrypted (`EYETABLE_SECRET_KEY`), like
+  database sources' passwords, and never shown again. When you edit a
+  destination, leave the connection string empty to keep the stored one.
+
+**Test** connects without changing anything. It reports the server's version,
+the database, the login, and whether eyetable may create tables in the schema.
+If the database doesn't exist yet on that server, the test says so.
+
+You can rename a destination, and its sources follow. A destination that has
+sources routed to it can't be removed, and neither can the built-in one.
+
+The **Destination** column in Sources shows where each source's data goes.
+Point at it to see that destination's database. Choosing a source's
+destination, and loading into SQL Server, are the next step: for now every
+source loads into **eyetable**.
+
+API: `GET/POST /api/destinations`, `PUT/DELETE /api/destinations/<id>`,
+`POST /api/destinations/test` (`{"id": …}` or `{"connection": …, "schema": …}`).
+
 ### Groups and schedules
 
 A **group** is a named set of sources that load together. In the **Groups**

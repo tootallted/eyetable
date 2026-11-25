@@ -279,7 +279,10 @@ def friendly(exc: Exception) -> str:
             parts.append(part)
     text = ". ".join(parts) or type(exc).__name__
     lowered = text.lower()
-    if "client with ip address" in lowered and "not allowed" in lowered:
+    if "cannot open database" in lowered:
+        text = re.sub(r"^Login failed for user [^.]*\.\s*", "", text)
+        text += ". The database doesn't exist on that server yet, or this login has no access to it."
+    elif "client with ip address" in lowered and "not allowed" in lowered:
         text += ". Add this IP to the server's firewall rules (in Azure: the SQL server's Networking page)."
     elif "login failed" in lowered and "invalid uri" not in lowered:
         text += ". Check the user name (Uid) and password (Pwd), or which account signed in with Microsoft."

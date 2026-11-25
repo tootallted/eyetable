@@ -304,6 +304,17 @@ class CoreStore:
             sa.Column("connected_at", UTCDateTime(), nullable=False),
             sa.Column("last_used_at", UTCDateTime()),
         )
+        # The databases sources can load into besides eyetable's own (see destinations.py); the
+        # connection config keeps any password encrypted.
+        self.destinations = sa.Table(
+            "destinations",
+            self.metadata,
+            sa.Column("id", sa.String(40), primary_key=True),
+            sa.Column("config", JSONType, nullable=False),
+            sa.Column("schema_name", sa.String(63), nullable=False),
+            sa.Column("created_at", UTCDateTime(), nullable=False),
+            sa.Column("updated_at", UTCDateTime(), nullable=False),
+        )
         # One row at most: the Microsoft Entra sign-ins database connections use
         # (MSAL's token cache, encrypted; see entra.py).
         self.entra_cache = sa.Table(
@@ -685,6 +696,30 @@ class CoreStore:
                 .values(status="failed", finished_at=_now())
             )
             return result.rowcount
+
+    # -- destinations ----------------------------------------------------------
+
+    def list_destinations(self) -> list[Any]:
+        with self.db.connect() as conn:
+            return conn.execute(sa.select(self.destinations).order_by(self.destinations.c.id)).all()
+
+    def get_destination(self, dest_id: str) -> Any:
+        with self.db.connect() as conn:
+            return conn.execute(sa.select(self.destinations).where(self.destinations.c.id == dest_id)).first()
+
+    def save_destination(self, dest_id: str, config: dict[str, Any], schema: str, replaces: str | None = None) -> None:
+        """Add a destination, or change one (`replaces`: its current id, when it's renamed)."""
+        now = _now()
+        with self.db.begin() as conn:
+            old = conn.execute(sa.select(self.destinations.c.created_at).where(
+                self.destinations.c.id == (replaces or dest_id))).scalar()
+            conn.execute(sa.delete(self.destinations).where(self.destinations.c.id.in_({dest_id, replaces or dest_id})))
+            conn.execute(sa.insert(self.destinations).values(id=dest_id, config=config, schema_name=schema,
+                                                             created_at=old or now, updated_at=now))
+
+    def delete_destination(self, dest_id: str) -> None:
+        with self.db.begin() as conn:
+            conn.execute(sa.delete(self.destinations).where(self.destinations.c.id == dest_id))
 
     # -- Google connection ---------------------------------------------------
 

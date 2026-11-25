@@ -478,6 +478,12 @@
     .sources-table thead.sf th:empty { display: none; }
     .sources-table thead.sf .sf-filter { width: 150px; text-align: left; }
   }
+  .tag.dest { font-family: var(--mono); }
+  .tag.dest.other { background: var(--accent-soft); color: var(--accent); border-color: transparent; }
+  .dest-table td { white-space: normal; vertical-align: top; }
+  .dest-table .srcs { display: flex; flex-wrap: wrap; gap: 4px; max-width: 360px; }
+  .dest-table .actions { display: flex; gap: 6px; justify-content: flex-end; }
+  .dest-table .test-ok { color: var(--ok); font-size: 12.5px; } .dest-table .test-bad { color: var(--err); font-size: 12.5px; }
   .tag { display: inline-block; padding: 1px 8px; border-radius: 999px; background: var(--surface-2); border: 1px solid var(--border); font-size: 12px; color: var(--muted); }
   .empty { padding: 28px 16px; text-align: center; color: var(--muted); }
 
@@ -1012,6 +1018,45 @@
     </div>
   </section>
 
+  <section class="card" data-fold="destinations" aria-labelledby="dest-title">
+    <div class="card-head">
+      <h2 id="dest-title"><button class="fold" type="button" aria-expanded="true" aria-controls="dest-body"><span class="tri"></span>Destinations</button></h2>
+      <button class="btn small" id="destination-add" type="button" disabled>Add destination</button>
+    </div>
+    <div class="card-body" id="dest-body">
+      <p class="hint">The databases a source's data can be loaded into. Every source loads into one destination; eyetable's own
+        database is the built-in one, where everything has loaded so far. Add others here (SQL Server, Postgres), check each
+        one connects, and see which sources are routed to it.</p>
+      <div id="dest-msg" role="status"></div>
+      <form class="editor" id="dest-editor" hidden>
+        <h3 id="de-title">Add a destination</h3>
+        <label class="field">Name
+          <input type="text" id="de-name" maxlength="40" autocomplete="off" spellcheck="false" placeholder="e.g. local_sql">
+          <span class="note">Lowercase letters, digits and _, starting with a letter.</span>
+        </label>
+        <label class="field">Connection string
+          <textarea id="de-conn" rows="3" spellcheck="false" autocomplete="off"
+            placeholder="Driver={ODBC Driver 17 for SQL Server};Server=localhost;Database=eyetable;Trusted_Connection=yes;Encrypt=no;"></textarea>
+          <span class="note" id="de-conn-note">ODBC (SQL Server), JDBC sqlserver://, or a URL such as postgresql://user:password@host:5432/db.
+            A password is kept encrypted, never shown again. <button type="button" class="link" id="de-local">Use the SQL Server on this PC</button></span>
+        </label>
+        <label class="field">Schema
+          <input type="text" id="de-schema" maxlength="63" autocomplete="off" spellcheck="false" placeholder="dbo">
+          <span class="note">Where its tables go: dbo by default on SQL Server, public on Postgres.</span>
+        </label>
+        <div class="actions">
+          <button class="btn primary" type="submit" id="de-save">Save destination</button>
+          <button class="btn" type="button" id="de-test">Test connection</button>
+          <button class="btn" type="button" id="de-cancel">Cancel</button>
+          <span class="spacer"></span>
+          <button class="btn danger" type="button" id="de-remove" hidden>Remove</button>
+        </div>
+        <div id="de-msg" role="status" aria-live="polite"></div>
+      </form>
+      <div class="table-wrap" id="dest-list"><div class="empty">Connect to see your destinations.</div></div>
+    </div>
+  </section>
+
   <section class="card" id="queue-card" data-fold="queue" hidden aria-labelledby="queue-title">
     <div class="card-head">
       <h2 id="queue-title"><button class="fold" type="button" aria-expanded="true" aria-controls="queue-body"><span class="tri"></span>Load queue</button></h2>
@@ -1426,6 +1471,7 @@
         renderDbControls();
         loadSchema();
         loadGroups();
+        loadDestList();
         loadGoogleConnection();
         loadQueue();
         if (groupsState.editing) renderEditor();
@@ -1638,6 +1684,7 @@
       { key: 'tags', label: 'Tags', value: function (s) { return (s.tags || []).join(' '); },
         text: function (s) { return (s.tags || []).map(function (t) { return '#' + t; }).join(' '); } },
       { key: 'type', label: 'Type', value: function (s) { return typeLabel(s.type); } },
+      { key: 'dest', label: 'Destination', value: function (s) { return s.destination || 'eyetable'; } },
       { key: 'table', label: 'Table', value: function (s) { return s.tables ? s.tables.map(function (t) { return t.name; }).join(', ') : s.table || ''; },
         text: function (s) { return s.tables ? s.tables.map(function (t) { return t.schema + '.' + t.name + ' ' + fullTable(t.table); }).join(' ') : fullTable(s.table || ''); } },
       { key: 'rows', label: 'Rows', num: true, numeric: true, firstDir: -1,
@@ -1758,7 +1805,7 @@
     function dbTableEntry(s, t) {
       return { name: t.name, source: s.name, tags: s.tags, type: s.type, table: t.table, schema: t.schema, hidden: !!t.hidden,
         rows: t.rows === undefined ? null : t.rows, last_upload: null, last_loaded_at: t.last_loaded_at, updated_at: s.updated_at,
-        connection: s.connection, _src: s, _t: t };
+        connection: s.connection, destination: s.destination, _src: s, _t: t };
     }
 
     function tableEntryRow(e, member) {
@@ -1774,6 +1821,7 @@
         flagsCell(t),
         el('td', { 'data-label': 'Tags' }, [tagsCell(s)]),
         el('td', { 'data-label': 'Type' }, [el('span', { class: 'tag', text: typeLabel(s.type) })]),
+        destCell(s.destination),
         el('td', { class: 'mono wrap', 'data-label': 'Loaded into' }, breakable(fullTable(t.table))),
         el('td', { class: 'num', 'data-label': 'Rows', text: t.rows === null || t.rows === undefined ? '\u2014' : fmtInt(t.rows) }),
         el('td', { 'data-label': 'Columns', text: t.columns ? plural(t.columns, 'column') : '\u2014' }),
@@ -1823,6 +1871,10 @@
         el('td', { class: 'flags-col' }),
         el('td', { 'data-label': '' }),
         el('td', { 'data-label': 'Type' }, types.map(function (t) { return el('span', { class: 'tag', text: t }); })),
+        (function () {  // the destination its members load into (several, if they differ)
+          var ds = members.map(function (m) { return m.destination || 'eyetable'; }).filter(function (d, i, all) { return all.indexOf(d) === i; });
+          return el('td', { 'data-label': 'Destination' }, ds.map(function (d) { return destTag(d); }));
+        })(),
         el('td', { 'data-label': 'Holds', text: allTables ? plural(members.length, 'table')
           : plural(members.length, 'source') + (tables !== members.length ? ', ' + plural(tables, 'table') : '') }),
         el('td', { class: 'num', 'data-label': 'Rows', text: counted.length ? fmtInt(counted.reduce(function (n, m) { return n + m.rows; }, 0)) : '\u2014' }),
@@ -1852,6 +1904,7 @@
           flagsCell(s.tables ? (s.tables.length === 1 ? s.tables[0] : null) : s),
           el('td', { 'data-label': 'Tags' }, [tagsCell(s)]),
           el('td', { 'data-label': 'Type' }, [el('span', { class: 'tag', text: typeLabel(s.type) })]),
+          destCell(s.destination),
           s.tables ? tablesCell(s, open) : el('td', { class: 'mono wrap', 'data-label': 'Table' }, s.table ? breakable(fullTable(s.table)) : [s.datasets + ' dataset(s)']),
           el('td', { class: 'num', 'data-label': 'Rows', text: s.table ? fmtInt(s.rows) : '—' }),
           el('td', { class: 'wrap', 'data-label': 'Last file', title: s.file_set ? 'Every file matching ' + s.file_set.pattern + ' in ' + s.file_set.folder : '' },
@@ -2044,6 +2097,7 @@
         flagsCell(t),
         el('td', { 'data-label': '' }),
         el('td', { 'data-label': 'Type' }, [el('span', { class: 'tag', text: t.kind })]),
+        el('td'),
         el('td', { class: 'mono wrap', 'data-label': 'Loaded into' }, breakable(fullTable(t.table))),
         el('td', { class: 'num', 'data-label': 'Rows', text: t.rows === null || t.rows === undefined ? '\u2014' : fmtInt(t.rows) }),
         el('td', { 'data-label': 'Columns', text: t.columns ? plural(t.columns, 'column') : '' }),
@@ -4341,6 +4395,135 @@
     }
 
 
+
+    // -- destinations: the databases sources load into (API: /api/destinations) -------
+    var destState = { list: [], editing: null, tests: {} };
+    var LOCAL_SQL = 'Driver={ODBC Driver 17 for SQL Server};Server=localhost;Database=eyetable;Trusted_Connection=yes;Encrypt=no;';
+
+    function destDescribe(d) {
+      return d.kind + (d.server ? ' on ' + d.server : '') + (d.database ? ', database ' + d.database : '') + (d.schema ? ', schema ' + d.schema : '');
+    }
+
+    function destTag(name) {
+      var d = destState.list.filter(function (x) { return x.id === name; })[0];
+      return el('span', { class: 'tag dest' + (name !== 'eyetable' ? ' other' : ''), text: name,
+        title: d ? 'Loads into ' + destDescribe(d) : 'Loads into the destination ' + name });
+    }
+
+    function destCell(name) {
+      return el('td', { 'data-label': 'Destination' }, [destTag(name || 'eyetable')]);
+    }
+
+    function loadDestList() {
+      return api('/api/destinations').then(function (list) {
+        destState.list = list;
+        renderDestList();
+        renderSources();  // the Destination column's titles name each one's database
+      }, function (err) { clear($('dest-list')).appendChild(el('div', { class: 'empty', text: err.message })); });
+    }
+
+    function renderDestList() {
+      $('destination-add').disabled = !state.connected;
+      var wrap = clear($('dest-list'));
+      if (!destState.list.length) { wrap.appendChild(el('div', { class: 'empty', text: 'Connect to see your destinations.' })); return; }
+      var head = el('tr', null, ['Destination', 'Database', 'Schema', 'Sources routed here', ''].map(function (h) { return el('th', { text: h, scope: 'col' }); }));
+      var body = destState.list.map(function (d) {
+        var test = destState.tests[d.id];
+        var testBtn = el('button', { type: 'button', class: 'btn small', text: 'Test' });
+        testBtn.addEventListener('click', function () { testDest(d.id, testBtn); });
+        var actions = [testBtn];
+        if (!d.builtin) {
+          var edit = el('button', { type: 'button', class: 'btn small', text: 'Edit' });
+          edit.addEventListener('click', function () { openDestEditor(d); });
+          actions.push(edit);
+        }
+        return el('tr', null, [
+          el('td', null, [el('strong', { class: 'mono', text: d.name }),
+            el('div', { class: 'muted', style: 'font-size:12px', text: d.builtin ? 'built in: eyetable\u2019s own database' : d.kind })]),
+          el('td', null, [el('div', { text: (d.builtin ? d.kind + ' \u00b7 ' : '') + (d.server || '') }),
+            el('div', { class: 'muted mono', style: 'font-size:12px', text: d.database || '' })]),
+          el('td', { class: 'mono', text: d.schema || '\u2014' }),
+          el('td', null, [d.sources.length ? el('div', { class: 'srcs' }, d.sources.map(function (n) { return el('span', { class: 'tag', text: n }); }))
+            : el('span', { class: 'muted', text: 'None yet' })]),
+          el('td', null, [el('div', { class: 'actions' }, actions),
+            test ? el('div', { class: test.ok ? 'test-ok' : 'test-bad', text: (test.ok ? '\u2714 ' : '\u2716 ') + test.message, title: test.version || '' }) : null])
+        ]);
+      });
+      wrap.appendChild(el('table', { class: 'dest-table' }, [el('thead', null, [head]), el('tbody', null, body)]));
+    }
+
+    function testDest(id, btn) {
+      btn.disabled = true;
+      btn.textContent = 'Testing\u2026';
+      api('/api/destinations/test', { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify({ id: id }) })
+        .then(function (r) { destState.tests[id] = r; }, function (err) { destState.tests[id] = { ok: false, message: err.message }; })
+        .then(renderDestList);
+    }
+
+    function openDestEditor(d) {
+      unfold('destinations');
+      destState.editing = d ? d.id : null;
+      $('de-title').textContent = d ? 'Edit ' + d.name : 'Add a destination';
+      $('de-name').value = d ? d.name : '';
+      $('de-conn').value = '';
+      $('de-conn').placeholder = d ? 'Leave empty to keep the stored connection (' + destDescribe(d) + ')' : LOCAL_SQL;
+      $('de-schema').value = d ? d.schema : '';
+      $('de-remove').hidden = !d;
+      clear($('de-msg'));
+      $('dest-editor').hidden = false;
+      $('de-name').focus();
+    }
+
+    function closeDestEditor() { destState.editing = null; $('dest-editor').hidden = true; }
+
+    function destBody() {
+      return { name: $('de-name').value.trim().toLowerCase(), connection: $('de-conn').value.trim(), schema: $('de-schema').value.trim() || null };
+    }
+
+    $('destination-add').addEventListener('click', function () { openDestEditor(null); });
+    $('de-cancel').addEventListener('click', closeDestEditor);
+    $('de-local').addEventListener('click', function () {
+      $('de-conn').value = LOCAL_SQL;
+      if (!$('de-name').value.trim()) $('de-name').value = 'local_sql';
+      if (!$('de-schema').value.trim()) $('de-schema').value = 'dbo';
+      $('de-conn').focus();
+    });
+    $('de-test').addEventListener('click', function () {
+      var b = destBody(), msg = clear($('de-msg')), btn = $('de-test');
+      if (!b.connection && !destState.editing) { msg.appendChild(banner('err', 'Paste a connection string first.')); return; }
+      btn.disabled = true;
+      msg.appendChild(el('div', { class: 'muted', text: 'Connecting\u2026' }));
+      api('/api/destinations/test', { method: 'POST', headers: JSON_HEADERS,
+        body: JSON.stringify({ id: destState.editing, connection: b.connection, schema: b.schema }) })
+        .then(function (r) {
+          clear(msg).appendChild(banner(r.ok ? 'ok' : 'err', (r.version ? r.version + '. ' : '') + r.message));
+        }, function (err) { clear(msg).appendChild(banner('err', err.message)); })
+        .then(function () { btn.disabled = false; });
+    });
+    $('dest-editor').addEventListener('submit', function (ev) {
+      ev.preventDefault();
+      var b = destBody(), msg = clear($('de-msg')), editing = destState.editing;
+      if (!b.name) { msg.appendChild(banner('err', 'Give the destination a name.')); return; }
+      if (!editing && !b.connection) { msg.appendChild(banner('err', 'Paste its connection string.')); return; }
+      $('de-save').disabled = true;
+      api(editing ? '/api/destinations/' + encodeURIComponent(editing) : '/api/destinations', {
+        method: editing ? 'PUT' : 'POST', headers: JSON_HEADERS, body: JSON.stringify(b)
+      }).then(function (d) {
+        closeDestEditor();
+        clear($('dest-msg')).appendChild(banner('ok', 'Saved ' + d.name + ': ' + destDescribe(d) + '. Test it to check it connects.'));
+        return loadDestList();
+      }, function (err) { msg.appendChild(banner('err', err.message)); })
+        .then(function () { $('de-save').disabled = false; });
+    });
+    $('de-remove').addEventListener('click', function () {
+      var id = destState.editing;
+      if (!id || !confirm('Remove the destination ' + id + '? Nothing in its database is changed.')) return;
+      api('/api/destinations/' + encodeURIComponent(id), { method: 'DELETE' }).then(function () {
+        closeDestEditor();
+        clear($('dest-msg')).appendChild(banner('ok', 'Removed ' + id + '.'));
+        return loadDestList();
+      }, function (err) { clear($('de-msg')).appendChild(banner('err', err.message)); });
+    });
 
     // -- groups ---------------------------------------------------------------
     var DAY_SHORT = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
