@@ -105,6 +105,8 @@ class Engine:
         self.store = store
         self._factory = connector_factory
         self._environ = environ
+        if self.secret_key and not store.secret_key:
+            store.secret_key = self.secret_key  # to open destinations' stored connections
         self._scan_keys = scan_keys
         self._scans: ThreadPoolExecutor | None = None
 

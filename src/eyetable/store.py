@@ -27,6 +27,7 @@ from typing import Any
 
 import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.mssql import DATETIME2 as MSSQL_DATETIME2
 from sqlalchemy.schema import CreateSchema
 
 from eyetable.identifiers import column_name
@@ -85,19 +86,20 @@ class UTCDateTime(sa.TypeDecorator):
 
 
 def sa_type(kind: str | None) -> sa.types.TypeEngine:
+    # On SQL Server: text is NVARCHAR(MAX) (any language), numbers keep their decimals, times DATETIME2
     return {
         "bigint": sa.BigInteger(),
         "double": sa.Double(),
-        "numeric": sa.Numeric(),
+        "numeric": sa.Numeric().with_variant(sa.Numeric(38, 10), "mssql"),
         "boolean": sa.Boolean(),
-        "timestamp": sa.DateTime(timezone=False),
+        "timestamp": sa.DateTime(timezone=False).with_variant(MSSQL_DATETIME2(), "mssql"),
         "timestamptz": UTCDateTime(),
         "date": sa.Date(),
         "time": sa.Time(),
         "json": JSONType,
         "binary": sa.LargeBinary(),
-        "varchar": sa.String(),
-    }.get(kind or "text", sa.Text())
+        "varchar": sa.String().with_variant(sa.UnicodeText(), "mssql"),
+    }.get(kind or "text", sa.Text().with_variant(sa.UnicodeText(), "mssql"))
 
 
 def kind_of(type_: sa.types.TypeEngine) -> str:
@@ -210,6 +212,20 @@ class Run:
     error: str | None
 
 
+def _routed(fn: Callable) -> Callable:
+    """A data operation on a table: run by the store that holds it (see CoreStore.data_for)."""
+    import functools
+
+    @functools.wraps(fn)
+    def run(self, table, *args, **kwargs):
+        target = self.data_for(table)
+        if target is not self:
+            return getattr(target, fn.__name__)(table, *args, **kwargs)
+        return fn(self, table, *args, **kwargs)
+
+    return run
+
+
 class CoreStore:
     def __init__(self, url: str, meta_schema: str = "eyetable", data_schema: str = "eyetable_raw"):
         self.db = sa.create_engine(url)
@@ -219,6 +235,9 @@ class CoreStore:
         self.schema_hooks: list = []  # called with each schema ensure_schema creates (QueryRunner shares it)
         self._merges = threading.local()  # the last history merge's counts, per thread (take_merge_stats)
         self._schemas_made: set[str] = set()
+        self.secret_key: str | None = None  # set by the Engine: opens destinations' stored connections
+        self._routes: dict[str, str] | None = None  # table ref -> destination, for sources routed elsewhere
+        self._dest_stores: dict[str, tuple[Any, "CoreStore"]] = {}
 
         self.metadata = sa.MetaData(schema=self.meta_schema)
         self.sources = sa.Table(
@@ -417,6 +436,7 @@ class CoreStore:
     # -- sources -----------------------------------------------------------
 
     def save_source(self, name: str, type_: str, config: dict[str, Any]) -> None:
+        self._routes = None
         now = _now()
         with self.db.begin() as conn:
             existing = conn.execute(
@@ -449,6 +469,7 @@ class CoreStore:
         return [Source(**r._mapping) for r in rows]
 
     def remove_source(self, name: str) -> None:
+        self._routes = None
         """Forget a source and its catalog. Tables already ingested are kept."""
         self.get_source(name)
         with self.db.begin() as conn:
@@ -709,6 +730,8 @@ class CoreStore:
 
     def save_destination(self, dest_id: str, config: dict[str, Any], schema: str, replaces: str | None = None) -> None:
         """Add a destination, or change one (`replaces`: its current id, when it's renamed)."""
+        self._routes = None
+        self._dest_stores.pop(replaces or dest_id, None)
         now = _now()
         with self.db.begin() as conn:
             old = conn.execute(sa.select(self.destinations.c.created_at).where(
@@ -718,6 +741,8 @@ class CoreStore:
                                                              created_at=old or now, updated_at=now))
 
     def delete_destination(self, dest_id: str) -> None:
+        self._routes = None
+        self._dest_stores.pop(dest_id, None)
         with self.db.begin() as conn:
             conn.execute(sa.delete(self.destinations).where(self.destinations.c.id == dest_id))
 
@@ -817,9 +842,11 @@ class CoreStore:
 
     def drop_table(self, table: str) -> None:
         """Delete a table of loaded data (a database source's table that was unchosen), and its view."""
-        self.drop_current_view(table)
+        holder = self.data_for(table)
+        holder.drop_current_view(table)
+        with holder.db.begin() as conn:
+            conn.execute(sa.text(f"DROP TABLE IF EXISTS {holder.qualified(table)}"))
         with self.db.begin() as conn:
-            conn.execute(sa.text(f"DROP TABLE IF EXISTS {self.qualified(table)}"))
             conn.execute(sa.delete(self.table_keys).where(self.table_keys.c.table_name == table))
             conn.execute(sa.delete(self.table_increments).where(self.table_increments.c.table_name == table))
             conn.execute(sa.delete(self.hidden_tables).where(self.hidden_tables.c.table_name == table))
@@ -851,6 +878,7 @@ class CoreStore:
     # -- renaming a source ---------------------------------------------------------
 
     def rename_source(self, old: str, new: str) -> None:
+        self._routes = None
         """Rename a source in eyetable's records: its config, catalog, runs, files, tags and groups.
         (Its tables are Engine.rename's job.)"""
         if self.source_exists(new):
@@ -927,6 +955,7 @@ class CoreStore:
                      f"{'those views' if len(deps) != 1 else 'the view'} still give{'s' if len(deps) == 1 else ''} what you expect")
         self._warn(text)
 
+    @_routed
     def dependent_views(self, table: str) -> list[str]:
         """Views built on the table or on its <table>_current view (other than that view itself), e.g. a
         view saved from the query window. While there are any, loads change the table in place instead of
@@ -946,6 +975,7 @@ class CoreStore:
                 {"oids": oids}).scalars().all()
         return list(rows)
 
+    @_routed
     def current_rows(self, ref: str) -> str:
         """A table as SQL to select from: a history table's current versions only, else the table."""
         if self.has_history(ref) and ACTIVE_COLUMN in {c["name"] for c in self.columns(ref)}:
@@ -1002,7 +1032,7 @@ class CoreStore:
         meta = {ID_COLUMN, *META_COLUMNS, *HISTORY_COLUMNS}
         if not self.table_exists(table):  # the first load: every row is a first, current version
             with db.begin() as conn:
-                conn.execute(sa.text(f"ALTER TABLE {qi} RENAME TO {q(name)}"))
+                self._rename(conn, incoming, name)
                 self._add_history_columns(conn, table, now)
             return {"new": rows, "changed": 0, "unchanged": 0}
         tgt_cols = {c["name"]: c["type"] for c in self.columns(table)}
@@ -1011,21 +1041,19 @@ class CoreStore:
                 self._add_history_columns(conn, table, now)
             for c, typ in inc_cols.items():  # a column first seen in this load
                 if c not in tgt_cols and c not in meta:
-                    conn.execute(sa.text(f"ALTER TABLE {self.qualified(table)} ADD COLUMN {q(c)} "
-                                         f"{typ.compile(dialect=db.dialect)}"))
+                    self._add_column(conn, self.qualified(table), c, typ.compile(dialect=db.dialect))
                     tgt_cols[c] = typ
             data = [c for c in tgt_cols if c not in meta]
             self._warn_missing(table, [c for c in data if c not in inc_cols and c not in key], self.dependent_views(table))
             t, i = q(name), "i"
-            text = "TEXT"
-            distinct = "IS DISTINCT FROM" if db.dialect.name == "postgresql" else "IS NOT"
+            text = self._text_sql
 
             def as_text(side: str, col: str) -> str:
                 return f"CAST({side}.{q(col)} AS {text})"
 
             same_key = " AND ".join(f"{as_text(i, k)} = {as_text('{T}', k)}" for k in key)
             changed = " OR ".join(
-                f"{as_text(i, c) if c in inc_cols else 'NULL'} {distinct} {as_text('{T}', c)}"
+                self._distinct(as_text(i, c) if c in inc_cols else f"CAST(NULL AS {text})", as_text("{T}", c))
                 for c in data if c not in key) or "1 = 0"
             closed = conn.execute(sa.text(
                 f"UPDATE {self.qualified(table)} SET {q(ACTIVE_COLUMN)} = 0, {q(TO_COLUMN)} = :now "
@@ -1051,9 +1079,9 @@ class CoreStore:
 
     def _add_history_columns(self, conn: sa.Connection, table: str, now: dt.datetime) -> None:
         q = self.db.dialect.identifier_preparer.quote
-        stamp = sa.DateTime().compile(dialect=self.db.dialect)
+        stamp = sa_type("timestamp").compile(dialect=self.db.dialect)
         for col, ddl in ((ACTIVE_COLUMN, "INTEGER"), (FROM_COLUMN, stamp), (TO_COLUMN, stamp)):
-            conn.execute(sa.text(f"ALTER TABLE {self.qualified(table)} ADD COLUMN {q(col)} {ddl}"))
+            self._add_column(conn, self.qualified(table), col, ddl)
         conn.execute(sa.text(f"UPDATE {self.qualified(table)} SET {q(ACTIVE_COLUMN)} = 1, {q(FROM_COLUMN)} = :now, "
                              f"{q(TO_COLUMN)} = :forever"), {"now": now, "forever": FOREVER})
 
@@ -1089,6 +1117,7 @@ class CoreStore:
             if column:
                 conn.execute(sa.insert(self.table_increments).values(table_name=table, column_name=column, set_at=_now()))
 
+    @_routed
     def max_value(self, table: str, column: str, type_: sa.types.TypeEngine | None = None) -> Any:
         """The largest value of a column, read as its own type (a datetime for a time column)."""
         if type_ is not None and isinstance(type_, sa.DateTime):
@@ -1099,6 +1128,7 @@ class CoreStore:
         with self.db.connect() as conn:
             return conn.execute(query).scalar()
 
+    @_routed
     def replace_older(self, table: str, key: list[str], run_id: int) -> int:
         """After an incremental load, delete each row that a row of run `run_id` with the same key replaces."""
         prep = self.db.dialect.identifier_preparer
@@ -1110,6 +1140,7 @@ class CoreStore:
                 f"ON n.{run} = :run AND n.{idc} > o.{idc} AND {same})"), {"run": run_id})
         return done.rowcount or 0
 
+    @_routed
     def replace_statements(self, table: str, batches: Iterable[list[dict[str, Any]]], run_id: int, origin: Any,
                            labels: Callable[[], list[str]]) -> tuple[int, int]:
         """An incremental load of a statement set: read the rows into <table>__incoming, then in one
@@ -1151,15 +1182,14 @@ class CoreStore:
                 if c in meta:
                     continue
                 if c not in tgt_cols:  # a column first seen in this load
-                    conn.execute(sa.text(f"ALTER TABLE {qt} ADD COLUMN {q(c)} {typ.compile(dialect=db.dialect)}"))
+                    self._add_column(conn, qt, c, typ.compile(dialect=db.dialect))
                     tgt_cols[c] = typ
                     continue
                 current, new = kind_of(tgt_cols[c]), kind_of(typ)
                 widened = merge_kinds(current, new)
                 # views on the table block changing a column's type: the values are cast to it instead
                 if widened != current and db.dialect.name != "sqlite" and not deps:  # e.g. whole numbers that now have decimals
-                    ddl = sa_type(widened).compile(dialect=db.dialect)
-                    conn.execute(sa.text(f"ALTER TABLE {qt} ALTER COLUMN {q(c)} TYPE {ddl} USING {q(c)}::{ddl}"))
+                    self._alter_type(conn, qt, c, sa_type(widened).compile(dialect=db.dialect))
                     tgt_cols[c] = sa_type(widened)
             deleted = 0
             if labels:
@@ -1177,6 +1207,7 @@ class CoreStore:
                                  f"SELECT {', '.join(value(c) for c in cols)} FROM {qi} ORDER BY {q(ID_COLUMN)}"))
         return deleted
 
+    @_routed
     def delete_run_rows(self, table: str, run_id: int) -> None:
         """Take out the rows a failed incremental load had already added."""
         if not self.table_exists(table):
@@ -1224,7 +1255,11 @@ class CoreStore:
         if not schema or schema in self._schemas_made or self.db.dialect.name == "sqlite":
             return
         with self.db.begin() as conn:
-            conn.execute(CreateSchema(schema, if_not_exists=True))
+            if self.mssql:
+                quoted = self.db.dialect.identifier_preparer.quote_schema(schema).replace("'", "''")
+                conn.execute(sa.text(f"IF SCHEMA_ID(:s) IS NULL EXEC('CREATE SCHEMA {quoted}')"), {"s": schema})
+            else:
+                conn.execute(CreateSchema(schema, if_not_exists=True))
         self._schemas_made.add(schema)
         for hook in self.schema_hooks:
             try:
@@ -1252,14 +1287,17 @@ class CoreStore:
         existing = set(sa.inspect(self.db).get_schema_names())
         return sorted(wanted & existing)
 
+    @_routed
     def columns(self, ref: str) -> list[dict[str, Any]]:
         schema, name = self.split(ref)
         return sa.inspect(self.db).get_columns(name, schema=schema)
 
+    @_routed
     def table_exists(self, table: str) -> bool:
         schema, name = self.split(table)
         return sa.inspect(self.db).has_table(name, schema=schema)
 
+    @_routed
     def archive_table(self, ref: str, when: dt.datetime | None = None) -> str | None:
         """Keep a table out of the way under a dated name: eyetable_raw.ledger becomes
         eyetable_raw_archived.ledger_20261113_161034. Returns its new ref (None if there was no table)."""
@@ -1272,15 +1310,107 @@ class CoreStore:
         prep = self.db.dialect.identifier_preparer
         if self.db.dialect.name == "sqlite" or not schema:  # no schemas: a dated name beside it
             with self.db.begin() as conn:
-                conn.execute(sa.text(f"ALTER TABLE {self.qualified(ref)} RENAME TO {prep.quote(new_name)}"))
+                self._rename(conn, ref, new_name)
             return new_name
         archive = f"{schema}_archived"[:63]
         self.ensure_schema(archive)
         with self.db.begin() as conn:
-            conn.execute(sa.text(f"ALTER TABLE {self.qualified(ref)} RENAME TO {prep.quote(new_name)}"))
-            conn.execute(sa.text(f"ALTER TABLE {prep.quote_schema(schema)}.{prep.quote(new_name)} "
-                                 f"SET SCHEMA {prep.quote_schema(archive)}"))
+            self._rename(conn, ref, new_name)
+            moved = f"{prep.quote_schema(schema)}.{prep.quote(new_name)}"
+            if self.mssql:
+                conn.execute(sa.text(f"ALTER SCHEMA {prep.quote_schema(archive)} TRANSFER {moved}"))
+            else:
+                conn.execute(sa.text(f"ALTER TABLE {moved} SET SCHEMA {prep.quote_schema(archive)}"))
         return f"{archive}.{new_name}"
+
+    # -- SQL that differs between databases --------------------------------------------
+
+    @property
+    def mssql(self) -> bool:
+        return self.db.dialect.name == "mssql"
+
+    def _add_column(self, conn: sa.Connection, qualified: str, col: str, ddl: str) -> None:
+        q = self.db.dialect.identifier_preparer.quote
+        conn.execute(sa.text(f"ALTER TABLE {qualified} {'ADD' if self.mssql else 'ADD COLUMN'} {q(col)} {ddl}"))
+
+    def _alter_type(self, conn: sa.Connection, qualified: str, col: str, ddl: str) -> None:
+        q = self.db.dialect.identifier_preparer.quote(col)
+        if self.mssql:
+            conn.execute(sa.text(f"ALTER TABLE {qualified} ALTER COLUMN {q} {ddl}"))
+        else:
+            conn.execute(sa.text(f"ALTER TABLE {qualified} ALTER COLUMN {q} TYPE {ddl} USING {q}::{ddl}"))
+
+    def _rename(self, conn: sa.Connection, ref: str, new_name: str) -> None:
+        """Rename a table in its schema."""
+        if self.mssql:
+            schema, name = self.split(ref)
+            conn.execute(sa.text("EXEC sp_rename :old, :new"), {"old": f"{schema}.{name}" if schema else name, "new": new_name})
+        else:
+            conn.execute(sa.text(f"ALTER TABLE {self.qualified(ref)} RENAME TO "
+                                 f"{self.db.dialect.identifier_preparer.quote(new_name)}"))
+
+    @property
+    def _text_sql(self) -> str:
+        return "NVARCHAR(MAX)" if self.mssql else "TEXT"
+
+    def _distinct(self, a: str, b: str) -> str:
+        """SQL that's true when a and b differ, NULL counting as a value."""
+        if self.db.dialect.name == "postgresql":
+            return f"{a} IS DISTINCT FROM {b}"
+        if self.db.dialect.name == "sqlite":
+            return f"{a} IS NOT {b}"
+        return f"({a} <> {b} OR ({a} IS NULL AND {b} IS NOT NULL) OR ({a} IS NOT NULL AND {b} IS NULL))"
+
+    # -- routing: tables whose source loads into another destination (destinations.py) --
+
+    def _route_map(self) -> dict[str, str]:
+        if self._routes is None:
+            from eyetable import targets
+
+            routes: dict[str, str] = {}
+            for src in self.list_sources():
+                dest = (src.config or {}).get("destination")
+                if dest and dest != "eyetable":
+                    try:
+                        for ref in targets.tables(src):
+                            routes[ref] = dest
+                    except Exception:
+                        continue
+            self._routes = routes
+        return self._routes
+
+    @staticmethod
+    def _base_table(table: str) -> str:
+        """The table a work table or view belongs to: parts__data__incoming__stg -> parts__data."""
+        for suffix in ("__stg", "__incoming", "__stg", CURRENT_VIEW_SUFFIX):
+            if table.endswith(suffix):
+                table = table[: -len(suffix)]
+        return table
+
+    def route_of(self, table: str) -> str | None:
+        """The destination a table loads into, when it isn't eyetable's own database."""
+        routes = self._route_map()
+        return routes.get(table) or routes.get(self._base_table(table))
+
+    def data_for(self, table: str) -> "CoreStore":
+        """The store that holds a table's data: this one, or one for the destination its source loads into."""
+        dest = self.route_of(table)
+        return self.destination_store(dest) if dest else self
+
+    def destination_store(self, dest_id: str) -> "CoreStore":
+        row = self.get_destination(dest_id)
+        if row is None:
+            raise ValueError(f"the destination {dest_id} no longer exists; route the source to another one")
+        cached = self._dest_stores.get(dest_id)
+        if cached and cached[0] == row.updated_at:
+            return cached[1]
+        from eyetable import dbconnect
+        from eyetable.credentials import decrypt_secrets
+
+        engine, _ = dbconnect.make_engine(decrypt_secrets(row.config, self.secret_key), fast=True)
+        store = DataStore(self, engine, row.schema_name, dest_id)
+        self._dest_stores[dest_id] = (row.updated_at, store)
+        return store
 
     # -- <table>_current views -----------------------------------------------------
 
@@ -1298,12 +1428,14 @@ class CoreStore:
             view = name[:63 - len(CURRENT_VIEW_SUFFIX)] + CURRENT_VIEW_SUFFIX
         return self.ref(schema, view)
 
+    @_routed
     def drop_current_view(self, table: str) -> None:
         if self.is_work_table(table):
             return
         with self.db.begin() as conn:
             conn.execute(sa.text(f"DROP VIEW IF EXISTS {self.qualified(self.current_view(table))}"))
 
+    @_routed
     def refresh_current_view(self, table: str) -> str | None:
         """(Re)make <table>_current: SELECT * FROM the table, WHERE "ET_isCurrent" = 1 for a history
         table. Returns the view's ref; None if there's no table, or a real table already has that name."""
@@ -1317,6 +1449,10 @@ class CoreStore:
         history = ACTIVE_COLUMN in {c["name"] for c in self.columns(table)}
         where = f" WHERE {q(ACTIVE_COLUMN)} = 1" if history else ""
         select = f"SELECT * FROM {self.qualified(table)}{where}"
+        if self.mssql:
+            with self.db.begin() as conn:
+                conn.execute(sa.text(f"CREATE OR ALTER VIEW {self.qualified(view)} AS {select}"))
+            return view
         if self.db.dialect.name == "postgresql" and vname in sa.inspect(self.db).get_view_names(schema=vschema):
             try:  # keeps views built on it: only adds the table's new columns at its end
                 with self.db.begin() as conn:
@@ -1354,6 +1490,7 @@ class CoreStore:
                 conn.execute(sa.delete(table).where(table.c.table_name == new))
                 conn.execute(sa.update(table).where(table.c.table_name == old).values(table_name=new))
 
+    @_routed
     def count_rows(self, table: str) -> int | None:
         if not self.table_exists(table):
             return None
@@ -1367,6 +1504,7 @@ class CoreStore:
             return f"{prep.quote_schema(schema)}.{prep.quote(name)}"
         return prep.quote(name)
 
+    @_routed
     def write(self, table: str, batches: Iterable[list[dict[str, Any]]], mode: str = "replace", run_id: int = 0,
               **kwargs: Any) -> int:
         """Write record batches into `table` (see _write), dropping its <table>_current view for the
@@ -1449,7 +1587,7 @@ class CoreStore:
             prep = self.db.dialect.identifier_preparer
             with self.db.begin() as conn:
                 conn.execute(sa.text(f"DROP TABLE IF EXISTS {self.qualified(table)}"))
-                conn.execute(sa.text(f"ALTER TABLE {self.qualified(target)} RENAME TO {prep.quote(self.split(table)[1])}"))
+                self._rename(conn, target, self.split(table)[1])
             loadlog.step(f"Swapped {target} in as {table}: {rows:,} rows, {len(writer.columns) + 1} columns")
         return rows
 
@@ -1476,8 +1614,8 @@ class CoreStore:
             with db.begin() as conn:
                 for c in cols:
                     if c not in tgt:  # a column first seen in this load
-                        conn.execute(sa.text(f"ALTER TABLE {qt} ADD COLUMN {q(c)} {src[c].compile(dialect=db.dialect)}"))
-                conn.execute(sa.text(f"TRUNCATE {qt} RESTART IDENTITY"))
+                        self._add_column(conn, qt, c, src[c].compile(dialect=db.dialect))
+                conn.execute(sa.text(f"TRUNCATE TABLE {qt}" if self.mssql else f"TRUNCATE {qt} RESTART IDENTITY"))
                 conn.execute(sa.text(f"INSERT INTO {qt} ({', '.join(q(c) for c in cols)}) "
                                      f"SELECT {', '.join(value(c) for c in cols)} FROM {qs} ORDER BY {q(ID_COLUMN)}"))
         except Exception as exc:
@@ -1486,10 +1624,12 @@ class CoreStore:
         with db.begin() as conn:
             conn.execute(sa.text(f"DROP TABLE IF EXISTS {qs}"))
 
+    @_routed
     def drop_staging(self, table: str) -> None:
         with self.db.begin() as conn:
             conn.execute(sa.text(f"DROP TABLE IF EXISTS {self.qualified(table + '__stg')}"))
 
+    @_routed
     def trim_staging(self, table: str, keep: int) -> int:
         """Keep the first `keep` rows of a table's staging table (the pages that were complete);
         returns how many rows it then holds."""
@@ -1502,6 +1642,7 @@ class CoreStore:
                                  f"(SELECT {idc} FROM (SELECT {idc} FROM {q} ORDER BY {idc} LIMIT :n) k)"), {"n": keep})
             return conn.execute(sa.text(f"SELECT COUNT(*) FROM {q}")).scalar_one()
 
+    @_routed
     def read_table(self, table: str, limit: int | None = None) -> list[dict[str, Any]]:
         schema, name = self.split(table)
         reflected = sa.Table(
@@ -1593,15 +1734,19 @@ class _TableWriter:
         names = ", ".join(prep.quote(c) for c in [ID_COLUMN, *data, *META_COLUMNS])
         overriding = " OVERRIDING SYSTEM VALUE" if db.dialect.name == "postgresql" else ""
         with db.begin() as conn:
+            if db.dialect.name == "mssql":  # ET_id is given, not numbered
+                conn.execute(sa.text(f"SET IDENTITY_INSERT {self.store.qualified(temp)} ON"))
             conn.execute(sa.text(f"INSERT INTO {self.store.qualified(temp)} ({names}){overriding} "
                                  f"SELECT {names} FROM {self.store.qualified(self.table)} ORDER BY {prep.quote(ID_COLUMN)}"))
+            if db.dialect.name == "mssql":
+                conn.execute(sa.text(f"SET IDENTITY_INSERT {self.store.qualified(temp)} OFF"))
             if db.dialect.name == "postgresql":  # the copied ET_ids were given, so move the counter past them
                 conn.execute(sa.text(
                     f"SELECT setval(pg_get_serial_sequence(:t, :c), COALESCE(MAX({prep.quote(ID_COLUMN)}), 1), "
                     f"MAX({prep.quote(ID_COLUMN)}) IS NOT NULL) FROM {self.store.qualified(temp)}"
                 ), {"t": self.store.qualified(temp), "c": ID_COLUMN})
             conn.execute(sa.text(f"DROP TABLE {self.store.qualified(self.table)}"))
-            conn.execute(sa.text(f"ALTER TABLE {self.store.qualified(temp)} RENAME TO {prep.quote(self.name)}"))
+            self.store._rename(conn, temp, self.name)
         self.columns = {**data, **META_COLUMNS}
         self.out_of_order = False
         self._rebuild()
@@ -1633,7 +1778,7 @@ class _TableWriter:
                 if col not in self.columns:
                     kind = kind or "text"
                     ddl = sa_type(kind).compile(dialect=db.dialect)
-                    conn.execute(sa.text(f"ALTER TABLE {qualified} ADD COLUMN {prep.quote(col)} {ddl}"))
+                    self.store._add_column(conn, qualified, col, ddl)
                     from eyetable import loadlog
 
                     loadlog.step(f"New column {col} ({kind}) added to {self.table}")
@@ -1646,11 +1791,7 @@ class _TableWriter:
                 if widened != current:
                     # SQLite is dynamically typed, so only the bookkeeping changes there.
                     if db.dialect.name != "sqlite":
-                        ddl = sa_type(widened).compile(dialect=db.dialect)
-                        q = prep.quote(col)
-                        conn.execute(
-                            sa.text(f"ALTER TABLE {qualified} ALTER COLUMN {q} TYPE {ddl} USING {q}::{ddl}")
-                        )
+                        self.store._alter_type(conn, qualified, col, sa_type(widened).compile(dialect=db.dialect))
                     self.columns[col] = widened
                     changed = True
         if changed:
@@ -1674,3 +1815,46 @@ class _TableWriter:
         with self.store.db.begin() as conn:
             conn.execute(sa.insert(self._table), rows)
         return len(rows)
+
+
+class DataStore(CoreStore):
+    """A destination's database (see destinations.py): CoreStore's data operations run on it, while
+    everything else (sources, runs, keys, history flags, ...) stays in eyetable's own database, the
+    `core` store. Shares the core's per-thread load notes, so the Engine reads them as usual."""
+
+    def __init__(self, core: CoreStore, engine: sa.Engine, schema: str, dest_id: str):  # noqa: D107
+        self.__dict__.update(core.__dict__)
+        self.core = core
+        self.dest_id = dest_id
+        self.db = engine
+        self.data_schema = None if engine.dialect.name == "sqlite" else schema  # SQLite has no schemas
+        self.schema_hooks = []
+        self._schemas_made = set()
+        self._dest_stores = {}
+
+    def data_for(self, table: str) -> "CoreStore":
+        return self
+
+
+# Everything that isn't a data operation is eyetable's own bookkeeping: a DataStore asks the core.
+_DATA_OPERATIONS = {
+    "write", "_write", "_merge", "_merge_into", "_add_history_columns", "replace_statements", "_swap_statements",
+    "_refill", "replace_older", "delete_run_rows", "drop_staging", "trim_staging", "table_exists", "columns",
+    "count_rows", "read_table", "max_value", "archive_table", "refresh_current_view", "drop_current_view",
+    "dependent_views", "current_view", "current_rows", "ensure_schema", "qualified", "split", "ref", "is_work_table",
+    "_warn", "_warn_missing", "take_merge_stats", "take_load_warnings", "mssql", "_add_column", "_alter_type",
+    "_rename", "_text_sql", "_distinct", "data_for", "_base_table",
+}
+
+
+def _ask_core(name: str) -> Callable:
+    def call(self, *args, **kwargs):
+        return getattr(self.core, name)(*args, **kwargs)
+
+    call.__name__ = name
+    return call
+
+
+for _name, _value in list(vars(CoreStore).items()):
+    if callable(_value) and not _name.startswith("__") and _name not in _DATA_OPERATIONS:
+        setattr(DataStore, _name, _ask_core(_name))

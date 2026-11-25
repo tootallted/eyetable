@@ -269,6 +269,10 @@ class DestinationIn(BaseModel):
     schema_: str | None = Field(default=None, max_length=63, alias="schema")
 
 
+class RouteIn(BaseModel):
+    destination: str = Field(max_length=40)
+
+
 class DestinationTestIn(BaseModel):
     id: str | None = Field(default=None, max_length=40)
     connection: str = Field(default="", max_length=4000)
@@ -808,6 +812,27 @@ def create_app(
     @app.put("/api/destinations/{dest_id}", dependencies=auth)
     def update_destination(dest_id: str, body: DestinationIn) -> dict[str, Any]:
         return dest_call(lambda: dests.update(dest_id, body.name, body.connection, body.schema_))
+
+    @app.put("/api/sources/{name}/destination", dependencies=auth)
+    def route_source(name: str, body: RouteIn) -> dict[str, Any]:
+        """Send a source's data to another destination from its next load on. Its tables already in the
+        old destination stay there, untouched; the next load makes them in the new one (a full load)."""
+        src = get_source(name)
+        dest = dest_call(lambda: dests.get(body.destination.strip()))
+        old = (src.config or {}).get("destination") or "eyetable"
+        if dest["id"] == old:
+            return {"source": jsonable_encoder(source_summary(src)), "note": f"{name} already loads into {old}"}
+        config = {k: v for k, v in src.config.items() if k != "destination"}
+        if dest["id"] != "eyetable":
+            config["destination"] = dest["id"]
+        store.save_source(name, src.type, config)
+        moved = store.get_source(name)
+        return jsonable_encoder({
+            "source": source_summary(moved),
+            "note": (f"{name} now loads into {dest['id']} ({dest['kind']}, {dest['database'] or dest['server']}"
+                     f"{', schema ' + dest['schema'] if dest['schema'] else ''}). Its next load makes its tables there, "
+                     f"in full; what it loaded into {old} stays there until you drop it."),
+        })
 
     @app.delete("/api/destinations/{dest_id}", dependencies=auth)
     def remove_destination(dest_id: str) -> dict[str, Any]:

@@ -479,6 +479,9 @@
     .sources-table thead.sf .sf-filter { width: 150px; text-align: left; }
   }
   .tag.dest { font-family: var(--mono); }
+  .route-stat .v { display: flex; gap: 6px; align-items: center; }
+  .route-stat select { padding: 2px 6px; font: 13px var(--mono); }
+  .route-note { font-size: 12px; max-width: 380px; } .route-note.ok { color: var(--ok); } .route-note.err { color: var(--err); }
   .tag.dest.other { background: var(--accent-soft); color: var(--accent); border-color: transparent; }
   .dest-table td { white-space: normal; vertical-align: top; }
   .dest-table .srcs { display: flex; flex-wrap: wrap; gap: 4px; max-width: 360px; }
@@ -2773,6 +2776,38 @@
       }, function (err) { msg.appendChild(banner('err', err.message)); });
     }
 
+    // The destination a source loads into, and moving it to another (API: PUT /api/sources/<name>/destination).
+    function routeStat(src) {
+      var current = src.destination || 'eyetable';
+      var list = destState.list.length ? destState.list : [{ id: current, builtin: current === 'eyetable' }];
+      var sel = el('select', { 'aria-label': 'Destination of ' + src.name }, list.map(function (d) {
+        return el('option', { value: d.id, text: d.id + (d.builtin ? ' (built in)' : d.kind ? ' (' + d.kind + ')' : '') });
+      }));
+      sel.value = current;
+      var move = el('button', { type: 'button', class: 'btn small', text: 'Move' });
+      move.hidden = true;
+      var note = el('div', { class: 'route-note', role: 'status' });
+      sel.addEventListener('change', function () { move.hidden = sel.value === current; note.textContent = ''; });
+      move.addEventListener('click', function () {
+        var to = sel.value;
+        if (!confirm('Send ' + src.name + '’s data to ' + to + ' from its next load on?\n\nIts next load makes its tables in ' + to +
+                     ' (a full load). What it already loaded into ' + current + ' stays there until you drop it.')) return;
+        move.disabled = true;
+        api('/api/sources/' + encodeURIComponent(src.name) + '/destination', { method: 'PUT', headers: JSON_HEADERS,
+          body: JSON.stringify({ destination: to }) }).then(function (r) {
+          note.className = 'route-note ok';
+          note.textContent = r.note;
+          current = to;
+          move.hidden = true;
+          refreshSourcesOnly();
+          loadDestList();
+        }, function (err) { note.className = 'route-note err'; note.textContent = err.message; })
+          .then(function () { move.disabled = false; });
+      });
+      return el('div', { class: 'stat route-stat' }, [el('div', { class: 'k', text: 'Destination' }),
+        el('div', { class: 'v' }, [sel, move]), note]);
+    }
+
     function renderDetail(src, preview) {
       $('detail').hidden = false;
       $('detail-name').textContent = src.name;
@@ -2792,6 +2827,7 @@
         stat('Datasets', fmtInt(src.datasets));
         stat('Runs', fmtInt(src.runs.length));
       }
+      stats.appendChild(routeStat(src));
 
       loadSettings(src);
       renderNaming(src, src.tables && src.tables.length > 1 ? (state.pickedTable[src.name] || src.table) : src.table);

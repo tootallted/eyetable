@@ -938,9 +938,39 @@ You can rename a destination, and its sources follow. A destination that has
 sources routed to it can't be removed, and neither can the built-in one.
 
 The **Destination** column in Sources shows where each source's data goes.
-Point at it to see that destination's database. Choosing a source's
-destination, and loading into SQL Server, are the next step: for now every
-source loads into **eyetable**.
+Point at it to see that destination's database.
+
+#### Routing a source to a destination
+
+The selected source's details show **Destination** with a dropdown. Pick
+another destination and press **Move**. It asks first, then:
+
+* **Every load from then on goes there:** full and incremental loads, history
+  merges, statement windows and Reload. The source's tables are made in that
+  destination's schema, each with its `<table>_current` view.
+* **The first load there is a full load**, since the tables don't exist there
+  yet.
+* **What it loaded before stays** in the old destination until you drop it.
+  Moving the source back starts loading there again.
+
+On a destination, the source works as it does in eyetable's own database:
+
+* **Its data lives there:** Preview Data, row counts, key scans, natural keys,
+  history (`ET_isCurrent`, `ET_fromdate`, `ET_todate`) and incremental loads all
+  read and write the destination's database.
+* **eyetable's own records stay in eyetable's database:** the source's
+  settings, runs, keys and the Load queue.
+* **The query window** reads eyetable's own database only, so a source routed
+  elsewhere doesn't appear in it. Query those tables from SQL Server's own
+  tools.
+
+On SQL Server, text is `NVARCHAR(MAX)`, so any language is kept; times are
+`DATETIME2` or `DATETIMEOFFSET`; and decimals are `NUMERIC(38,10)`. Rows go in
+in bulk (`fast_executemany`). The destination's schema is created if it doesn't
+exist, provided the login may create schemas.
+
+API: `PUT /api/sources/<name>/destination` with `{"destination": "local_sql"}`
+(or `"eyetable"` to bring it back).
 
 API: `GET/POST /api/destinations`, `PUT/DELETE /api/destinations/<id>`,
 `POST /api/destinations/test` (`{"id": …}` or `{"connection": …, "schema": …}`).

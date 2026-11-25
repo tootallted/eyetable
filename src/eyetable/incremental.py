@@ -194,6 +194,7 @@ class Plan:
 
 
 def plan(store: CoreStore, table: str) -> Plan:
+    store = store.data_for(table)  # the database the table is in (destinations.py)
     column = store.get_increment(table)
     if column is None:
         raise IncrementalProblem(f"{table} has no incremental column; choose one in Preview Data")

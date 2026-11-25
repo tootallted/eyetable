@@ -39,6 +39,7 @@ class KeyProblem(ValueError):
 
 def source_columns(store: CoreStore, table: str) -> dict[str, str]:
     """A loaded table's own columns (no ET_ ones), in table order: name -> kind."""
+    store = store.data_for(table)  # the database the table is in (destinations.py)
     if not store.table_exists(table):
         raise KeyProblem(f"there is no loaded table named {table}")
     cols = store.columns(table)
@@ -48,7 +49,8 @@ def source_columns(store: CoreStore, table: str) -> dict[str, str]:
 def _expr(store: CoreStore, name: str, kind: str) -> str:
     """A column as SQL; JSON is compared as text (Postgres can't compare json values)."""
     col = store.db.dialect.identifier_preparer.quote(name)
-    return f"CAST({col} AS TEXT)" if kind == "json" else col
+    text = "NVARCHAR(MAX)" if store.db.dialect.name == "mssql" else "TEXT"
+    return f"CAST({col} AS {text})" if kind == "json" else col
 
 
 def _rank(name: str, kind: str, position: int, table: str) -> tuple:
@@ -60,6 +62,7 @@ def _rank(name: str, kind: str, position: int, table: str) -> tuple:
 
 def check_set(store: CoreStore, table: str, columns: list[str], kinds: dict[str, str] | None = None) -> dict[str, Any]:
     """How well `columns` identify the rows: rows with a null in them, and repeated values."""
+    store = store.data_for(table)  # the database the table is in (destinations.py)
     kinds = kinds if kinds is not None else source_columns(store, table)
     missing = [c for c in columns if c not in kinds]
     if missing:
@@ -82,12 +85,14 @@ def check_set(store: CoreStore, table: str, columns: list[str], kinds: dict[str,
 def _unique(conn: sa.Connection, store: CoreStore, table: str, exprs: list[str]) -> bool:
     group = ", ".join(exprs)
     found = conn.execute(sa.text(
-        f"SELECT 1 FROM {store.current_rows(table)} GROUP BY {group} HAVING COUNT(*) > 1 LIMIT 1")).first()
-    return found is None
+        f"SELECT CASE WHEN EXISTS (SELECT 1 FROM {store.current_rows(table)} GROUP BY {group} "
+        f"HAVING COUNT(*) > 1) THEN 1 ELSE 0 END")).scalar()
+    return not found
 
 
 def scan(store: CoreStore, table: str) -> dict[str, Any]:
     """Count each column's nulls and distinct values, and find the columns and sets that are unique."""
+    store = store.data_for(table)  # the database the table is in (destinations.py)
     started = time.monotonic()
     kinds = source_columns(store, table)
     names = list(kinds)
@@ -157,6 +162,7 @@ def scan(store: CoreStore, table: str) -> dict[str, Any]:
 
 def scan_and_save(store: CoreStore, table: str) -> dict[str, Any]:
     """Scan a table, keep the result, and check its chosen natural key against the new data."""
+    store = store.data_for(table)  # the database the table is in (destinations.py)
     result = scan(store, table)
     store.save_key_scan(table, result)
     return key_info(store, table)
@@ -164,6 +170,7 @@ def scan_and_save(store: CoreStore, table: str) -> dict[str, Any]:
 
 def key_info(store: CoreStore, table: str) -> dict[str, Any]:
     """What the page shows: the latest scan, the chosen natural key, and how the key holds up now."""
+    store = store.data_for(table)  # the database the table is in (destinations.py)
     saved = store.get_table_key(table)
     key = saved["key"] if saved else None
     check = None
@@ -182,6 +189,7 @@ def key_info(store: CoreStore, table: str) -> dict[str, Any]:
 
 def increment_info(store: CoreStore, table: str) -> dict[str, Any] | None:
     """The table's incremental column, and the largest value of it loaded so far."""
+    store = store.data_for(table)  # the database the table is in (destinations.py)
     column = store.get_increment(table)
     if column is None:
         return None

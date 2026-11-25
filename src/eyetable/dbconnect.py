@@ -223,8 +223,10 @@ def prepare(text: str, secret_key: str | None) -> Prepared:
     return Prepared(config, password or None, server, database, warnings)
 
 
-def make_engine(config: dict[str, Any], password: str | None = None, login_timeout: int = 20) -> tuple[sa.Engine, list[str]]:
-    """An engine for a (decrypted) connection config, and any warnings."""
+def make_engine(config: dict[str, Any], password: str | None = None, login_timeout: int = 20,
+                fast: bool = False) -> tuple[sa.Engine, list[str]]:
+    """An engine for a (decrypted) connection config, and any warnings. `fast`: send many rows in one
+    round trip on SQL Server (for loading into a destination)."""
     password = password if password is not None else config.get("password")
     warnings: list[str] = []
     if "odbc" in config:
@@ -240,6 +242,7 @@ def make_engine(config: dict[str, Any], password: str | None = None, login_timeo
         engine = sa.create_engine(
             "mssql+pyodbc:///?odbc_connect=" + urllib.parse.quote_plus(odbc),
             connect_args={"timeout": config.get("login_timeout", login_timeout)}, pool_pre_ping=True,
+            **({"fast_executemany": True} if fast else {}),
         )
         if config.get("entra"):
             tokens, sign_in = entra.provider(), config["entra"]
