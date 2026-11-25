@@ -134,6 +134,21 @@ class DbTableConnector(DatabaseConnector):
         except sa.exc.SQLAlchemyError as exc:
             raise ConnectionError_(f"reading {schema}.{table} failed: {friendly(exc)}") from None
 
+    def sample(self, key: str, rows: int = 20) -> list[dict]:
+        """The first rows of one table, asked for as just that many (TOP / LIMIT): no full scan."""
+        item = self._item(key)
+        schema, table = item["schema"], item["table"]
+        source = self._source(schema, table)
+        try:
+            with self._engine.connect() as conn:
+                return [dict(r) for r in conn.execute(sa.select(source).limit(rows)).mappings()]
+        except sa.exc.SQLAlchemyError as exc:
+            raise ConnectionError_(f"reading {schema}.{table} failed: {friendly(exc)}") from None
+
+    def metadata(self, key: str):
+        """One table's columns and row count (its entry in the source's catalog)."""
+        return self._dataset(self._item(key))
+
     def read_in_parts(self, key: str, column: str, batch_size: int = 1000, since: tuple | None = None):
         """Read a table as a series of ranges of `column` (a date/time or number), each its own query.
 

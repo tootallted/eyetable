@@ -370,6 +370,15 @@ class CoreStore:
             sa.Column("set_at", UTCDateTime(), nullable=False),
         )
         # Tables hidden in Sources ("commented out"): every load skips them (see Engine.reload_source).
+        # Tables holding just a sample (the first rows) of their source, to set keys up before the
+        # first full load; the next real load replaces the sample (see write).
+        self.table_samples = sa.Table(
+            "table_samples",
+            self.metadata,
+            sa.Column("table_name", sa.Text, primary_key=True),
+            sa.Column("rows", sa.Integer, nullable=False),
+            sa.Column("sampled_at", UTCDateTime(), nullable=False),
+        )
         self.hidden_tables = sa.Table(
             "hidden_tables",
             self.metadata,
@@ -524,6 +533,14 @@ class CoreStore:
                         for d in datasets
                     ],
                 )
+
+    def save_dataset(self, source: str, dataset: DatasetInfo) -> None:
+        """Add or refresh one entry of a source's catalog, leaving the others."""
+        with self.db.begin() as conn:
+            conn.execute(sa.delete(self.datasets).where(self.datasets.c.source == source,
+                                                        self.datasets.c.key == dataset.key))
+            conn.execute(sa.insert(self.datasets).values(source=source, key=dataset.key, info=dataset.to_dict(),
+                                                         discovered_at=_now()))
 
     def list_datasets(self, source: str | None = None) -> list[tuple[str, DatasetInfo]]:
         query = sa.select(self.datasets.c.source, self.datasets.c.info).order_by(
@@ -851,6 +868,7 @@ class CoreStore:
             conn.execute(sa.delete(self.table_increments).where(self.table_increments.c.table_name == table))
             conn.execute(sa.delete(self.hidden_tables).where(self.hidden_tables.c.table_name == table))
             conn.execute(sa.delete(self.table_history).where(self.table_history.c.table_name == table))
+            conn.execute(sa.delete(self.table_samples).where(self.table_samples.c.table_name == table))
 
     # -- key scans and natural keys ------------------------------------------
 
@@ -1483,10 +1501,27 @@ class CoreStore:
         """Make (or remake) every data table's <table>_current view; returns the views."""
         return [v for v in (self.refresh_current_view(t) for t in self.data_tables()) if v]
 
+    # -- samples: the first rows of a table, before its first full load ---------------
+
+    def samples(self) -> set[str]:
+        with self.db.connect() as conn:
+            return set(conn.execute(sa.select(self.table_samples.c.table_name)).scalars())
+
+    def sampled(self, table: str) -> bool:
+        with self.db.connect() as conn:
+            return conn.execute(sa.select(self.table_samples.c.rows).where(
+                self.table_samples.c.table_name == table)).first() is not None
+
+    def set_sampled(self, table: str, rows: int | None) -> None:
+        with self.db.begin() as conn:
+            conn.execute(sa.delete(self.table_samples).where(self.table_samples.c.table_name == table))
+            if rows is not None:
+                conn.execute(sa.insert(self.table_samples).values(table_name=table, rows=rows, sampled_at=_now()))
+
     def move_table_settings(self, old: str, new: str) -> None:
         """A table's natural key and scan, incremental column and hidden flag follow it to a new name."""
         with self.db.begin() as conn:
-            for table in (self.table_keys, self.table_increments, self.hidden_tables, self.table_history):
+            for table in (self.table_keys, self.table_increments, self.hidden_tables, self.table_history, self.table_samples):
                 conn.execute(sa.delete(table).where(table.c.table_name == new))
                 conn.execute(sa.update(table).where(table.c.table_name == old).values(table_name=new))
 
@@ -1506,7 +1541,7 @@ class CoreStore:
 
     @_routed
     def write(self, table: str, batches: Iterable[list[dict[str, Any]]], mode: str = "replace", run_id: int = 0,
-              **kwargs: Any) -> int:
+              sample: bool = False, **kwargs: Any) -> int:
         """Write record batches into `table` (see _write), dropping its <table>_current view for the
         load (Postgres won't swap or widen a table a view depends on) and making it again afterwards,
         with any new columns, whether or not the load worked.
@@ -1520,6 +1555,16 @@ class CoreStore:
             return self._write(table, batches, mode, run_id, **kwargs)
         from eyetable import loadlog
 
+        if sample:  # the first rows only: a plain table, whatever the table's settings, marked as a sample
+            self._drop_data(table)
+            rows = self._write(table, batches, "replace", run_id, plain=True, **kwargs)
+            self.refresh_current_view(table)
+            self.set_sampled(table, rows)
+            return rows
+        if self.sampled(table):  # the first real load after a sample: the table starts afresh
+            loadlog.step(f"{table} holds a sample; it's replaced by this load")
+            self._drop_data(table)
+            self.set_sampled(table, None)
         self._merges.warnings = []  # this load's own (an earlier failed load's don't carry over)
         deps = self.dependent_views(table)
         if deps:
@@ -1543,6 +1588,7 @@ class CoreStore:
         keep_on_failure: bool = False,
         resume: bool = False,
         in_place_for: list[str] | None = None,
+        plain: bool = False,
     ) -> int:
         """Write record batches into `table` in the data schema; return rows written.
 
@@ -1558,7 +1604,7 @@ class CoreStore:
         """
         if mode not in ("replace", "append"):
             raise ValueError(f"unknown write mode {mode!r}")
-        key = self.history_key(table)
+        key = None if plain else self.history_key(table)
         if key:  # a history table is never replaced: every load merges into it
             return self._merge(table, batches, run_id, origin, key)
         from eyetable import loadlog
@@ -1625,6 +1671,12 @@ class CoreStore:
             conn.execute(sa.text(f"DROP TABLE IF EXISTS {qs}"))
 
     @_routed
+    def _drop_data(self, table: str) -> None:
+        """Drop a table's data (and its _current view), keeping its settings."""
+        self.drop_current_view(table)
+        with self.db.begin() as conn:
+            conn.execute(sa.text(f"DROP TABLE IF EXISTS {self.qualified(table)}"))
+
     def drop_staging(self, table: str) -> None:
         with self.db.begin() as conn:
             conn.execute(sa.text(f"DROP TABLE IF EXISTS {self.qualified(table + '__stg')}"))
@@ -1843,7 +1895,7 @@ _DATA_OPERATIONS = {
     "count_rows", "read_table", "max_value", "archive_table", "refresh_current_view", "drop_current_view",
     "dependent_views", "current_view", "current_rows", "ensure_schema", "qualified", "split", "ref", "is_work_table",
     "_warn", "_warn_missing", "take_merge_stats", "take_load_warnings", "mssql", "_add_column", "_alter_type",
-    "_rename", "_text_sql", "_distinct", "data_for", "_base_table",
+    "_rename", "_text_sql", "_distinct", "data_for", "_base_table", "_drop_data",
 }
 
 

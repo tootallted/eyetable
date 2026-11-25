@@ -198,7 +198,7 @@ def plan(store: CoreStore, table: str) -> Plan:
     column = store.get_increment(table)
     if column is None:
         raise IncrementalProblem(f"{table} has no incremental column; choose one in Preview Data")
-    if not store.table_exists(table):
+    if not store.table_exists(table) or store.sampled(table):  # a sample isn't a load to carry on from
         return Plan(column, None, False, None)
     kinds = {c["name"]: c["type"] for c in store.columns(table)}
     if column not in kinds:

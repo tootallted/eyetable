@@ -352,6 +352,8 @@
   .flag.pk { background: var(--ok-soft); color: var(--ok); border-color: transparent; }
   .flag.ic { background: var(--accent-soft); color: var(--accent); border-color: transparent; }
   .flag.h { background: var(--warn-soft); color: var(--warn); border-color: transparent; }
+  .flag.sample { background: var(--surface-2); color: var(--muted); border-style: dashed; }
+  .load-btns > .btn.sample-btn { width: 88px; }
   .sources-table th.flags-col, .sources-table td.flags-col { width: 1%; padding-left: 2px; padding-right: 2px; }
   .incr-list { display: grid; gap: 6px; }
   .incr-list label { display: flex; gap: 8px; align-items: baseline; font-size: 14px; cursor: pointer; }
@@ -1801,6 +1803,8 @@
       if (t && t.incremental) flags.push(el('span', { class: 'flag ic', text: 'IC', title: 'Incremental column: ' + t.incremental }));
       else if (t && t.statement_window) flags.push(el('span', { class: 'flag ic', text: 'IC', title: windowText(t.statement_window) }));
       if (t && t.history) flags.push(el('span', { class: 'flag h', text: 'H', title: 'Keeps history: loads merge by the natural key' }));
+      if (t && t.sampled) flags.push(el('span', { class: 'flag sample', text: 'SAMPLE',
+        title: 'Holds just a sample (its first rows), to set its key and incremental column; its next load replaces it with the whole table' }));
       return el('td', { class: 'flags-col', 'data-label': flags.length ? 'Set up' : '' }, flags.length ? [el('span', { class: 'flags' }, flags)] : []);
     }
 
@@ -5142,12 +5146,51 @@
     }
 
     function loadButtons(s, t) {
-      var target = t ? { table: t.table, incremental: t.incremental, label: t.schema + '.' + t.name } : null;
+      var target = t ? { table: t.table, incremental: t.incremental, label: t.schema + '.' + t.name, rows: t.rows } : null;
       var box = el('span', { class: 'load-btns' }, [loadButton(s, target, false)]);
       var tables = incrementalTables(s, target);
       var queued = queuedLoad(s.name, target && s.tables && s.tables.length > 1 ? target.table : null, true);
       box.appendChild(tables && (tables.length || queued) ? loadButton(s, target, true) : el('span', { class: 'load-slot', 'aria-hidden': 'true' }));
+      if (s.type !== 'file') box.appendChild(sampleButton(s, target));
       return box;
+    }
+
+    // Sample: one table's metadata and first 20 rows, so its natural key and incremental column
+    // can be set before its first full load (API: POST /api/sources/<name>/sample).
+    function sampleButton(s, target) {
+      var what = target ? (target.label || target.table) : s.name;
+      var b = el('button', { type: 'button', class: 'btn small sample-btn', text: 'Sample', 'aria-label': 'Sample ' + what,
+        title: 'Refresh ' + (target ? 'this table\u2019s' : 'the') + ' columns and load just its first 20 rows, to choose its key and incremental column before its first full load' });
+      b.addEventListener('click', function (e) {
+        e.stopPropagation();  // the row itself opens the source's details
+        sampleTable(s, target, b);
+      });
+      b.addEventListener('keydown', function (e) { e.stopPropagation(); });
+      return b;
+    }
+
+    function sampleTable(s, target, btn) {
+      var what = target ? (target.label || target.table) : s.name;
+      var table = target ? target.table : null;
+      var msg = clear($('sources-msg'));
+      var loaded = target ? target.rows : s.rows;
+      if (loaded > 20 && !confirm('Sample ' + what + '? Its ' + fmtInt(loaded) + ' loaded rows are replaced by just its first 20, until its next load brings the whole table back.')) return;
+      btn.disabled = true;
+      btn.textContent = 'Sampling\u2026';
+      var payload = { table: table };
+      if (s.type === 'gsheet' && googleToken()) payload.google_token = googleToken();
+      if (s.type === 'gsheet' && microsoftToken()) payload.microsoft_token = microsoftToken();
+      api('/api/sources/' + encodeURIComponent(s.name) + '/sample', { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify(payload) })
+        .then(function (r) {
+          var res = r.result;
+          msg.appendChild(banner('ok', 'Sampled ' + what + ': ' + res.note.replace(/^sample: /, '') + '. Choose its natural key and incremental column under Preview Data, then load it.'));
+          if (s.tables && s.tables.length > 1 && res.table) state.pickedTable[s.name] = res.table;
+          return refreshSourcesOnly().then(function () {
+            unfold('detail');
+            selectSource(s.name);
+          });
+        }, function (err) { msg.appendChild(banner('err', what + ' couldn\u2019t be sampled: ' + err.message)); })
+        .then(function () { btn.disabled = false; btn.textContent = 'Sample'; });
     }
 
     function loadButton(s, target, incremental, text) {

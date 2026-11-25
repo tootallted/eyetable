@@ -46,7 +46,7 @@ class RunResult:
     rows: int
     error: str | None = None
     upload_id: int | None = None
-    mode: str = "replace"  # "replace" | "append" | "incremental"
+    mode: str = "replace"  # "replace" | "append" | "incremental" | "sample"
     since: Any = None  # an incremental load's starting point: the largest value loaded before it
     replaced: int = 0  # older copies of rows an incremental load replaced (by natural key)
     detail: str | None = None  # a failure's full traceback, for the load queue's details
@@ -89,6 +89,8 @@ def _csv_snapshot(headers: list[str], records: list[dict[str, Any]]) -> bytes:
         writer.writerow(["" if r[h] is None else (r[h].isoformat() if isinstance(r[h], (dt.date, dt.time)) else r[h]) for h in headers])
     return out.getvalue().encode("utf-8")
 
+
+SAMPLE_ROWS = 20  # how many rows a sample loads (Engine.sample_table)
 
 class Engine:
     def __init__(
@@ -1070,7 +1072,75 @@ class Engine:
         return results
 
     def _has_statement_column(self, table: str) -> bool:
-        return self.store.table_exists(table) and STATEMENT_COLUMN in {c["name"] for c in self.store.columns(table)}
+        return (self.store.table_exists(table) and not self.store.sampled(table)
+                and STATEMENT_COLUMN in {c["name"] for c in self.store.columns(table)})
+
+    # -- samples: the first rows of one table, to set it up before its first full load ---------
+
+    def sample_table(self, source: str, table: str | None = None, rows: int = SAMPLE_ROWS,
+                     sheet_fetch: Callable[[str], gsheets.Workbook] = gsheets.fetch_workbook) -> RunResult:
+        """Refresh one table's metadata (its columns, and row count where the source says) and load
+        just its first `rows` rows, so its natural key and incremental column can be chosen before
+        its first full load. The table is marked as a sample: the next real load (Reload,
+        Incremental, a group or schedule) replaces it with a full load, whatever its settings."""
+        src = self.store.get_source(source)
+        if src.type == "file":
+            raise ValueError("a file source holds the whole file it was loaded from; there's nothing to sample")
+        if src.type == "gsheet":
+            target = targets.table_for(src)
+            if table and table != target:
+                raise ValueError(f"{source} has no table {table}")
+            book = sheet_fetch(src.config["url"])
+            tab = next((t for t in book.tabs if t.title == src.config.get("tab_title")), None)
+            if tab is None:
+                raise ValueError(f'the tab "{src.config.get("tab_title")}" is no longer in "{book.title}"')
+            run_id = self.store.start_run(source, DATASET_KEY, target, "sample")
+            return self._write_sample(run_id, source, DATASET_KEY, target, tab.records[:rows],
+                                      f"{book.title} / {tab.title}", total=len(tab.records))
+        if src.type == "dbtable":
+            entries = targets.entries(src)
+            picked = [e for e in entries if e["ref"] == table] if table else entries[:1]
+            if not picked:
+                raise ValueError(f"{source} has no table {table}")
+            key, target = picked[0]["key"], picked[0]["ref"]
+        else:
+            catalog = {d.key: d for _, d in self.store.list_datasets(source)} or {d.key: d for d in self.discover(source)}
+            pairs = [(k, targets.table_for(src, d.name)) for k, d in catalog.items() if d.readable]
+            picked = [p for p in pairs if p[1] == table] if table else pairs[:1]
+            if not picked:
+                raise ValueError(f"{source} has no table {table}")
+            key, target = picked[0]
+        loadlog.step(f"Sampling {target}: its metadata and first {rows} rows")
+        run_id = self.store.start_run(source, key, target, "sample")
+        total = None
+        try:
+            with self.connector(source) as conn:
+                if hasattr(conn, "metadata"):  # refresh this table's catalog entry: columns, row count
+                    info = conn.metadata(key)
+                    self.store.save_dataset(source, info)
+                    total = info.row_count
+                records = conn.sample(key, rows)
+                origin = conn.origin(key)
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            self.store.finish_run(run_id, "failed", 0, error)
+            return RunResult(run_id, key, target, "failed", 0, error, mode="sample", detail=traceback.format_exc())
+        return self._write_sample(run_id, source, key, target, records, origin, total)
+
+    def _write_sample(self, run_id: int, source: str, key: str, table: str, records: list[dict], origin: str,
+                      total: int | None) -> RunResult:
+        try:
+            rows = self.store.write(table, [records] if records else [], "replace", run_id,
+                                    origin=f"{source} - {origin} (sample)", sample=True)
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            self.store.finish_run(run_id, "failed", 0, error)
+            return RunResult(run_id, key, table, "failed", 0, error, mode="sample", detail=traceback.format_exc())
+        self.store.finish_run(run_id, "succeeded", rows)
+        self._scan_quietly(table)  # now, so its key and incremental candidates show straight away
+        of = f" of about {total:,}" if total else ""
+        return RunResult(run_id, key, table, "succeeded", rows, mode="sample",
+                         note=f"sample: the first {rows:,} rows{of}; its next load replaces them with the whole table")
 
     def _ingest_statements(self, conn: Connector, source: str, key: str, table: str, window: dict[str, Any],
                            batch_size: int) -> RunResult:

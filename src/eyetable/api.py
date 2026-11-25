@@ -433,6 +433,7 @@ def create_app(
         increments = store.increments()
         hidden = store.hidden()
         keyed, histories = store.keyed_tables(), store.histories()
+        samples = store.samples()
         catalog = {d.key: d for d in datasets}
         out = []
         for item in dbconnect.db_tables(src.config):
@@ -443,7 +444,8 @@ def create_app(
             out.append({"key": item["key"], "schema": item["schema"], "name": item["table"], "kind": item.get("kind", "table"),
                         "table": table, "rows": rows, "last_loaded_at": finished, "incremental": increments.get(table),
                         "split": (item.get("split") or {}).get("column"), "hidden": table in hidden,
-                        "key": table in keyed, "history": table in histories,
+                        "key": table in keyed, "history": table in histories, "sampled": table in samples,
+                        "source_rows": catalog[item["key"]].row_count if item["key"] in catalog else None,
                         "columns": len(catalog[item["key"]].columns) if item["key"] in catalog else None})
         return out
 
@@ -486,6 +488,7 @@ def create_app(
                 hidden=table in store.hidden(),
                 key=table in store.keyed_tables(),
                 history=store.has_history(table),
+                sampled=store.sampled(table),
                 incremental=store.get_increment(table),
                 provider=src.config.get("provider", "google") if src.type == "gsheet" else None,
                 rows=store.count_rows(table),
@@ -1442,6 +1445,24 @@ def create_app(
             "results": [r.__dict__ for r in results],
             "rows": sum(r.rows for r in results),
         })
+
+    @app.post("/api/sources/{name}/sample", dependencies=auth)
+    def sample_source(name: str, body: ReloadIn | None = None) -> dict[str, Any]:
+        """Refresh one table's metadata and load just its first rows (a sample), so its natural key
+        and incremental column can be set before its first full load. `table` picks a database
+        source's table (its first by default)."""
+        get_source(name)
+        token_ = sign_ins(body)
+        try:
+            result = engine.sample_table(name, body.table if body else None,
+                                         sheet_fetch=lambda url: sheet_fetch(url, token_))
+        except SheetError as exc:
+            raise sheet_error(exc) from None
+        except (ValueError, KeyError) as exc:
+            raise HTTPException(400, str(exc).strip("'\"")) from None
+        if result.status == "failed":
+            raise HTTPException(500, f"{result.table}: {result.error}")
+        return jsonable_encoder({"source": source_summary(store.get_source(name)), "result": result.__dict__})
 
     @app.post("/api/sources/{name}/run", dependencies=auth, status_code=202)
     def run_source(name: str, body: ReloadIn | None = None) -> dict[str, Any]:

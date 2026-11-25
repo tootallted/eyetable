@@ -519,6 +519,40 @@ again; **Last loaded** shows when data last finished loading.
 Each reload is an ingestion run, so rows get a new `ET_timestamp` and
 `ET_run_id`, and `ET_id` starts again at 1. API: `POST /api/sources/<name>/reload`.
 
+### Sampling a table before its first load
+
+A big table (10,000 rows and more) usually wants its natural key and
+incremental column chosen before its first full load. That way the first load
+already keeps history, and later loads can be incremental. Choosing them needs
+the table's columns, so every database, API and Google Sheet table has a
+**Sample** button beside **Reload** and **Incremental**. It works on one table
+at a time, not the whole source. It:
+
+* **Refreshes that table's metadata:** its columns and, for a database table,
+  its row count, which the note reports as *about N rows*.
+* **Loads just its first 20 rows.** A database is asked for only those rows
+  (`TOP 20` / `LIMIT 20`), so a huge table isn't scanned. An API reads only its
+  first page.
+* **Opens the table's details**, with Preview Data and the key scan of those
+  rows, so you can choose the natural key and the incremental column there.
+
+The table is flagged **SAMPLE** in Sources while it holds the sample. Its next
+real load replaces the sample. That covers **Reload**, **Incremental**, a group
+or schedule, whatever started it:
+
+* **It's a clean full load.** The sample is dropped first, so an incremental
+  load doesn't start from the sample's latest value, and history starts afresh.
+  Every row becomes a first version.
+* **The settings chosen on the sample apply** from that load on: the natural
+  key and history, and the incremental column.
+
+If the table already holds a full load, sampling it asks first, because its
+rows are replaced by the 20 until its next load. File sources hold their whole
+file, so they have nothing to sample.
+
+API: `POST /api/sources/<name>/sample` with `{"table": "<table>"}` (a database
+source's first table by default). The run is recorded with mode `sample`.
+
 ### Big tables: loading in parts
 
 A database table can be too big to read in one query before the database
