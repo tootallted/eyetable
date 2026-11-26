@@ -143,6 +143,11 @@
   .drop strong { font-size: 16px; }
   .drop input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
 
+  /* the Load data card's four parts, each folding on its own (closed whenever the card is opened) */
+  .sub { display: grid; gap: 10px; }
+  .sub-head { margin: 0; font-size: 14px; }
+  .sub-head .fold { font-weight: 600; font-size: 14px; color: var(--text); }
+  .sub-body[hidden] { display: none !important; }
   .or { display: flex; align-items: center; gap: 12px; color: var(--muted); font-size: 13px; }
   .or::before, .or::after { content: ""; flex: 1; border-top: 1px solid var(--border); }
   .gs { display: grid; gap: 10px; }
@@ -627,6 +632,9 @@
   <section class="card" data-fold="load" aria-labelledby="load-title">
     <h2 id="load-title"><button class="fold" type="button" aria-expanded="true" aria-controls="load-body"><span class="tri"></span>Load data</button></h2>
     <div class="card-body" id="load-body">
+      <div class="sub" data-sub="csv">
+        <h3 class="sub-head"><button class="fold sub-fold" type="button" aria-expanded="false" aria-controls="sub-csv"><span class="tri"></span>CSV file</button></h3>
+      <div class="sub-body" id="sub-csv" hidden>
       <label class="drop" id="drop">
         <input type="file" id="file-input" accept=".csv,text/csv">
         <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 16V4M7 9l5-5 5 5"/><path d="M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3"/></svg>
@@ -681,12 +689,15 @@
         </div>
       </div>
       <div id="load-result" role="status"></div>
+      </div>
+      </div>
 
       <div class="or"><span>or a Google Sheet, or an Excel or CSV file in OneDrive or SharePoint</span></div>
-      <div class="gs">
-        <label class="field" for="gs-url">Google Sheet, OneDrive or SharePoint link</label>
+      <div class="sub" data-sub="gs">
+        <h3 class="sub-head"><button class="fold sub-fold" type="button" aria-expanded="false" aria-controls="sub-gs"><span class="tri"></span>Google Sheet, OneDrive or SharePoint link</button></h3>
+      <div class="gs sub-body" id="sub-gs" hidden>
         <div class="gs-row">
-          <input type="url" id="gs-url" placeholder="https://docs.google.com/spreadsheets/d/…" autocomplete="off" spellcheck="false">
+          <input type="url" id="gs-url" aria-label="Google Sheet, OneDrive or SharePoint link" placeholder="https://docs.google.com/spreadsheets/d/…" autocomplete="off" spellcheck="false">
           <button class="btn" id="gs-check" type="button" disabled>Check tabs</button>
         </div>
         <p class="hint">Every tab becomes its own source, named <code>file name_tab name</code>. Paste or drop the
@@ -710,11 +721,13 @@
         </div>
         <div id="gs-result" role="status"></div>
       </div>
+      </div>
 
       <div class="or"><span>or an API request</span></div>
-      <div class="gs">
-        <label class="field" for="curl-text">curl command</label>
-        <textarea id="curl-text" spellcheck="false" autocomplete="off"
+      <div class="sub" data-sub="curl">
+        <h3 class="sub-head"><button class="fold sub-fold" type="button" aria-expanded="false" aria-controls="sub-curl"><span class="tri"></span>curl command</button></h3>
+      <div class="gs sub-body" id="sub-curl" hidden>
+        <textarea id="curl-text" aria-label="curl command" spellcheck="false" autocomplete="off"
           placeholder="curl 'https://api.example.com/v1/orders?page=1&amp;per_page=100' -H 'Authorization: Bearer …'"></textarea>
         <details class="cert-box" id="curl-cert-box">
           <summary>Client certificate (if the API requires one)</summary>
@@ -797,11 +810,13 @@
         </div>
         <div id="curl-result" role="status"></div>
       </div>
+      </div>
 
       <div class="or"><span>or a database</span></div>
-      <div class="gs">
-        <label class="field" for="db-conn">Connection string</label>
-        <textarea id="db-conn" spellcheck="false" autocomplete="off"
+      <div class="sub" data-sub="db">
+        <h3 class="sub-head"><button class="fold sub-fold" type="button" aria-expanded="false" aria-controls="sub-db"><span class="tri"></span>Connection string</button></h3>
+      <div class="gs sub-body" id="sub-db" hidden>
+        <textarea id="db-conn" aria-label="Connection string" spellcheck="false" autocomplete="off"
           placeholder="Driver={ODBC Driver 18 for SQL Server};Server=tcp:yourserver.database.windows.net,1433;Database=yourdb;Uid=…;Pwd={…};Encrypt=yes;"></textarea>
         <div><button class="btn" id="db-connect" type="button" disabled>Connect</button></div>
         <p class="hint">An ODBC or JDBC connection string (SQL Server, Azure SQL, Dataverse; <code>Authentication=ActiveDirectoryInteractive</code>
@@ -830,6 +845,7 @@
           <button class="btn primary" id="db-load" type="button" disabled>Load selected</button>
         </div>
         <div id="db-result" role="status"></div>
+      </div>
       </div>
     </div>
   </section>
@@ -6122,8 +6138,23 @@
     var KEY_FOLDED = 'eyetable.folded';
     var folded = read('localStorage', KEY_FOLDED).split(',').filter(Boolean);
 
+    // The Load data card's parts (CSV, sheet link, curl, connection string): each opens on its own,
+    // and all close whenever the card is opened from folded.
+    function setSub(sub, open) {
+      sub.querySelector('.sub-fold').setAttribute('aria-expanded', String(open));
+      sub.querySelector('.sub-body').hidden = !open;
+    }
+    function openSub(name) { setSub(document.querySelector('[data-sub=' + name + ']'), true); }
+    function closeSubs() { document.querySelectorAll('[data-sub]').forEach(function (sub) { setSub(sub, false); }); }
+    document.querySelectorAll('[data-sub]').forEach(function (sub) {
+      sub.querySelector('.sub-fold').addEventListener('click', function () {
+        setSub(sub, sub.querySelector('.sub-fold').getAttribute('aria-expanded') !== 'true');
+      });
+    });
+
     function setFolded(section, fold) {
       var name = section.getAttribute('data-fold');
+      if (name === 'load' && !fold && section.classList.contains('folded')) closeSubs();
       section.classList.toggle('folded', fold);
       section.querySelector('.fold').setAttribute('aria-expanded', String(!fold));
       folded = folded.filter(function (n) { return n !== name; }).concat(fold ? [name] : []);
@@ -6169,6 +6200,7 @@
       if (e.dataTransfer.files.length) {
         e.preventDefault();
         unfold('load');
+        openSub('csv');
         stage(e.dataTransfer.files[0]);
         return;
       }
@@ -6176,6 +6208,7 @@
       if (SHEET_LINK.test(text)) {
         e.preventDefault();
         unfold('load');
+        openSub('gs');
         $('gs-url').value = text;
         $('gs-url').scrollIntoView({ block: 'center', behavior: 'smooth' });
         checkSheet();
