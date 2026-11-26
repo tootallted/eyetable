@@ -767,6 +767,57 @@ Key checks and scans look only at the current versions (`ET_isCurrent = 1`).
 To see a key as it was at time `t`, query the table with
 `WHERE "ET_fromdate" <= t AND "ET_todate" > t`.
 
+**`as_of`: a history table as it was at a time.** `eyetable_views.as_of` returns
+a history table's rows as they were at a given time, and can be queried like a
+table. Give it the table as a typed `NULL`, and the time:
+
+```sql
+SELECT * FROM as_of(NULL::smvs_appsetting__smvs_claim, '2026-11-14');           -- midnight, server time
+SELECT * FROM as_of(NULL::smvs_appsetting__smvs_claim, '2026-11-14 23:59:59');  -- end of that day
+SELECT c.*, s.name
+FROM as_of(NULL::smvs_appsetting__smvs_claim, '11/14/2026') c
+JOIN as_of(NULL::smvs_appsetting__data, '11/14/2026') s ON s.smvs_appsettingid = c.smvs_appsettingid;
+```
+
+* **Which rows count:** a row counts if it was current at that time, meaning
+  `ET_fromdate <= t AND ET_todate > t`. It isn't `BETWEEN`, which would also
+  return the version that ended at that very moment.
+* **Why `NULL::table`:** the table goes in as `NULL::schema.table`, not a name in
+  quotes. Its row type tells Postgres which columns come back, so `SELECT *`
+  works for any table.
+* **Where it works:** on tables that keep history, back to when each started
+  keeping it.
+* **Permissions:** it runs with the rights of whoever calls it, including the
+  query window's role.
+* **Upkeep:** eyetable makes it again whenever it starts (`authoring.py`,
+  `AS_OF_SQL`), which needs the author role set up (see *Saving queries as
+  views and procedures*).
+* **On SQL Server destinations**, one function can't serve every table,
+  because a SQL Server function's columns are fixed and it can't run dynamic
+  SQL. So each history table gets its own: `<table>_as_of(@at)`. See *Routing
+  a source to a destination*.
+
+**On SQL Server destinations**, one function can't serve every table. A T-SQL
+function's columns are fixed when it's made, and functions can't run dynamic
+SQL. So each history table there gets its own inline function beside its
+`_current` view, named after the table with `_as_of`:
+
+```sql
+SELECT * FROM dbo.parts__data_as_of('2026-11-14');           -- the rows current then
+SELECT * FROM dbo.parts__data_as_of('2026-11-14 23:59:59');  -- at the end of that day
+```
+
+It's `SELECT * FROM <table> WHERE ET_fromdate <= @at AND ET_todate > @at`. eyetable
+makes it again after every load, so it keeps up with new columns, and drops it
+with its table. A table without history has no `_as_of` function. Write dates
+as `'2026-11-14'`: whether `'11/14/2026'` reads as month/day depends on the
+login's language on SQL Server.
+
+History merges on SQL Server compare text exactly (`COLLATE Latin1_General_BIN2`).
+A change in case only, `bolt` to `BOLT`, is a new version there too, as it is in
+Postgres. The key checks compare text exactly as well, even though the database
+itself ignores case.
+
 **`<table>_current` views.** Every table of loaded data has a view beside it,
 in the same schema, named after it with `_current` added. For example,
 `eyetable_raw.parts__data` has `eyetable_raw.parts__data_current`. The view
@@ -1002,6 +1053,29 @@ On SQL Server, text is `NVARCHAR(MAX)`, so any language is kept; times are
 `DATETIME2` or `DATETIMEOFFSET`; and decimals are `NUMERIC(38,10)`. Rows go in
 in bulk (`fast_executemany`). The destination's schema is created if it doesn't
 exist, provided the login may create schemas.
+
+**History on SQL Server compares text exactly.** SQL Server usually ignores case
+(`bolt` = `BOLT`), so the history merge and key checks compare text with a
+binary collation (`Latin1_General_BIN2`), as Postgres does. A change only in
+case still makes a new version, and `abc` and `ABC` are different keys.
+
+**Each history table on SQL Server gets an as-of function**,
+`<table>_as_of(@at datetime2)`, beside its `_current` view. It returns the rows
+that were current at that time (`ET_fromdate <= @at AND ET_todate > @at`), and
+you query it like a table:
+
+```sql
+SELECT * FROM dbo.parts__data_as_of('2026-11-14');
+SELECT * FROM dbo.parts__data_as_of('2026-11-14 23:59:59') WHERE qty > 5;
+SELECT c.*, s.name
+FROM dbo.smvs_claim_as_of('2026-11-14') c
+JOIN dbo.smvs_appsetting_as_of('2026-11-14') s ON s.smvs_appsettingid = c.smvs_appsettingid;
+```
+
+It's made again after every load, with the table's current columns. It's
+dropped with its table, or when the table stops keeping history. Write dates
+as `'2026-11-14'` or `'20261114'`: how `'11/14/2026'` is read depends on the
+login's language.
 
 API: `PUT /api/sources/<name>/destination` with `{"destination": "local_sql"}`
 (or `"eyetable"` to bring it back).

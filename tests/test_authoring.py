@@ -164,3 +164,28 @@ def test_save_open_edit_deploy_call_and_drop_on_postgres(pg):
     assert client.post("/api/objects/big_parts/call", headers=AUTH).status_code == 400  # a view doesn't run
     assert client.delete("/api/objects/big_parts", headers=AUTH).json()["dropped"]["kind"] == "view"
     assert client.get("/api/objects/big_parts", headers=AUTH).status_code == 404
+
+
+def test_as_of_is_made_and_reads_a_history_table_as_it_was(pg):
+    from eyetable import keys
+
+    store, views = pg
+    engine = Engine(store)
+    engine.ingest_upload("parts", "p.csv", b"id,name\n1,bolt\n2,nut\n", create=True)
+    keys.choose_key(store, "parts__data", ["id"])
+    engine.ingest_upload("parts", "p.csv", b"id,name\n1,bolt\n2,nut\n", mode="replace")  # first versions
+    with store.db.connect() as conn:
+        first = conn.execute(sa.text(f'SELECT max("ET_fromdate") FROM {store.data_schema}.parts__data')).scalar()
+    engine.ingest_upload("parts", "p.csv", b"id,name\n1,BOLT\n2,nut\n3,washer\n", mode="replace")
+    author = Author(store, PG_URL, views)
+    author.setup()
+    author.setup()  # again at the next start: replaced, not duplicated
+    assert author.problem is None
+    t = f"{store.data_schema}.parts__data"
+    with store.db.connect() as conn:
+        then = conn.execute(sa.text(f"SELECT id, name FROM {views}.as_of(NULL::{t}, :at) ORDER BY id"), {"at": first}).all()
+        now = conn.execute(sa.text(f"SELECT id, name FROM {views}.as_of(NULL::{t}, now()::timestamp) ORDER BY id")).all()
+        comment = conn.execute(sa.text(f"SELECT obj_description('{views}.as_of(anyelement, timestamp)'::regprocedure)")).scalar()
+    assert [tuple(r) for r in then] == [(1, "bolt"), (2, "nut")]
+    assert [tuple(r) for r in now] == [(1, "BOLT"), (2, "nut"), (3, "washer")]
+    assert "as_of(NULL::schema.table" in comment

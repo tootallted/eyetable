@@ -44,6 +44,28 @@ _DEFINITION = re.compile(r"^\s*create\s+(?:or\s+replace\s+)?(view|procedure)\s+(
                          re.I)
 _DOLLAR_TAG = "$eyetable$"
 
+# as_of: a history table's rows as they were at a time, queried like a table:
+#   SELECT * FROM as_of(NULL::eyetable_raw.parts__data, '2026-11-14')
+# The first argument is the table, as a typed NULL: its row type tells Postgres the columns (a
+# table name in quotes can't). A row counts if it was current then: ET_fromdate <= t < ET_todate
+# (not BETWEEN, which would also catch the version that ended at that very moment). It runs with
+# the caller's rights. Made (again) in the views schema whenever eyetable starts (Author.setup).
+AS_OF_SQL = """
+CREATE OR REPLACE FUNCTION {schema}.as_of(_table anyelement, _at timestamp)
+RETURNS SETOF anyelement
+LANGUAGE plpgsql STABLE
+AS $fn$
+BEGIN
+  RETURN QUERY EXECUTE format(
+    'SELECT * FROM %s WHERE "ET_fromdate" <= $1 AND "ET_todate" > $1',
+    pg_typeof(_table))
+  USING _at;
+END
+$fn$
+"""
+AS_OF_COMMENT = ("COMMENT ON FUNCTION {schema}.as_of(anyelement, timestamp) IS 'Rows of a history table as they were "
+                 "at a time: SELECT * FROM as_of(NULL::schema.table, ''2026-11-14'')'")
+
 
 class AuthorError(Exception):
     def __init__(self, message: str, status: int = 400):
@@ -194,6 +216,10 @@ class Author:
                     conn.execute(sa.text(f"GRANT USAGE ON SCHEMA {s} TO {r}"))
                     conn.execute(sa.text(f"GRANT SELECT ON ALL TABLES IN SCHEMA {s} TO {r}"))
                     conn.execute(sa.text(f"ALTER DEFAULT PRIVILEGES IN SCHEMA {s} GRANT SELECT ON TABLES TO {r}"))
+                # as_of(NULL::table, time): any history table as it was at a time (see AS_OF_SQL)
+                # through text(), which escapes the function body's % for the driver
+                conn.execute(sa.text(AS_OF_SQL.format(schema=q(self.schema))))
+                conn.execute(sa.text(AS_OF_COMMENT.format(schema=q(self.schema))))
             self.problem = None
         except AuthorError as exc:
             self.problem = str(exc)
