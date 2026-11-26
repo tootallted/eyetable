@@ -49,8 +49,11 @@ def source_columns(store: CoreStore, table: str) -> dict[str, str]:
 def _expr(store: CoreStore, name: str, kind: str) -> str:
     """A column as SQL; JSON is compared as text (Postgres can't compare json values)."""
     col = store.db.dialect.identifier_preparer.quote(name)
-    text = "NVARCHAR(MAX)" if store.db.dialect.name == "mssql" else "TEXT"
-    return f"CAST({col} AS {text})" if kind == "json" else col
+    if store.db.dialect.name == "mssql":  # compare text exactly: by default SQL Server ignores case
+        if kind == "json":
+            return f"CAST({col} AS NVARCHAR(MAX)) COLLATE Latin1_General_BIN2"
+        return f"{col} COLLATE Latin1_General_BIN2" if kind in ("text", "varchar") else col
+    return f"CAST({col} AS TEXT)" if kind == "json" else col
 
 
 def _rank(name: str, kind: str, position: int, table: str) -> tuple:

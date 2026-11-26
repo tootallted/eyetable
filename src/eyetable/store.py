@@ -51,6 +51,7 @@ HISTORY_COLUMNS = (ACTIVE_COLUMN, FROM_COLUMN, TO_COLUMN)
 # Every data table has a view beside it, <table>_current, of its current rows: a history table's
 # ET_isCurrent = 1 rows, every row of any other table (see CoreStore.refresh_current_view).
 CURRENT_VIEW_SUFFIX = "_current"
+AS_OF_SUFFIX = "_as_of"  # SQL Server: <table>_as_of(@at), a history table as it was then (CoreStore.as_of_function)
 OLD_HISTORY_COLUMNS = {"ET_active": ACTIVE_COLUMN, "ET_fromdt": FROM_COLUMN, "ET_todt": TO_COLUMN}
 FOREVER = dt.datetime(9999, 12, 31)
 # A statement set's rows say which statement brought them (eyetable.connectors.curl_source).
@@ -1066,12 +1067,16 @@ class CoreStore:
             t, i = q(name), "i"
             text = self._text_sql
 
+            # SQL Server compares text without regard to case by default; a binary collation makes
+            # "bolt" and "BOLT" differ, as they do in Postgres
+            exact = " COLLATE Latin1_General_BIN2" if self.mssql else ""
+
             def as_text(side: str, col: str) -> str:
-                return f"CAST({side}.{q(col)} AS {text})"
+                return f"CAST({side}.{q(col)} AS {text}){exact}"
 
             same_key = " AND ".join(f"{as_text(i, k)} = {as_text('{T}', k)}" for k in key)
             changed = " OR ".join(
-                self._distinct(as_text(i, c) if c in inc_cols else f"CAST(NULL AS {text})", as_text("{T}", c))
+                self._distinct(as_text(i, c) if c in inc_cols else f"CAST(NULL AS {text}){exact}", as_text("{T}", c))
                 for c in data if c not in key) or "1 = 0"
             closed = conn.execute(sa.text(
                 f"UPDATE {self.qualified(table)} SET {q(ACTIVE_COLUMN)} = 0, {q(TO_COLUMN)} = :now "
@@ -1438,6 +1443,13 @@ class CoreStore:
         name = table.rsplit(".", 1)[-1]
         return name.endswith(("__stg", "__incoming")) or name.startswith("et_reorder_")
 
+    def as_of_function(self, table: str) -> str:
+        """On SQL Server, the ref of a history table's as-of function: dbo.parts__data_as_of. Postgres has
+        one as_of for every table (authoring.py); a SQL Server function's columns are fixed, so each
+        table gets its own: SELECT * FROM dbo.parts__data_as_of('2026-11-14')."""
+        schema, name = self.split(table)
+        return self.ref(schema, name[:128 - len(AS_OF_SUFFIX)] + AS_OF_SUFFIX)
+
     def current_view(self, table: str) -> str:
         """The ref of a table's view of its current rows: eyetable_raw.parts__data_current."""
         schema, name = self.split(table)
@@ -1452,6 +1464,8 @@ class CoreStore:
             return
         with self.db.begin() as conn:
             conn.execute(sa.text(f"DROP VIEW IF EXISTS {self.qualified(self.current_view(table))}"))
+            if self.mssql:
+                conn.execute(sa.text(f"DROP FUNCTION IF EXISTS {self.qualified(self.as_of_function(table))}"))
 
     @_routed
     def refresh_current_view(self, table: str) -> str | None:
@@ -1468,8 +1482,16 @@ class CoreStore:
         where = f" WHERE {q(ACTIVE_COLUMN)} = 1" if history else ""
         select = f"SELECT * FROM {self.qualified(table)}{where}"
         if self.mssql:
+            fn = self.qualified(self.as_of_function(table))
+            q = self.db.dialect.identifier_preparer.quote
             with self.db.begin() as conn:
                 conn.execute(sa.text(f"CREATE OR ALTER VIEW {self.qualified(view)} AS {select}"))
+                if history:  # <table>_as_of(@at): the rows current at that time, remade with the table's columns
+                    conn.execute(sa.text(
+                        f"CREATE OR ALTER FUNCTION {fn}(@at datetime2) RETURNS TABLE AS RETURN "
+                        f"SELECT * FROM {self.qualified(table)} WHERE {q(FROM_COLUMN)} <= @at AND {q(TO_COLUMN)} > @at"))
+                else:
+                    conn.execute(sa.text(f"DROP FUNCTION IF EXISTS {fn}"))
             return view
         if self.db.dialect.name == "postgresql" and vname in sa.inspect(self.db).get_view_names(schema=vschema):
             try:  # keeps views built on it: only adds the table's new columns at its end
@@ -1895,7 +1917,7 @@ _DATA_OPERATIONS = {
     "count_rows", "read_table", "max_value", "archive_table", "refresh_current_view", "drop_current_view",
     "dependent_views", "current_view", "current_rows", "ensure_schema", "qualified", "split", "ref", "is_work_table",
     "_warn", "_warn_missing", "take_merge_stats", "take_load_warnings", "mssql", "_add_column", "_alter_type",
-    "_rename", "_text_sql", "_distinct", "data_for", "_base_table", "_drop_data",
+    "_rename", "_text_sql", "_distinct", "data_for", "_base_table", "_drop_data", "as_of_function",
 }
 
 

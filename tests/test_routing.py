@@ -108,6 +108,20 @@ def test_full_incremental_history_and_views_on_sql_server(mssql, store):
     scanned = keys.scan_and_save(store, "parts__data")  # a key scan runs there too
     assert "id" in scanned["scan"]["primary_key_candidates"]
 
+    # each history table gets <table>_as_of(@at): the rows current at that time
+    r = engine.ingest_upload("parts", "p.csv", b"id,name,price,colour\n1,BOLT,1.25,\n2,CAFE,2.5,\n3,washer,0.1,red\n", mode="replace")
+    assert "1 changed, 2 unchanged" in r.note
+    [(changed_at,)] = on_sql_server(db, "SELECT ET_fromdate FROM loads.parts__data WHERE id = 1 AND ET_isCurrent = 1")
+    at = changed_at.isoformat(sep=" ")
+    before = on_sql_server(db, "SELECT id, name FROM loads.parts__data_as_of("
+                               f"DATEADD(millisecond, -1, CAST('{at}' AS datetime2))) ORDER BY id")
+    after = on_sql_server(db, f"SELECT id, name FROM loads.parts__data_as_of('{at}') ORDER BY id")
+    assert before == [(1, "bolt"), (2, "CAFE"), (3, "washer")]
+    assert after == [(1, "BOLT"), (2, "CAFE"), (3, "washer")]
+    assert on_sql_server(db, "SELECT COUNT(*) FROM loads.parts__data_as_of('2000-01-01')") == [(0,)]
+    store.drop_table("parts__data")  # the function goes with its table
+    assert on_sql_server(db, "SELECT OBJECT_ID('loads.parts__data_as_of')") == [(None,)]
+
 
 def test_the_page_routes_a_source(mssql, store):
     engine, db = mssql
